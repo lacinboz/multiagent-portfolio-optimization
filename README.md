@@ -12,7 +12,7 @@ trade-offs, and read LLM-generated insights about portfolio behavior.
 
 ---
 
-## 🚀 Features
+##  Features
 
 ### **Numerical Finance Engine**
 - Compute daily returns from historical price data  
