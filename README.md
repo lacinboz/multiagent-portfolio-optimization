@@ -37,5 +37,5 @@ trade-offs, and read LLM-generated insights about portfolio behavior.
 
 ---
 
-## 📂 Project Structure
+This repository accompanies the thesis project of Laçin Boz, focusing on the integration of classical portfolio optimization techniques with LLM-based analytical reasoning through a multi-agent architecture.
 
