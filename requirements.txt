@@ -1,0 +1,4 @@
+pandas
+requests
+python-dotenv      # for reading .env (API key)
+pyarrow            # fast parquet/feather IO
