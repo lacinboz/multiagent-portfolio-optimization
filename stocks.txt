@@ -1,0 +1,11 @@
+tickers = [
+    "EXC","FAST","CDNS","MRVL","MSFT","MSTR","MU","CPRT","CSGP","CSX","CTAS","CTSH",
+    "GILD","GOOGL","MNST","IDXX","INTC","LRCX","MAR","AMZN","ASML","AAPL","ADBE",
+    "ADI","ADP","ADSK","AEP","AZN","BKR","BIIB","AMAT","AMD","AMGN","PANW","KHC",
+    "PYPL","SHOP","CCEP","AVGO","TEAM","TTD","GOOG","CDW","DXCM","CSCO","PCAR",
+    "BKNG","PEP","TSLA","NXPI","KDP","META","WDAY","FANG","CHTR","VRSK","FTNT",
+    "VRTX","LULU","REGN","ROP","ROST","SBUX","AXON","MELI","TMUS","NVDA","ODFL",
+    "ON","ORLY","PAYX","TRI","XEL","TTWO","TXN","SNPS","QCOM","MDLZ","KLAC","EA",
+    "INTU","ISRG","MCHP","HON","NFLX","CMCSA","COST","ABNB","DASH","APP","WBD",
+    "DDOG","ZS","GFS","CEG","CRWD","PLTR","PDD","LIN","ARM","GEHC"
+]

@@ -3,14 +3,13 @@ import numpy as np
 from pathlib import Path
 from scipy.optimize import minimize
 
-# --- Dosya yolları ---
-DATA_DIR = Path("data/processed")
-RETURNS_CSV = DATA_DIR / "returns_hourly.csv"               
+DATA_DIR = Path("data/processed_yahoo")
+RETURNS_CSV = DATA_DIR / "returns_daily.csv"               
 COV_ANNUAL_CSV = DATA_DIR / "cov_annual.csv"
 SUMMARY_ANNUAL_CSV = DATA_DIR / "summary_per_asset_annual.csv"
 
 
-# --- Yardımcı fonksiyonlar (genel) ---
+
 
 def near_psd(A, eps=1e-8):
     """Negatif en küçük özdeğerleri 0'a çekerek PSD kovaryans matrisi üretir."""
@@ -39,7 +38,7 @@ def sharpe_ratio(w, mu, cov, rf=0.0):
     return (r - rf) / v if v > 0 else -np.inf
 
 
-# --- ASIL ÖNEMLİ KISIM: Optimizasyon fonksiyonu ---
+
 
 def run_portfolio_optimization(mu, cov, rf=0.02, w_max=0.30, lambda_l2=1e-3,
                                data_dir=DATA_DIR, save_csv=True):
@@ -108,16 +107,42 @@ def run_portfolio_optimization(mu, cov, rf=0.02, w_max=0.30, lambda_l2=1e-3,
 
     # --- Efficient frontier için yardımcı fonksiyon ---
 
+        # --- Efficient frontier için yardımcı fonksiyon ---
+
     def min_var_for_target_return(target):
         cons = [
             {'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0},
-            {'type': 'eq', 'fun': lambda w, mu=mu, t=target: w @ mu.values - t}
+            {'type': 'eq', 'fun': lambda w, t=target: float(w @ mu.values) - float(t)}
         ]
         res = minimize(obj_min_var, w0, method="SLSQP",
                        bounds=bounds, constraints=cons)
         return res
 
-    grid = np.linspace(mu.min()*0.8, mu.max()*1.2, 25)
+    # ✅ Feasible return range bul: [r_minvar, r_max_return]
+    def obj_neg_return(w):
+        return -float(w @ mu.values)
+
+    res_maxret = minimize(
+        obj_neg_return,
+        w0,
+        method="SLSQP",
+        bounds=bounds,
+        constraints=constraints
+    )
+
+    if res_maxret.success:
+        r_maxret = float(res_maxret.x @ mu.values)
+    else:
+        # fallback (çok nadir)
+        r_maxret = float(mu.max())
+
+    lo = float(r_minvar)
+    hi = float(r_maxret)
+    if hi < lo:
+        lo, hi = hi, lo
+
+    # ✅ Daha sık grid -> daha düzgün çizgi
+    grid = np.linspace(lo, hi, 60)
 
     frontier_rows = []
     for t in grid:
@@ -126,17 +151,16 @@ def run_portfolio_optimization(mu, cov, rf=0.02, w_max=0.30, lambda_l2=1e-3,
             w = res.x
             r, v = portfolio_stats(w, mu, cov)
             row = {
-                "target_return": t,
-                "realized_return": r,
-                "vol": v
+                "target_return": float(t),
+                "realized_return": float(r),
+                "vol": float(v),
             }
-            for i, k in enumerate(tickers):
-                row[f"w_{k}"] = w[i]
             frontier_rows.append(row)
 
     frontier = pd.DataFrame(frontier_rows)
 
     print("Efficient frontier point count:", len(frontier))
+
 
     
     if save_csv:

@@ -3,10 +3,12 @@ import pandas as pd
 from pathlib import Path
 import plotly.express as px
 import plotly.graph_objects as go
+import numpy as np
+
 
 from agents import optimization_agent, recommendation_agent
 
-DATA_DIR = Path("data/processed")
+DATA_DIR = Path("data/processed_yahoo")
 
 
 @st.cache_data
@@ -113,6 +115,7 @@ with col_left:
         default=all_tickers,
         help="These assets will be available to the optimization agent.",
     )
+    
 
     rf = st.number_input(
         "Risk-free rate (annual)",
