@@ -1,20 +1,7 @@
- # portfolio_langgraph.py
-# ✅ Updated for REAL “LLM-in-the-loop” value:
-# - Keep numerical core deterministic (mu/cov → optimizer → metrics)
-# - Move ambiguous intent (“extra_notes”) interpretation to the LLM
-# - Allow LLM to propose *meaningful* safe changes, including switching objective:
-#     * set_objective_key  ✅ (maxsharpe <-> minvar)
-#     * set_w_max
-#     * set_lambda_l2
-#     * exclude_assets  (only if user explicitly indicates dislike-assets)
-# - IMPORTANT: When extra_notes is present and pain_points are empty, we treat UI-inferred
-#   goal/stability/concentration as “soft” and do NOT deterministically override objective.
-#   This is the main change that gives the LLM real leverage without hardcoding rules.
-
+# portfolio_langgraph.py
 from __future__ import annotations
 
 from typing import TypedDict, List, Dict, Any, Optional, Literal
-
 import pandas as pd
 from langgraph.graph import StateGraph, END
 
@@ -25,87 +12,62 @@ from agents_langgraph import (
     recommendation_agent,
 )
 
-# Optional LLM (safe: only used if use_llm=True and llm_client exists)
 try:
     from llm_client import LLMClient
 except Exception:  # pragma: no cover
     LLMClient = None  # type: ignore
 
 
-# ----------------------------
-# UI label constants (IMPORTANT: must match dashboard strings)
-# ----------------------------
 PP_TOO_RISKY = "It feels too risky"
 PP_TOO_CONSERVATIVE = "It feels too conservative"
 PP_TOO_CONCENTRATED = "It’s too concentrated in a few assets"
 PP_DISLIKE_ASSETS = "I don’t like some of the assets"
 PP_NOT_SURE = "I’m not sure — I just want something safer/smoother"
 
-
-# ----------------------------
-# State enums
-# ----------------------------
 Mode = Literal["base", "refine"]
 ObjectiveKey = Literal["maxsharpe", "minvar"]
 
 
-# ----------------------------
-# State
-# ----------------------------
 class PortfolioState(TypedDict, total=False):
-    # inputs
     mode: Mode
     selected_tickers: List[str]
     rf: float
     w_max: float
     lambda_l2: float
     preferences: Dict[str, Any]
-
-    # UI-driven LLM toggle
     use_llm: bool
 
-    # interactive loop
     clarification_questions: List[Dict[str, Any]]
     clarification_answers: Optional[Dict[str, Any]]
     needs_user_input: bool
 
-    # derived decisions
     objective_key: ObjectiveKey
+    chosen_candidate: Optional[ObjectiveKey]
+    llm_decision: Optional[Dict[str, Any]]
 
-    # computed / intermediate
     mu: Optional[pd.Series]
     cov: Optional[pd.DataFrame]
-
-    # current portfolio
-    current_weights: Optional[Dict[str, float]]
-    current_metrics: Optional[Dict[str, Any]]
-    baseline_metrics: Optional[Dict[str, Any]]
-
     optimization_result: Dict[str, Any]
-    optimized_weights: Dict[str, float]
-    optimized_metrics: Dict[str, Any]
 
-    # news / context
+    current_weights: Optional[Dict[str, float]]
+    baseline_metrics: Optional[Dict[str, Any]]
+    current_metrics: Optional[Dict[str, Any]]
+
+    candidates: Dict[str, Dict[str, Any]]
+
+    optimized_weights: Dict[str, float]
+    optimized_metrics: Dict[str, Any]  # normalized + raw both included, see _normalize_metrics
+
     news_raw: Optional[List[Dict[str, Any]]]
     news_signals: Optional[Dict[str, Any]]
 
-    # loop control (refine loop)
-    iteration: int
-    max_iterations: int
-    needs_refine: bool
-    refine_actions: List[Dict[str, Any]]
-    llm_decision: Optional[Dict[str, Any]]
-    changes_applied: List[Dict[str, Any]]
-    changes_rejected: List[Dict[str, Any]]
     debug_notes: List[str]
-
-    # output
     explanation: str
 
 
-# ----------------------------
-# Utils
-# ----------------------------
+# =========================================================
+# Defaults / prefs
+# =========================================================
 def _init_defaults(state: PortfolioState) -> PortfolioState:
     state.setdefault("mode", "refine")
     state.setdefault("rf", 0.02)
@@ -113,7 +75,6 @@ def _init_defaults(state: PortfolioState) -> PortfolioState:
     state.setdefault("lambda_l2", 1e-3)
     state.setdefault("objective_key", "maxsharpe")
     state.setdefault("preferences", {})
-
     state.setdefault("use_llm", False)
     state.setdefault("current_weights", None)
 
@@ -123,84 +84,33 @@ def _init_defaults(state: PortfolioState) -> PortfolioState:
 
     state.setdefault("mu", None)
     state.setdefault("cov", None)
+    state.setdefault("optimization_result", {})
+
+    state.setdefault("baseline_metrics", None)
+    state.setdefault("current_metrics", None)
+
+    state.setdefault("candidates", {})
+    state.setdefault("chosen_candidate", None)
+    state.setdefault("llm_decision", None)
+
+    state.setdefault("optimized_weights", {})
+    state.setdefault("optimized_metrics", {})
 
     state.setdefault("news_raw", None)
     state.setdefault("news_signals", None)
 
-    state.setdefault("iteration", 0)
-    state.setdefault("max_iterations", 2)
-    state.setdefault("needs_refine", False)
-    state.setdefault("refine_actions", [])
-    state.setdefault("llm_decision", None)
-    state.setdefault("changes_applied", [])
-    state.setdefault("changes_rejected", [])
     state.setdefault("debug_notes", [])
-
-    state.setdefault("optimization_result", {})
-    state.setdefault("optimized_weights", {})
-    state.setdefault("optimized_metrics", {})
-    state.setdefault("baseline_metrics", None)
-    state.setdefault("current_metrics", None)
     state.setdefault("explanation", "")
     return state
 
 
 def _merged_prefs(state: PortfolioState) -> Dict[str, Any]:
-    # dashboard passes answers via clarification_answers
     return (state.get("clarification_answers") or state.get("preferences") or {}) or {}
 
 
-def _pref_str_list(x: Any) -> List[str]:
-    if x is None:
-        return []
-    if isinstance(x, list):
-        return [str(i) for i in x]
-    return [str(x)]
-
-
-def _clamp(x: float, lo: float, hi: float) -> float:
-    return min(max(float(x), float(lo)), float(hi))
-
-
-def _wants_diversification(prefs: Dict[str, Any]) -> bool:
-    pain_points = _pref_str_list(prefs.get("pain_points"))
-    concentration = prefs.get("concentration")
-    # diversification desire can come from explicit concentration OR explicit pain point
-    return (concentration == "low") or (PP_TOO_CONCENTRATED in pain_points)
-
-
-def _user_dislikes_assets(prefs: Dict[str, Any]) -> bool:
-    pain_points = _pref_str_list(prefs.get("pain_points"))
-    return (PP_DISLIKE_ASSETS in pain_points) or bool(prefs.get("excluded_assets"))
-
-
-def _conflicting_risk_signals(prefs: Dict[str, Any]) -> bool:
-    pain_points = _pref_str_list(prefs.get("pain_points"))
-    return (PP_TOO_RISKY in pain_points) and (PP_TOO_CONSERVATIVE in pain_points)
-
-
-def _has_meaningful_extra_notes(prefs: Dict[str, Any]) -> bool:
-    txt = str(prefs.get("extra_notes") or "").strip()
-    return len(txt) >= 8  # small threshold to ignore accidental whitespace
-
-
-def _soft_inferred_ui_targets_should_be_ignored(prefs: Dict[str, Any]) -> bool:
-    """
-    Key idea:
-    - Dashboard currently infers (goal/stability/concentration) even when user only wrote extra_notes.
-    - If pain_points is empty BUT extra_notes exists, we treat these inferred targets as "soft"
-      and do NOT deterministically override objective_key / caps in perception.
-    The LLM should decide how to convert that text into actions.
-    """
-    pain_points = _pref_str_list(prefs.get("pain_points"))
-    if pain_points:
-        return False
-    return _has_meaningful_extra_notes(prefs)
-
-
-# ----------------------------
-# Helper: build questions (rarely used now; dashboard usually provides answers)
-# ----------------------------
+# =========================================================
+# UI questions
+# =========================================================
 def _build_default_questions(state: PortfolioState) -> List[Dict[str, Any]]:
     n = len(state.get("selected_tickers", []))
     return [
@@ -236,9 +146,80 @@ def _build_default_questions(state: PortfolioState) -> List[Dict[str, Any]]:
     ]
 
 
-# ----------------------------
-# Nodes: ask clarifications
-# ----------------------------
+# =========================================================
+# Metrics helpers (single-source-of-truth normalization)
+# =========================================================
+def _extract_active_weights(weights_all: Dict[str, Any]) -> Dict[str, float]:
+    return {t: float(v) for t, v in (weights_all or {}).items() if abs(float(v)) > 1e-6}
+
+
+def _safe_max_weight(weights: Dict[str, float]) -> float:
+    return max(weights.values()) if weights else 0.0
+
+
+def _effective_n(weights: Dict[str, float]) -> float:
+    if not weights:
+        return 0.0
+    s = sum(float(w) ** 2 for w in weights.values())
+    return float(1.0 / s) if s > 0 else 0.0
+
+
+def _attach_concentration_metrics(metrics: Dict[str, Any], weights: Dict[str, float]) -> Dict[str, Any]:
+    """
+    risk_agent() returns return/vol/sharpe/rc_* and active_assets,
+    but NOT max_weight/effective_n. Compute them deterministically.
+    """
+    out = dict(metrics or {})
+    out["max_weight"] = _safe_max_weight(weights)
+    out["effective_n"] = _effective_n(weights)
+    out["active_assets"] = int(out.get("active_assets") or len([w for w in weights.values() if abs(w) > 1e-6]))
+    return out
+
+
+def _as_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        v = float(x)
+        # NaN check
+        if v != v:
+            return None
+        return v
+    except Exception:
+        return None
+
+
+def _normalize_metrics(m: Dict[str, Any], *, rf: float) -> Dict[str, Any]:
+    """
+    Create ONE consistent metrics payload:
+    - raw decimals: return, vol, max_weight
+    - pct values: return_pct, vol_pct, max_weight_pct
+    - sharpe is unitless
+    """
+    out = dict(m or {})
+    r = _as_float(out.get("return"))
+    v = _as_float(out.get("vol"))
+    s = _as_float(out.get("sharpe"))
+
+    # If sharpe missing, compute if possible
+    if s is None and (r is not None) and (v is not None) and v > 0:
+        s = (r - float(rf)) / v
+        out["sharpe"] = s
+
+    out["return_pct"] = (r * 100.0) if r is not None else None
+    out["vol_pct"] = (v * 100.0) if v is not None else None
+
+    mw = _as_float(out.get("max_weight"))
+    out["max_weight_pct"] = (mw * 100.0) if mw is not None else None
+
+    # keep rf for downstream formatting/debug
+    out["rf"] = float(rf)
+    return out
+
+
+# =========================================================
+# Nodes
+# =========================================================
 def node_ask_clarifications(state: PortfolioState) -> PortfolioState:
     state = _init_defaults(state)
 
@@ -249,13 +230,13 @@ def node_ask_clarifications(state: PortfolioState) -> PortfolioState:
 
     if state.get("clarification_answers") is not None:
         state["needs_user_input"] = False
-        state["debug_notes"].append("Clarifications(REFINE): answers present -> continue.")
+        state["debug_notes"].append("Clarifications(REFINE): answers present → continue.")
         return state
 
     state["clarification_questions"] = _build_default_questions(state)
     state["needs_user_input"] = True
     state["debug_notes"].append(
-        f"Clarifications(REFINE): generated {len(state['clarification_questions'])} questions -> stop for user input."
+        f"Clarifications(REFINE): generated {len(state['clarification_questions'])} questions → stop for user input."
     )
     return state
 
@@ -264,89 +245,36 @@ def route_after_clarifications(state: PortfolioState) -> str:
     return "end" if state.get("needs_user_input") else "perception"
 
 
-# ----------------------------
-# Node: perception (ONLY applies explicit, non-ambiguous inputs)
-# ----------------------------
 def node_perception(state: PortfolioState) -> PortfolioState:
     state = _init_defaults(state)
+    prefs = _merged_prefs(state)
 
     if state.get("mode") == "base":
         state["debug_notes"].append(
-            f"Perception(BASE): objective_key={state['objective_key']}, w_max={float(state['w_max']):.2f}, lambda_l2={float(state['lambda_l2']):.4g}"
+            f"Perception(BASE): objective_key={state['objective_key']}, w_max={float(state['w_max']):.2f}, "
+            f"lambda_l2={float(state['lambda_l2']):.4g}"
         )
         return state
 
-    prefs = _merged_prefs(state)
-    satisfaction = str(prefs.get("satisfaction") or "").lower().strip()  # "yes" / "no"
-    pain_points = _pref_str_list(prefs.get("pain_points"))
-    excluded_assets = prefs.get("excluded_assets") or []
+    satisfaction = str(prefs.get("satisfaction") or "").lower().strip()
 
-    # apply exclusions deterministically (safe + explicit)
+    excluded_assets = prefs.get("excluded_assets") or []
     if excluded_assets:
         excluded = set(map(str, excluded_assets))
-        selected = [t for t in list(state.get("selected_tickers", [])) if t not in excluded]
-        state["selected_tickers"] = selected
+        state["selected_tickers"] = [t for t in list(state.get("selected_tickers", [])) if t not in excluded]
         state["debug_notes"].append(f"Perception: excluded={sorted(excluded)}")
 
-    # ⭐ MAIN CHANGE:
-    # If user only wrote extra_notes (pain_points empty), do NOT enforce inferred targets deterministically.
-    # Let LLM propose meaningful actions (e.g., switch to minvar) in node_llm_evaluate.
-    ignore_soft_targets = _soft_inferred_ui_targets_should_be_ignored(prefs) and (satisfaction == "no")
-    if ignore_soft_targets:
-        state["debug_notes"].append(
-            "Perception: extra_notes present + pain_points empty -> ignoring soft inferred targets (LLM will interpret)."
-        )
-        state["debug_notes"].append(
-            f"Perception: objective_key={state['objective_key']}, w_max={float(state['w_max']):.2f}, lambda_l2={float(state['lambda_l2']):.4g}, n={len(state.get('selected_tickers', []))}"
-        )
-        return state
-
-    # If explicit structured targets exist (from UI), we can still apply deterministically.
-    goal = prefs.get("goal")         # "best_tradeoff" | "lowest_risk" | None
-    stability = prefs.get("stability")  # "stable" | "balanced" | "swingy" | None
-    concentration = prefs.get("concentration")  # "low" | "high" | None
-
-    # objective from explicit goal/stability
-    if goal == "lowest_risk":
-        state["objective_key"] = "minvar"
-    elif goal == "best_tradeoff":
-        state["objective_key"] = "maxsharpe"
-
-    if stability == "stable":
-        state["objective_key"] = "minvar"
-
-    # caps from explicit concentration
-    if concentration == "low":
-        state["w_max"] = min(float(state["w_max"]), 0.20)
-    elif concentration == "high":
-        state["w_max"] = max(float(state["w_max"]), 0.35)
-
-    # Keep tiny safe nudges ONLY when pain_points explicitly selected
-    if satisfaction == "no" and pain_points:
-        conflict = _conflicting_risk_signals(prefs)
-        if conflict:
-            state["lambda_l2"] = max(float(state["lambda_l2"]), 2e-3)
-            state["debug_notes"].append("Perception: conflicting pain points -> mild lambda_l2 only.")
-        else:
-            if PP_TOO_CONCENTRATED in pain_points:
-                state["w_max"] = min(float(state["w_max"]), 0.20)
-                state["lambda_l2"] = max(float(state["lambda_l2"]), 5e-3)
-            if (PP_TOO_RISKY in pain_points) or (PP_NOT_SURE in pain_points):
-                state["lambda_l2"] = max(float(state["lambda_l2"]), 5e-3)
-            if PP_TOO_CONSERVATIVE in pain_points:
-                state["lambda_l2"] = min(float(state["lambda_l2"]), 1e-3)
+    extra_notes = str(prefs.get("extra_notes") or "").strip()
+    pain_points = prefs.get("pain_points") or []
+    pain_points_n = len(pain_points) if isinstance(pain_points, list) else 1
 
     state["debug_notes"].append(
-        f"Perception: objective_key={state['objective_key']}, w_max={float(state['w_max']):.2f}, "
-        f"lambda_l2={float(state['lambda_l2']):.4g}, n={len(state.get('selected_tickers', []))}, "
-        f"goal={goal}, stability={stability}, concentration={concentration}"
+        f"Perception(REFINE): satisfaction={satisfaction or '∅'}, pain_points={pain_points_n}, "
+        f"extra_notes={'yes' if extra_notes else 'no'}, n={len(state.get('selected_tickers', []))}"
     )
     return state
 
 
-# ----------------------------
-# Node: baselines
-# ----------------------------
 def node_compute_baselines(state: PortfolioState) -> PortfolioState:
     tickers = state.get("selected_tickers", [])
 
@@ -356,14 +284,18 @@ def node_compute_baselines(state: PortfolioState) -> PortfolioState:
     if tickers:
         ew = {t: 1.0 / len(tickers) for t in tickers}
         try:
-            state["baseline_metrics"] = risk_agent(ew, tickers)
+            bm = risk_agent(ew, tickers, rf=float(state["rf"]))
+            bm = _attach_concentration_metrics(bm, _extract_active_weights(ew))
+            state["baseline_metrics"] = _normalize_metrics(bm, rf=float(state["rf"]))
         except Exception as e:
             state["baseline_metrics"] = None
             state["debug_notes"].append(f"Baseline metrics failed: {e}")
 
     if state.get("current_weights") is not None and tickers:
         try:
-            state["current_metrics"] = risk_agent(state["current_weights"], tickers)
+            cm = risk_agent(state["current_weights"], tickers, rf=float(state["rf"]))
+            cm = _attach_concentration_metrics(cm, _extract_active_weights(state["current_weights"]))
+            state["current_metrics"] = _normalize_metrics(cm, rf=float(state["rf"]))
         except Exception as e:
             state["current_metrics"] = None
             state["debug_notes"].append(f"Current metrics failed: {e}")
@@ -371,9 +303,6 @@ def node_compute_baselines(state: PortfolioState) -> PortfolioState:
     return state
 
 
-# ----------------------------
-# Node: data
-# ----------------------------
 def node_data(state: PortfolioState) -> PortfolioState:
     state["mu"], state["cov"] = None, None
 
@@ -388,14 +317,11 @@ def node_data(state: PortfolioState) -> PortfolioState:
         state["debug_notes"].append(f"Data: loaded mu/cov for n={len(mu)}")
     except Exception as e:
         state["mu"], state["cov"] = None, None
-        state["debug_notes"].append(f"Data: failed -> {e}")
+        state["debug_notes"].append(f"Data: failed → {e}")
 
     return state
 
 
-# ----------------------------
-# Node: optimization
-# ----------------------------
 def node_optimize(state: PortfolioState) -> PortfolioState:
     if state.get("mu") is None or state.get("cov") is None:
         state["optimization_result"] = {}
@@ -414,43 +340,64 @@ def node_optimize(state: PortfolioState) -> PortfolioState:
     return state
 
 
-def node_extract_portfolio(state: PortfolioState) -> PortfolioState:
-    if not state.get("optimization_result"):
-        state["optimized_weights"] = {}
-        state["debug_notes"].append("Extract: skipped (missing optimization_result).")
+def node_extract_candidates(state: PortfolioState) -> PortfolioState:
+    state["candidates"] = {}
+
+    res = state.get("optimization_result") or {}
+    if not res:
+        state["debug_notes"].append("ExtractCandidates: skipped (missing optimization_result).")
         return state
 
-    obj = state.get("objective_key", "maxsharpe")
-    if obj not in state["optimization_result"]:
-        state["optimized_weights"] = {}
-        state["debug_notes"].append(f"Extract: skipped (objective '{obj}' not found).")
+    mode = state.get("mode", "refine")
+
+    if mode == "base":
+        obj = state.get("objective_key", "maxsharpe")
+        if obj in res:
+            w = _extract_active_weights(res[obj].get("weights", {}))
+            state["candidates"][obj] = {"weights": w, "metrics": None}
+            state["chosen_candidate"] = obj
+            state["debug_notes"].append(f"Extract(BASE): objective={obj} active={len(w)} max_w={_safe_max_weight(w):.4f}")
+        else:
+            state["debug_notes"].append(f"Extract(BASE): objective '{obj}' not found.")
         return state
 
-    port = state["optimization_result"][obj]
-    w_all = port.get("weights", {})
-    weights = {t: float(w) for t, w in w_all.items() if abs(float(w)) > 1e-6}
+    # stable insertion order
+    for obj in ("maxsharpe", "minvar"):
+        if obj in res:
+            w = _extract_active_weights(res[obj].get("weights", {}))
+            state["candidates"][obj] = {"weights": w, "metrics": None}
+            state["debug_notes"].append(f"ExtractCandidates: {obj} active={len(w)} max_w={_safe_max_weight(w):.4f}")
 
-    state["optimized_weights"] = weights
-    state["debug_notes"].append(f"Extract: objective={obj}, active={len(weights)}")
-    max_w = max(weights.values()) if weights else 0.0
-    state["debug_notes"].append(f"Extract: max_weight={max_w:.4f} vs w_max={float(state['w_max']):.2f}")
+    if not state["candidates"]:
+        state["debug_notes"].append("ExtractCandidates: none available.")
     return state
 
 
-def node_risk(state: PortfolioState) -> PortfolioState:
-    if not state.get("optimized_weights") or not state.get("selected_tickers"):
-        state["optimized_metrics"] = {}
-        state["debug_notes"].append("Risk: skipped (missing weights or tickers).")
+def node_risk_candidates(state: PortfolioState) -> PortfolioState:
+    tickers = state.get("selected_tickers", [])
+    cands = state.get("candidates") or {}
+    if not tickers or not cands:
+        state["debug_notes"].append("RiskCandidates: skipped (missing tickers or candidates).")
         return state
 
-    state["optimized_metrics"] = risk_agent(state["optimized_weights"], state["selected_tickers"])
-    state["debug_notes"].append("Risk: computed optimized metrics.")
+    for k, item in cands.items():
+        w = item.get("weights") or {}
+        if not w:
+            item["metrics"] = {}
+            continue
+        try:
+            m = risk_agent(w, tickers, rf=float(state["rf"]))
+            m = _attach_concentration_metrics(m, w)
+            # ✅ normalize here → LLM + UI see one consistent representation
+            item["metrics"] = _normalize_metrics(m, rf=float(state["rf"]))
+        except Exception as e:
+            item["metrics"] = {}
+            state["debug_notes"].append(f"RiskCandidates: failed for {k}: {e}")
+
+    state["debug_notes"].append("RiskCandidates: computed metrics for candidates.")
     return state
 
 
-# ----------------------------
-# Node: news fetcher (stub)
-# ----------------------------
 def node_news_fetch(state: PortfolioState) -> PortfolioState:
     tickers = state.get("selected_tickers", [])
     state["news_raw"] = [{"ticker": t, "headline": None, "source": None, "ts": None} for t in tickers]
@@ -458,10 +405,7 @@ def node_news_fetch(state: PortfolioState) -> PortfolioState:
     return state
 
 
-# ----------------------------
-# Node: news -> signals (placeholder)
-# ----------------------------
-def node_news_signals_llm(state: PortfolioState) -> PortfolioState:
+def node_news_signals_placeholder(state: PortfolioState) -> PortfolioState:
     raw = state.get("news_raw") or []
     signals: Dict[str, Any] = {"by_ticker": {}, "global": {"risk_flags": [], "vol_regime": "normal"}}
 
@@ -484,292 +428,138 @@ def node_news_signals_llm(state: PortfolioState) -> PortfolioState:
     return state
 
 
-# ----------------------------
-# Node: LLM evaluation / refinement controller
-# ----------------------------
-def node_llm_evaluate(state: PortfolioState) -> PortfolioState:
+def node_llm_select_candidate(state: PortfolioState) -> PortfolioState:
     state = _init_defaults(state)
 
     if state.get("mode") == "base":
-        state["needs_refine"] = False
-        state["refine_actions"] = []
+        chosen = state.get("chosen_candidate") or state.get("objective_key", "maxsharpe")
         state["llm_decision"] = {
             "decision": "accept",
-            "rationale": "Base run: refinement disabled. Portfolio generated for comparison.",
-            "proposed_actions": [],
+            "rationale": "Base run: candidate selection disabled. Portfolio generated for comparison.",
+            "chosen_candidate": chosen,
         }
-        state["debug_notes"].append("LLM_Evaluate(BASE): accept (no refine).")
+        state["debug_notes"].append("LLM_Select(BASE): accept (no selection).")
         return state
 
     prefs = _merged_prefs(state)
-    satisfaction = str(prefs.get("satisfaction") or "").lower().strip()  # "yes" / "no"
-    pain_points = _pref_str_list(prefs.get("pain_points"))
+    satisfaction = str(prefs.get("satisfaction") or "").lower().strip()
 
-    # ✅ If user is happy -> ACCEPT, always
+    candidates = state.get("candidates") or {}
+    if not candidates:
+        chosen = state.get("objective_key", "maxsharpe")
+        state["chosen_candidate"] = chosen  # type: ignore
+        state["llm_decision"] = {
+            "decision": "accept",
+            "rationale": "No candidates available; cannot select.",
+            "chosen_candidate": chosen,
+        }
+        state["debug_notes"].append("LLM_Select: no candidates -> accept fallback.")
+        return state
+
     if satisfaction == "yes":
-        state["needs_refine"] = False
-        state["refine_actions"] = []
+        chosen = state.get("objective_key", "maxsharpe")
+        if chosen not in candidates:
+            chosen = "maxsharpe" if "maxsharpe" in candidates else next(iter(candidates.keys()))
+        state["chosen_candidate"] = chosen  # type: ignore
         state["llm_decision"] = {
             "decision": "accept",
-            "rationale": "User indicated the portfolio looks good (satisfaction=yes).",
-            "proposed_actions": [],
+            "rationale": "User indicated satisfaction=yes; skipping candidate selection.",
+            "chosen_candidate": chosen,
         }
-        state["debug_notes"].append("LLM_Evaluate: satisfaction=yes -> accept.")
+        state["debug_notes"].append("LLM_Select: satisfaction=yes -> accept.")
         return state
 
-    # If max iters reached -> accept
-    if int(state["iteration"]) >= int(state["max_iterations"]):
-        state["needs_refine"] = False
-        state["refine_actions"] = []
-        state["llm_decision"] = {"decision": "accept", "rationale": "Max iterations reached.", "proposed_actions": []}
-        state["debug_notes"].append("LLM_Evaluate: max iterations reached -> accept.")
-        return state
-
-    if not state.get("optimized_weights"):
-        state["needs_refine"] = False
-        state["refine_actions"] = []
-        state["llm_decision"] = {
-            "decision": "accept",
-            "rationale": "No optimized weights; stopping.",
-            "proposed_actions": [],
-        }
-        state["debug_notes"].append("LLM_Evaluate: no weights -> accept.")
-        return state
-
-    # ✅ Only refine if user explicitly said "no"
     if satisfaction != "no":
-        state["needs_refine"] = False
-        state["refine_actions"] = []
+        chosen = state.get("objective_key", "maxsharpe")
+        if chosen not in candidates:
+            chosen = "maxsharpe" if "maxsharpe" in candidates else next(iter(candidates.keys()))
+        state["chosen_candidate"] = chosen  # type: ignore
         state["llm_decision"] = {
             "decision": "accept",
-            "rationale": "No explicit dissatisfaction signal. Skipping refinement.",
-            "proposed_actions": [],
+            "rationale": "No explicit dissatisfaction; skipping candidate selection.",
+            "chosen_candidate": chosen,
         }
-        state["debug_notes"].append("LLM_Evaluate: satisfaction not provided -> accept.")
+        state["debug_notes"].append("LLM_Select: satisfaction not 'no' -> accept.")
         return state
 
-    wants_div = _wants_diversification(prefs)
-    allow_exclude = _user_dislikes_assets(prefs)
-    conflict = _conflicting_risk_signals(prefs)
-
-    # ---- LLM path ----
     use_llm = bool(state.get("use_llm", False))
+
     if use_llm and LLMClient is not None:
         try:
             client = LLMClient()
-
-            # NOTE:
-            # Your llm_client.py currently validates allowed action types.
-            # To support real value, you MUST allow "set_objective_key" there too.
-            # We already enforce guards here + in apply_refine.
-            llm_payload = client.decide_refine_actions(
+            llm_payload = client.select_candidate(
                 mode=str(state.get("mode")),
-                iteration=int(state.get("iteration", 0)),
-                max_iterations=int(state.get("max_iterations", 0)),
                 objective_key=str(state.get("objective_key")),
                 rf=float(state.get("rf")),
                 w_max=float(state.get("w_max")),
                 lambda_l2=float(state.get("lambda_l2")),
                 selected_tickers=list(state.get("selected_tickers", [])),
-                optimized_metrics=state.get("optimized_metrics") or {},
-                optimized_weights=state.get("optimized_weights") or {},
+                candidates=candidates,
                 baseline_metrics=state.get("baseline_metrics"),
                 current_metrics=state.get("current_metrics"),
                 preferences=prefs,
                 news_signals=state.get("news_signals"),
             )
 
-            decision = str(llm_payload.get("decision", "accept")).lower().strip()
-            actions = llm_payload.get("proposed_actions", []) or []
-            rationale = str(llm_payload.get("rationale", "")).strip()
+            chosen = str(llm_payload.get("chosen_candidate", "")).lower().strip()
+            if chosen not in candidates:
+                chosen = "maxsharpe" if "maxsharpe" in candidates else next(iter(candidates.keys()))
 
-            # Guard: exclude_assets only if user explicitly signaled it
-            if not allow_exclude:
-                actions = [a for a in actions if a.get("type") != "exclude_assets"]
-
-            # Guard: if wants diversification, do not increase w_max
-            filtered: List[Dict[str, Any]] = []
-            for a in actions:
-                if a.get("type") == "set_w_max" and wants_div:
-                    try:
-                        if float(a.get("value")) > float(state["w_max"]):
-                            continue
-                    except Exception:
-                        continue
-                filtered.append(a)
-            actions = filtered
-
-            # Guard: conflict case -> only mild changes (prefer lambda_l2 + objective switch at most)
-            if conflict:
-                keep = {"set_lambda_l2", "set_objective_key"}
-                actions = [a for a in actions if a.get("type") in keep]
-
-            needs_refine = (decision == "refine") and (len(actions) > 0)
-
-            state["needs_refine"] = needs_refine
-            state["refine_actions"] = actions if needs_refine else []
-            state["llm_decision"] = {
-                "decision": "refine" if needs_refine else "accept",
-                "rationale": rationale or ("LLM proposed changes." if needs_refine else "LLM: accept."),
-                "proposed_actions": state["refine_actions"],
-            }
-            state["debug_notes"].append(f"LLM_Evaluate(LLM): decision={decision}, actions={actions}")
+            rationale = str(llm_payload.get("rationale", "")).strip() or "LLM selected the most preference-aligned candidate."
+            state["chosen_candidate"] = chosen  # type: ignore
+            state["llm_decision"] = {"decision": "accept", "rationale": rationale, "chosen_candidate": chosen}
+            state["debug_notes"].append(f"LLM_Select(LLM): chosen={chosen}")
             return state
 
         except Exception as e:
-            state["debug_notes"].append(f"LLM_Evaluate(LLM): failed -> fallback to rules: {e}")
+            state["debug_notes"].append(f"LLM_Select(LLM): failed → fallback: {e}")
 
-    # ---- Minimal fallback rules (only for safety) ----
-    actions: List[Dict[str, Any]] = []
-    rationale_parts: List[str] = []
-
-    # If news regime high: reduce concentration + diversify
-    news_signals = state.get("news_signals") or {}
-    vol_regime = ((news_signals.get("global") or {}).get("vol_regime")) or "normal"
-    if vol_regime == "high":
-        actions.append({"type": "set_w_max", "value": _clamp(float(state["w_max"]) - 0.05, 0.10, 1.0)})
-        actions.append({"type": "set_lambda_l2", "value": max(float(state["lambda_l2"]), 5e-3)})
-        rationale_parts.append("Elevated volatility regime → reduce concentration + encourage diversification.")
-
-    # If user provided explicit pain_points, honor them minimally
-    if conflict:
-        actions.append({"type": "set_lambda_l2", "value": max(float(state["lambda_l2"]), 2e-3)})
-        rationale_parts.append("Conflicting feedback → mild diversification pressure.")
-    else:
-        if pain_points:
-            if (PP_TOO_RISKY in pain_points) or (PP_NOT_SURE in pain_points):
-                actions.append({"type": "set_objective_key", "value": "minvar"})
-                actions.append({"type": "set_lambda_l2", "value": max(float(state["lambda_l2"]), 5e-3)})
-                rationale_parts.append("Risk/smoother preference → switch to min-variance + diversify.")
-            if PP_TOO_CONCENTRATED in pain_points:
-                actions.append({"type": "set_w_max", "value": min(float(state["w_max"]), 0.20)})
-                actions.append({"type": "set_lambda_l2", "value": max(float(state["lambda_l2"]), 5e-3)})
-                rationale_parts.append("Concentration complaint → lower cap + add L2.")
-        else:
-            # If no pain_points but dissatisfaction exists, do one safe move:
-            # keep fallback conservative: small lambda_l2 increase
-            actions.append({"type": "set_lambda_l2", "value": max(float(state["lambda_l2"]), 2e-3)})
-            rationale_parts.append("No structured feedback; applying small safe diversification pressure.")
-
-    # de-dup by type (keep last)
-    last_by_type: Dict[str, Dict[str, Any]] = {}
-    for a in actions:
-        if a.get("type"):
-            last_by_type[a["type"]] = a
-    actions = list(last_by_type.values())
-
-    # enforce exclude_assets only if user wants it
-    if not allow_exclude:
-        actions = [a for a in actions if a.get("type") != "exclude_assets"]
-
-    # enforce no w_max increase when wants_div
-    if wants_div:
-        filtered2: List[Dict[str, Any]] = []
-        for a in actions:
-            if a.get("type") == "set_w_max":
-                try:
-                    if float(a.get("value")) > float(state["w_max"]):
-                        continue
-                except Exception:
-                    continue
-            filtered2.append(a)
-        actions = filtered2
-
-    needs_refine = len(actions) > 0
-    state["needs_refine"] = needs_refine
-    state["refine_actions"] = actions if needs_refine else []
+    chosen = "maxsharpe" if "maxsharpe" in candidates else next(iter(candidates.keys()))
+    state["chosen_candidate"] = chosen  # type: ignore
     state["llm_decision"] = {
-        "decision": "refine" if needs_refine else "accept",
-        "rationale": " ".join(rationale_parts) if rationale_parts else "No actionable adjustments inferred.",
-        "proposed_actions": state["refine_actions"],
+        "decision": "accept",
+        "rationale": "LLM disabled/unavailable; defaulting to a deterministic candidate.",
+        "chosen_candidate": chosen,
     }
-    state["debug_notes"].append(f"LLM_Evaluate(FallbackRules): actions={state['refine_actions']}")
+    state["debug_notes"].append(f"LLM_Select(Fallback): chosen={chosen}")
     return state
 
 
-# ----------------------------
-# Node: apply refinement
-# ----------------------------
-def node_apply_refine(state: PortfolioState) -> PortfolioState:
-    applied: List[Dict[str, Any]] = []
-    rejected: List[Dict[str, Any]] = []
+def node_finalize_selection(state: PortfolioState) -> PortfolioState:
+    chosen = state.get("chosen_candidate") or state.get("objective_key", "maxsharpe")
+    candidates = state.get("candidates") or {}
 
-    prefs = _merged_prefs(state)
-    wants_div = _wants_diversification(prefs)
-    allow_exclude = _user_dislikes_assets(prefs)
-
-    for a in state.get("refine_actions", []):
-        t = a.get("type")
-
-        if t == "set_objective_key":
-            v = str(a.get("value") or "").strip().lower()
-            if v not in ("maxsharpe", "minvar"):
-                rejected.append({**a, "reason": "invalid objective_key"})
-                continue
-            state["objective_key"] = "minvar" if v == "minvar" else "maxsharpe"
-            applied.append(a)
-            continue
-
-        if t == "set_w_max":
-            try:
-                v = float(a.get("value"))
-                v = _clamp(v, 0.05, 1.0)
-                if wants_div and v > float(state["w_max"]):
-                    rejected.append({**a, "reason": "cannot increase w_max when user wants diversification"})
-                    continue
-                state["w_max"] = v
-                applied.append(a)
-            except Exception:
-                rejected.append({**a, "reason": "invalid w_max"})
-            continue
-
-        if t == "set_lambda_l2":
-            try:
-                v = float(a.get("value"))
-                v = _clamp(v, 0.0, 1.0)
-                state["lambda_l2"] = v
-                applied.append(a)
-            except Exception:
-                rejected.append({**a, "reason": "invalid lambda_l2"})
-            continue
-
-        if t == "exclude_assets":
-            if not allow_exclude:
-                rejected.append({**a, "reason": "exclude_assets only allowed when user dislikes assets"})
-                continue
-            ex = set(map(str, a.get("tickers", []) or []))
-            if not ex:
-                rejected.append({**a, "reason": "empty exclude list"})
-                continue
-            state["selected_tickers"] = [x for x in state["selected_tickers"] if x not in ex]
-            applied.append(a)
-            continue
-
-        rejected.append({**a, "reason": "unknown action type"})
-
-    state["changes_applied"] = applied
-    state["changes_rejected"] = rejected
-
-    state["iteration"] = int(state["iteration"]) + 1
-    state["debug_notes"].append(
-        f"ApplyRefine: applied={len(applied)}, rejected={len(rejected)}, iteration={state['iteration']}"
-    )
-
-    if not state.get("selected_tickers"):
-        state["needs_refine"] = False
-        state["refine_actions"] = []
-        state["debug_notes"].append("ApplyRefine: no tickers left after exclusions -> stop loop.")
-
+    if chosen in candidates:
+        state["optimized_weights"] = candidates[chosen].get("weights") or {}
+        # ✅ already normalized in node_risk_candidates
+        state["optimized_metrics"] = candidates[chosen].get("metrics") or {}
+        state["objective_key"] = chosen
+        state["debug_notes"].append(
+            f"FinalizeSelection: chosen={chosen}, active={len(state['optimized_weights'])}, "
+            f"max_w={_safe_max_weight(state['optimized_weights']):.4f}"
+        )
+    else:
+        state["optimized_weights"] = {}
+        state["optimized_metrics"] = {}
+        state["debug_notes"].append(f"FinalizeSelection: chosen candidate '{chosen}' missing -> empty result.")
     return state
 
 
 def node_explain(state: PortfolioState) -> PortfolioState:
+    """
+    Fix #2:
+    - Use the chosen candidate as the SINGLE source-of-truth for the explanation,
+      so we don't accidentally narrate a different objective than the one selected.
+    """
     if not state.get("optimization_result"):
         state["explanation"] = "No optimization result available (empty universe)."
         state["debug_notes"].append("Explain: skipped (no optimization_result).")
         return state
 
-    obj = "max_sharpe" if state.get("objective_key") == "maxsharpe" else "min_var"
+    chosen = state.get("objective_key") or "maxsharpe"
+    obj = "max_sharpe" if chosen == "maxsharpe" else "min_var"
+
+    # ✅ keep recommendation_agent but force it to talk about the chosen key
     text = recommendation_agent(
         state["optimization_result"],
         objective=obj,
@@ -777,18 +567,29 @@ def node_explain(state: PortfolioState) -> PortfolioState:
         rf=float(state["rf"]),
         preferences=_merged_prefs(state),
     )
+
+  
+    om = state.get("optimized_metrics") or {}
+    r_pct = om.get("return_pct")
+    v_pct = om.get("vol_pct")
+    s = om.get("sharpe")
+
+    if isinstance(r_pct, (int, float)) and isinstance(v_pct, (int, float)):
+        extra = f"\n\n(Selected candidate metrics: return {float(r_pct):.1f}%, vol {float(v_pct):.1f}%"
+        if isinstance(s, (int, float)):
+            extra += f", Sharpe {float(s):.2f})"
+        else:
+            extra += ")"
+        text += extra
+
     state["explanation"] = text
-    state["debug_notes"].append(f"Explain: generated text (objective_str={obj}).")
+    state["debug_notes"].append(f"Explain: generated (chosen_candidate={chosen}, objective_str={obj}).")
     return state
 
 
-def route_after_llm_evaluate(state: PortfolioState) -> str:
-    return "apply_refine" if state.get("needs_refine") else "explain"
-
-
-# ----------------------------
-# Build graph
-# ----------------------------
+# =========================================================
+# Graph wiring
+# =========================================================
 def build_portfolio_graph():
     g = StateGraph(PortfolioState)
 
@@ -798,14 +599,15 @@ def build_portfolio_graph():
 
     g.add_node("data", node_data)
     g.add_node("optimize", node_optimize)
-    g.add_node("extract", node_extract_portfolio)
-    g.add_node("risk", node_risk)
+
+    g.add_node("extract_candidates", node_extract_candidates)
+    g.add_node("risk_candidates", node_risk_candidates)
 
     g.add_node("news_fetch", node_news_fetch)
-    g.add_node("news_signals", node_news_signals_llm)
-    g.add_node("llm_evaluate", node_llm_evaluate)
+    g.add_node("news_signals", node_news_signals_placeholder)
 
-    g.add_node("apply_refine", node_apply_refine)
+    g.add_node("llm_select", node_llm_select_candidate)
+    g.add_node("finalize", node_finalize_selection)
     g.add_node("explain", node_explain)
 
     g.set_entry_point("ask_clarifications")
@@ -819,21 +621,15 @@ def build_portfolio_graph():
     g.add_edge("perception", "baselines")
     g.add_edge("baselines", "data")
     g.add_edge("data", "optimize")
-    g.add_edge("optimize", "extract")
-    g.add_edge("extract", "risk")
 
-    g.add_edge("risk", "news_fetch")
+    g.add_edge("optimize", "extract_candidates")
+    g.add_edge("extract_candidates", "risk_candidates")
+
+    g.add_edge("risk_candidates", "news_fetch")
     g.add_edge("news_fetch", "news_signals")
-    g.add_edge("news_signals", "llm_evaluate")
-
-    g.add_conditional_edges(
-        "llm_evaluate",
-        route_after_llm_evaluate,
-        {"apply_refine": "apply_refine", "explain": "explain"},
-    )
-
-    # loop back after refine
-    g.add_edge("apply_refine", "baselines")
+    g.add_edge("news_signals", "llm_select")
+    g.add_edge("llm_select", "finalize")
+    g.add_edge("finalize", "explain")
     g.add_edge("explain", END)
 
     return g.compile()
@@ -845,7 +641,7 @@ def run_graph(
     w_max: float,
     preferences: Optional[Dict[str, Any]] = None,
     current_weights: Optional[Dict[str, float]] = None,
-    max_iterations: int = 2,
+    max_iterations: int = 0,
     clarification_answers: Optional[Dict[str, Any]] = None,
     mode: Mode = "refine",
     use_llm: bool = False,
@@ -855,19 +651,20 @@ def run_graph(
     init: PortfolioState = {
         "mode": mode,
         "selected_tickers": selected_tickers,
-        "rf": rf,
-        "w_max": w_max,
+        "rf": float(rf),
+        "w_max": float(w_max),
         "lambda_l2": 1e-3,
         "preferences": preferences or {},
         "use_llm": bool(use_llm),
         "current_weights": current_weights,
-        "iteration": 0,
-        "max_iterations": int(max_iterations),
         "debug_notes": [],
         "clarification_answers": clarification_answers,
-        "changes_applied": [],
-        "changes_rejected": [],
+        "objective_key": "maxsharpe",
+        "chosen_candidate": None,
+        "candidates": {},
+        "llm_decision": None,
+        "optimized_weights": {},
+        "optimized_metrics": {},
     }
 
     return app.invoke(init, config={"recursion_limit": 200})
- 

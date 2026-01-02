@@ -1,15 +1,20 @@
- # llm_client.py
-# ✅ Updated to support REAL LLM value + new action: set_objective_key
-# - satisfaction == "yes" => MUST accept, no actions
-# - satisfaction == "no"  => MAY refine
-# - Actions NOW: set_objective_key, set_w_max, set_lambda_l2, exclude_assets
-# - Server-side post-guards enforce safety + prevent nonsense:
-#     * If user wants diversification => do NOT increase w_max
-#     * exclude_assets only if user explicitly indicated dislike-assets OR explicitly gave excluded_assets
-#     * conflict (too risky + too conservative) => only mild changes (lambda_l2 and optional objective switch)
-# - IMPORTANT CHANGE for your thesis goal:
-#     * If extra_notes exists (and pain_points empty), LLM is allowed to interpret and can switch objective to minvar.
-#     * This is where the LLM “adds value” without you hardcoding every phrase.
+# llm_client.py
+# ✅ Option A (robust): Decision + Explanation are DECOUPLED
+# + ✅ NEW: LLM Interpretation + LLM Verifier (self-check)
+#
+# Flow:
+# 0) LLM interprets user feedback -> tiny intent JSON (no hard mapping)
+# 1) LLM chooses candidate -> FINAL_CHOICE: <candidate>
+# 1.5) LLM verifies choice against intent + metric_table -> may correct
+# 2) LLM generates explanation (free-form)
+#
+# FIXES INCLUDED:
+# 1) ✅ Normalize return/vol to DECIMALS (fixes 51% vs 5.1% scale confusion)
+# 2) ✅ Prefer *_pct fields in explanation context (return_pct/vol_pct/max_weight_pct)
+# 3) ✅ Infer a small structured hint from extra_notes → pain_points (not a rule tree)
+# 4) ✅ Decision rubric handles "accept lower returns to reduce drawdowns"
+# 5) ✅ Explanation call no longer receives reasoner_text
+# 6) ✅ NEW: LLM interpretation + verifier + debug logging
 
 from __future__ import annotations
 
@@ -24,7 +29,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-Decision = Literal["accept", "refine"]
+Decision = Literal["accept"]
 
 # =========================================================
 # UI label constants (MUST match dashboard + portfolio_langgraph)
@@ -35,59 +40,12 @@ PP_TOO_CONCENTRATED = "It’s too concentrated in a few assets"
 PP_DISLIKE_ASSETS = "I don’t like some of the assets"
 PP_NOT_SURE = "I’m not sure — I just want something safer/smoother"
 
+_ALLOWED_CANDIDATES = {"maxsharpe", "minvar"}
+
+
 # =========================================================
 # Small helpers
 # =========================================================
-def _strip_code_fences(text: str) -> str:
-    text = (text or "").strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```[a-zA-Z]*\n", "", text)
-        text = re.sub(r"\n```$", "", text)
-    return text.strip()
-
-
-def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
-    """
-    Accepts:
-      - pure JSON dict
-      - JSON dict wrapped in fences
-      - text that contains a first {...} JSON dict
-    """
-    text = _strip_code_fences(text)
-
-    try:
-        obj = json.loads(text)
-        if isinstance(obj, dict):
-            return obj
-    except Exception:
-        pass
-
-    start = text.find("{")
-    if start < 0:
-        return None
-
-    depth = 0
-    for i in range(start, len(text)):
-        ch = text[i]
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                candidate = text[start : i + 1]
-                try:
-                    obj = json.loads(candidate)
-                    if isinstance(obj, dict):
-                        return obj
-                except Exception:
-                    return None
-    return None
-
-
-def _clamp_float(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
-
-
 def _pref_list(x: Any) -> List[str]:
     if x is None:
         return []
@@ -96,164 +54,158 @@ def _pref_list(x: Any) -> List[str]:
     return [str(x)]
 
 
-def _safe_bool(x: Any) -> bool:
-    return bool(x) is True
+def _has_meaningful_text(x: Any) -> bool:
+    s = str(x or "").strip()
+    return len(s) >= 8
 
 
 def _safe_dict(x: Any) -> Dict[str, Any]:
     return x if isinstance(x, dict) else {}
 
 
-def _has_meaningful_text(x: Any) -> bool:
-    s = str(x or "").strip()
-    return len(s) >= 8
+def _safe_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        v = float(x)
+        if not (v == v):  # NaN
+            return None
+        return v
+    except Exception:
+        return None
 
 
-# =========================================================
-# Output schema validation (+ SAFETY LIMITS)
-# =========================================================
-# ✅ allow objective switching (your new portfolio_langgraph supports it)
-_ALLOWED_ACTION_TYPES = {"set_objective_key", "set_w_max", "set_lambda_l2", "exclude_assets"}
-
-_MAX_ACTIONS = 2
-_MAX_EXCLUDE_TICKERS = 10
-
-_MIN_W_MAX = 0.05
-_MAX_W_MAX = 1.0
-
-_MIN_L2 = 0.0
-_MAX_L2 = 1.0
+def _norm_pct_to_decimal(x: Any) -> Any:
+    """
+    Enforce return/vol as decimals.
+    If value looks like percent-scale (e.g., 5.1 or 51.0), convert to decimal.
+    Keep small decimals (<= ~1.5) as-is.
+    """
+    v = _safe_float(x)
+    if v is None:
+        return x
+    if abs(v) > 1.5:
+        return v / 100.0
+    return v
 
 
-def validate_llm_decision_payload(payload: Dict[str, Any]) -> Tuple[bool, str]:
-    if not isinstance(payload, dict):
-        return False, "payload is not a dict"
+def _infer_pain_points_from_notes(extra_notes: str, pain_points: List[str]) -> List[str]:
+    """
+    Minimal structured hint from free text (NOT a rule tree):
+    If notes indicate 'smoother/avoid drawdowns/safer', add one label so the LLM
+    doesn't miss the intent when pain_points UI is empty.
+    """
+    if not extra_notes:
+        return pain_points
 
-    decision = payload.get("decision")
-    if decision not in ("accept", "refine"):
-        return False, "decision must be 'accept' or 'refine'"
+    s = extra_notes.lower()
+    risk_words = [
+        "smoother",
+        "smooth",
+        "drawdown",
+        "drawdowns",
+        "big drawdown",
+        "avoid big drawdowns",
+        "avoid drawdowns",
+        "safer",
+        "lower risk",
+        "less risk",
+        "downside",
+        "avoid losses",
+        "avoid loss",
+    ]
+    if any(w in s for w in risk_words):
+        if PP_NOT_SURE not in pain_points and PP_TOO_RISKY not in pain_points:
+            pain_points = list(pain_points) + [PP_NOT_SURE]
+    return pain_points
 
-    if "rationale" in payload and not isinstance(payload["rationale"], str):
-        return False, "rationale must be a string"
 
-    actions = payload.get("proposed_actions", [])
-    if actions is None:
-        actions = []
-    if not isinstance(actions, list):
-        return False, "proposed_actions must be a list"
+def _extract_final_choice(text: str, available: List[str]) -> Optional[str]:
+    """
+    Parse a line like:
+      FINAL_CHOICE: minvar
+    Accepts casing/whitespace variants.
+    """
+    if not text:
+        return None
+    avail_set = set(a.lower().strip() for a in available)
+    m = re.search(r"FINAL_CHOICE\s*:\s*([A-Za-z0-9_\-]+)", text, flags=re.IGNORECASE)
+    if not m:
+        return None
+    cand = m.group(1).strip().lower()
+    if cand in avail_set:
+        return cand
+    return None
 
-    if len(actions) > _MAX_ACTIONS:
-        return False, f"too many actions (max {_MAX_ACTIONS})"
 
-    for a in actions:
-        if not isinstance(a, dict):
-            return False, "each action must be an object/dict"
+def _compact_candidate(c: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    candidates expected shape (from portfolio_langgraph):
+      {
+        "weights": {...},
+        "metrics": {...}   # may include *_pct fields (recommended)
+      }
 
-        t = a.get("type")
-        if t not in _ALLOWED_ACTION_TYPES:
-            return False, f"unknown action type: {t}"
+    ✅ IMPORTANT:
+    - Normalize return/vol so the LLM never sees mixed scales (0.51 vs 51.0 etc.)
+    - Pass *_pct fields through so the LLM writes "10.4%" not "0.104%".
+    """
+    m = _safe_dict(c.get("metrics"))
+    w = _safe_dict(c.get("weights"))
 
-        if t == "set_objective_key":
-            v = str(a.get("value") or "").strip().lower()
-            if v not in ("maxsharpe", "minvar"):
-                return False, "set_objective_key.value must be 'maxsharpe' or 'minvar'"
+    # decimals (for safe comparisons / fallback logic)
+    ret = _norm_pct_to_decimal(m.get("return"))
+    vol = _norm_pct_to_decimal(m.get("vol"))
+    sharpe = _safe_float(m.get("sharpe"))
 
-        if t in ("set_w_max", "set_lambda_l2"):
-            try:
-                float(a.get("value"))
-            except Exception:
-                return False, f"{t}.value must be numeric"
+    # normalized display (preferred for explanation text)
+    ret_pct = _safe_float(m.get("return_pct"))
+    vol_pct = _safe_float(m.get("vol_pct"))
+    max_w_pct = _safe_float(m.get("max_weight_pct"))
 
-        if t == "exclude_assets":
-            tickers = a.get("tickers", [])
-            if not isinstance(tickers, list) or any(not isinstance(x, str) for x in tickers):
-                return False, "exclude_assets.tickers must be a list[str]"
-            if len(tickers) > _MAX_EXCLUDE_TICKERS:
-                return False, f"exclude_assets.tickers too long (max {_MAX_EXCLUDE_TICKERS})"
+    top_w = sorted([(k, float(v)) for k, v in w.items()], key=lambda x: x[1], reverse=True)[:5]
+    return {
+        "metrics": {
+            # raw decimals (still useful)
+            "return": ret,
+            "vol": vol,
+            "sharpe": sharpe,
+            "max_weight": m.get("max_weight"),
+            "effective_n": m.get("effective_n"),
+            "active_assets": m.get("active_assets"),
+            # ✅ preferred for natural-language
+            "return_pct": ret_pct,
+            "vol_pct": vol_pct,
+            "max_weight_pct": max_w_pct,
+        },
+        "top_weights": top_w,
+    }
 
+
+def validate_choice(choice: str, available: List[str]) -> Tuple[bool, str]:
+    if not choice:
+        return False, "choice missing"
+    c = choice.lower().strip()
+    if c not in [a.lower().strip() for a in available]:
+        return False, f"choice must be one of {available}"
     return True, "ok"
 
 
-def normalize_actions(actions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Clamp + de-dupe by type (keep last)."""
-    last: Dict[str, Dict[str, Any]] = {}
-    for a in actions:
-        t = a.get("type")
-        if not t:
-            continue
-
-        if t == "set_objective_key":
-            v = str(a.get("value") or "").strip().lower()
-            if v in ("maxsharpe", "minvar"):
-                a = {**a, "value": v}
-            else:
-                continue
-
-        if t == "set_w_max":
-            v = float(a.get("value"))
-            a = {**a, "value": _clamp_float(v, _MIN_W_MAX, _MAX_W_MAX)}
-
-        if t == "set_lambda_l2":
-            v = float(a.get("value"))
-            a = {**a, "value": _clamp_float(v, _MIN_L2, _MAX_L2)}
-
-        last[t] = a
-
-    return list(last.values())
+def _sort_available(candidates: Dict[str, Any]) -> List[str]:
+    """
+    Stable ordering to reduce tiny-model randomness:
+    - prefer known keys order: maxsharpe then minvar
+    - else fallback to sorted keys
+    """
+    keys = list(candidates.keys())
+    ordered = [k for k in ["maxsharpe", "minvar"] if k in keys]
+    rest = sorted([k for k in keys if k not in ordered])
+    return ordered + rest
 
 
-# =========================================================
-# Deterministic “notes flags” (optional, not required)
-# NOTE: We keep this, but it should NOT be your main logic anymore.
-# The main value path is: LLM reads extra_notes and chooses objective/actions.
-# =========================================================
-def _actions_from_extra_note_flags(
-    *,
-    flags: Dict[str, Any],
-    w_max_current: float,
-    lambda_l2_current: float,
-    wants_diversification: bool,
-) -> List[Dict[str, Any]]:
-    if not flags:
-        return []
-
-    actions: List[Dict[str, Any]] = []
-
-    avoid_drawdowns = _safe_bool(flags.get("avoid_drawdowns"))
-    safer_smoother = _safe_bool(flags.get("safer_smoother"))
-    prefer_div = _safe_bool(flags.get("prefer_diversification"))
-    avoid_big_positions = _safe_bool(flags.get("avoid_big_positions"))
-    still_want_growth = _safe_bool(flags.get("still_want_growth"))
-
-    # Smoothness / drawdowns: nudge towards minvar + slightly higher L2
-    if avoid_drawdowns or safer_smoother:
-        actions.append({"type": "set_objective_key", "value": "minvar"})
-        new_l2 = float(lambda_l2_current) + 0.001
-        if float(lambda_l2_current) < 0.001:
-            new_l2 = 0.003
-        actions.append({"type": "set_lambda_l2", "value": new_l2})
-
-    # Diversification / avoid big positions: reduce w_max a bit (never increase)
-    if (prefer_div or avoid_big_positions) and (not still_want_growth):
-        target = float(w_max_current) - 0.05
-        actions.append({"type": "set_w_max", "value": target})
-
-    # Post-guards later will enforce no w_max increase if wants_diversification.
-    return actions
-
-
-def _merge_actions_priority(primary: List[Dict[str, Any]], secondary: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Merge actions with priority: primary wins on same type."""
-    by_type: Dict[str, Dict[str, Any]] = {}
-    for a in secondary:
-        t = a.get("type")
-        if t:
-            by_type[t] = a
-    for a in primary:
-        t = a.get("type")
-        if t:
-            by_type[t] = a
-    return list(by_type.values())
+def _extract_metric_table(ctx: Dict[str, Any], available: List[str]) -> Dict[str, Any]:
+    cand_map = (ctx.get("candidates") or {})
+    return {k: ((cand_map.get(k) or {}).get("metrics") or {}) for k in available}
 
 
 # =========================================================
@@ -299,6 +251,10 @@ class LLMClient:
             max_tokens=int(os.getenv("HF_MAX_TOKENS", "512")),
             timeout_s=float(os.getenv("HF_TIMEOUT_S", "60.0")),
         )
+
+        print(f"[LLMClient] provider={self.provider}")
+        print(f"[LLMClient] ollama_model={self.ollama_cfg.model} base_url={self.ollama_cfg.base_url}")
+        print(f"[LLMClient] hf_model={self.hf_cfg.model}")
 
     # ----------------------------
     # Transport
@@ -363,246 +319,317 @@ class LLMClient:
             return self._chat_hf(system, user)
         return self._chat_ollama(system, user)
 
-    # ----------------------------
-    # Decision Agent
-    # ----------------------------
-    def decide_refine_actions(
+    # =========================================================
+    # NEW: Interpret user feedback (LLM) -> tiny intent JSON
+    # =========================================================
+    def _interpret_feedback(self, pain_points: List[str], extra_notes: str) -> Dict[str, Any]:
+        """
+        Returns a tiny JSON intent. No hard mapping.
+        This lets us LOG what the LLM thinks "too risky" means.
+        """
+        system = (
+            "You interpret portfolio feedback into a tiny structured intent.\n"
+            "Return ONLY valid JSON (no markdown).\n"
+            "Schema:\n"
+            "{\n"
+            '  "risk_aversion": "low"|"medium"|"high",\n'
+            '  "return_seeking": "low"|"medium"|"high",\n'
+            '  "prefers_diversification": true|false,\n'
+            '  "notes_summary": string\n'
+            "}\n"
+            "Rules:\n"
+            "- If pain_points include 'It feels too risky' or notes mention drawdowns/smoother/safer -> risk_aversion=high.\n"
+            "- If pain_points include 'It feels too conservative' -> return_seeking=high.\n"
+            "- Use notes_summary to paraphrase user intent briefly.\n"
+        )
+        user = json.dumps({"pain_points": pain_points, "extra_notes": extra_notes}, ensure_ascii=False)
+        text = self.chat(system=system, user=user).strip()
+
+        # best-effort JSON parse
+        try:
+            j = json.loads(text)
+            if not isinstance(j, dict):
+                raise ValueError("intent not dict")
+        except Exception:
+            # fallback intent (still not hard mapping; just safe default)
+            j = {
+                "risk_aversion": "medium",
+                "return_seeking": "medium",
+                "prefers_diversification": False,
+                "notes_summary": (extra_notes or "")[:160],
+            }
+
+        # debug log
+        if os.getenv("LLM_DEBUG_INTENT", "0") == "1":
+            print("\n===== LLM DEBUG: INTERPRETED INTENT =====")
+            print(json.dumps(j, indent=2))
+            print("========================================\n")
+
+        return j
+
+    # =========================================================
+    # Candidate Selection (Decision) + Verification + Explanation
+    # =========================================================
+    def select_candidate(
         self,
         *,
         mode: str,
-        iteration: int,
-        max_iterations: int,
         objective_key: str,
         rf: float,
         w_max: float,
         lambda_l2: float,
         selected_tickers: List[str],
-        optimized_metrics: Dict[str, Any],
-        optimized_weights: Dict[str, float],
+        candidates: Dict[str, Any],
         baseline_metrics: Optional[Dict[str, Any]],
         current_metrics: Optional[Dict[str, Any]],
         preferences: Dict[str, Any],
         news_signals: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
+        """
+        Returns:
+          {
+            "decision": "accept",
+            "chosen_candidate": "maxsharpe" | "minvar",
+            "rationale": "..."
+          }
+        """
 
-        # --- hard guards first ---
+        # ---- hard guards ----
         if mode == "base":
-            return {"decision": "accept", "rationale": "Base mode: no refinement.", "proposed_actions": []}
-        if iteration >= max_iterations:
-            return {"decision": "accept", "rationale": "Max iterations reached.", "proposed_actions": []}
+            chosen0 = str(objective_key or "maxsharpe").lower().strip() or "maxsharpe"
+            if chosen0 not in candidates:
+                chosen0 = "maxsharpe" if "maxsharpe" in candidates else next(iter(candidates.keys()))
+            return {
+                "decision": "accept",
+                "chosen_candidate": chosen0,
+                "rationale": "Base mode: candidate selection disabled.",
+            }
 
         prefs = preferences or {}
         satisfaction = str(prefs.get("satisfaction") or "").lower().strip()
 
-        # satisfaction == yes => MUST accept
+        # satisfaction yes -> keep current objective (no selection)
         if satisfaction == "yes":
+            chosen = str(objective_key or "maxsharpe").lower().strip() or "maxsharpe"
+            if chosen not in candidates:
+                chosen = "maxsharpe" if "maxsharpe" in candidates else next(iter(candidates.keys()))
             return {
                 "decision": "accept",
-                "rationale": "User indicated the portfolio looks good (satisfaction=yes).",
-                "proposed_actions": [],
+                "chosen_candidate": chosen,
+                "rationale": "User satisfaction=yes; skipping candidate comparison.",
             }
 
-        # STRICT: only refine if explicitly "no"
+        # only run selection if explicit dissatisfaction
         if satisfaction != "no":
+            chosen = str(objective_key or "maxsharpe").lower().strip() or "maxsharpe"
+            if chosen not in candidates:
+                chosen = "maxsharpe" if "maxsharpe" in candidates else next(iter(candidates.keys()))
             return {
                 "decision": "accept",
-                "rationale": "No explicit dissatisfaction (satisfaction!='no'). Skipping refinement.",
-                "proposed_actions": [],
+                "chosen_candidate": chosen,
+                "rationale": "No explicit dissatisfaction; defaulting to the current objective.",
             }
+
+        # availability (stable order)
+        available = _sort_available(candidates)
+        available = [k for k in available if k in _ALLOWED_CANDIDATES] or available
+        if not available:
+            return {"decision": "accept", "chosen_candidate": "maxsharpe", "rationale": "No candidates provided."}
+
+        # compact payload (normalized + includes *_pct fields)
+        candidates_summary = {k: _compact_candidate(_safe_dict(v)) for k, v in candidates.items()}
 
         pain_points = _pref_list(prefs.get("pain_points"))
-        concentration = prefs.get("concentration")
-
-        wants_div = (concentration == "low") or (PP_TOO_CONCENTRATED in pain_points)
-        conflict_risk = (PP_TOO_RISKY in pain_points) and (PP_TOO_CONSERVATIVE in pain_points)
-
-        # Allow exclude_assets ONLY if user explicitly said dislike-assets OR provided excluded_assets list
-        excluded_assets_ui = prefs.get("excluded_assets") or []
-        if not isinstance(excluded_assets_ui, list):
-            excluded_assets_ui = []
-        excluded_assets_ui = [str(x) for x in excluded_assets_ui if isinstance(x, (str, int, float))]
-        user_signaled_dislike_assets = (PP_DISLIKE_ASSETS in pain_points) or (len(excluded_assets_ui) > 0)
-
-        # extra_notes: raw user text (THIS is what you want the LLM to interpret)
         extra_notes = str(prefs.get("extra_notes") or "").strip()
-        has_extra_notes = _has_meaningful_text(extra_notes)
 
-        # Optional: extra flags from UI (if you have them)
-        extra_note_flags = _safe_dict(prefs.get("extra_note_flags"))
-        notes_tickers = prefs.get("notes_tickers", [])
-        if not isinstance(notes_tickers, list):
-            notes_tickers = []
-        notes_tickers = [str(t) for t in notes_tickers if isinstance(t, (str, int, float))]
-        # keep only tickers in current universe
-        universe = set(map(str, selected_tickers))
-        notes_tickers = [t for t in notes_tickers if t in universe][:_MAX_EXCLUDE_TICKERS]
+        # ✅ infer one structured hint from free-text notes (helps when UI pain_points empty)
+        pain_points = _infer_pain_points_from_notes(extra_notes, pain_points)
 
-        # Deterministic hint actions (secondary): flags -> small safe actions
-        flag_actions = _actions_from_extra_note_flags(
-            flags=extra_note_flags,
-            w_max_current=float(w_max),
-            lambda_l2_current=float(lambda_l2),
-            wants_diversification=wants_div,
-        )
+        # ✅ NEW: LLM interprets feedback -> intent (and we can log it)
+        intent = self._interpret_feedback(pain_points, extra_notes)
 
-        # If UI explicitly excluded, include it as deterministic exclusions
-        if excluded_assets_ui and user_signaled_dislike_assets:
-            # keep within universe
-            ex = [t for t in excluded_assets_ui if t in universe][:_MAX_EXCLUDE_TICKERS]
-            if ex:
-                flag_actions.append({"type": "exclude_assets", "tickers": ex})
-
-        # If notes mention tickers, treat as exclusion ONLY if user signaled dislike-assets
-        if user_signaled_dislike_assets and notes_tickers:
-            flag_actions.append({"type": "exclude_assets", "tickers": notes_tickers})
-
-        constraints_hint = {
-            "user_wants_diversification": wants_div,
-            "do_not_increase_w_max": wants_div,
-            "allow_exclude_assets": user_signaled_dislike_assets,
-            "conflict_risky_and_conservative": conflict_risk,
-            "extra_notes_present": has_extra_notes,
-        }
-
-        system = (
-            "You are a portfolio refinement Decision Agent.\n"
-            "Return ONLY a single JSON object. No markdown, no extra text.\n"
-            "\n"
-            "Your job:\n"
-            "1) Decide if the CURRENT portfolio matches the user's feedback.\n"
-            "2) If satisfied => decision='accept'.\n"
-            "3) If NOT satisfied => decision='refine' and propose ONLY small safe adjustments.\n"
-            "\n"
-            "Allowed actions (ONLY these):\n"
-            "- set_objective_key: {\"type\":\"set_objective_key\",\"value\":\"maxsharpe\"|\"minvar\"}\n"
-            "- set_w_max:         {\"type\":\"set_w_max\",\"value\": number}\n"
-            "- set_lambda_l2:     {\"type\":\"set_lambda_l2\",\"value\": number}\n"
-            "- exclude_assets:    {\"type\":\"exclude_assets\",\"tickers\": [string,...]}\n"
-            f"- Propose 0-{_MAX_ACTIONS} actions max.\n"
-            f"- Never exclude more than {_MAX_EXCLUDE_TICKERS} assets.\n"
-            "\n"
-            "Safety rules (MUST follow):\n"
-            "- If user wants diversification => do NOT propose increasing w_max.\n"
-            "- Propose exclude_assets ONLY if allow_exclude_assets is true.\n"
-            "- If feedback is conflicting (too risky + too conservative) => keep changes mild (prefer lambda_l2; objective switch optional).\n"
-            "\n"
-            "How to use extra_notes:\n"
-            "- If user asks for smoother ride / avoid big drawdowns => prefer objective_key='minvar'.\n"
-            "- If user says keep best returns / maximize Sharpe => keep 'maxsharpe'.\n"
-            "- Use w_max + lambda_l2 to control concentration/diversification.\n"
-            "\n"
-            "Schema:\n"
-            "{\n"
-            '  \"decision\": \"accept\" | \"refine\",\n'
-            '  \"rationale\": \"short reason\",\n'
-            '  \"proposed_actions\": [ ... ]\n'
-            "}\n"
-        )
-
-        summary = {
-            "mode": mode,
-            "iteration": iteration,
-            "max_iterations": max_iterations,
+        ctx = {
             "objective_key_current": objective_key,
             "rf": rf,
-            "w_max_current": w_max,
-            "lambda_l2_current": lambda_l2,
+            "w_max": w_max,
+            "lambda_l2": lambda_l2,
             "n_universe": len(selected_tickers),
-            "top_weights": sorted(optimized_weights.items(), key=lambda x: x[1], reverse=True)[:5],
-            "optimized_metrics": {
-                "return": optimized_metrics.get("return"),
-                "vol": optimized_metrics.get("vol"),
-                "sharpe": optimized_metrics.get("sharpe"),
-                # (optional) any extra metrics you already compute
-                "max_drawdown": optimized_metrics.get("max_drawdown"),
-            },
-            "baseline_metrics": None
-            if not baseline_metrics
-            else {"return": baseline_metrics.get("return"), "vol": baseline_metrics.get("vol")},
-            "current_metrics": None
-            if not current_metrics
-            else {"return": current_metrics.get("return"), "vol": current_metrics.get("vol")},
             "preferences": {
                 **prefs,
-                # make sure extra_notes is visible (this is the key)
+                "satisfaction": "no",
+                "pain_points": pain_points,
                 "extra_notes": extra_notes,
+                "extra_notes_present": _has_meaningful_text(extra_notes),
             },
+            "intent": intent,  # ✅ NEW
+            "baseline_metrics": baseline_metrics,
+            "current_metrics": current_metrics,
             "news_signals": news_signals,
-            "constraints_hint": constraints_hint,
-            # This is just a hint; LLM can override. Priority merge below keeps them safe.
-            "deterministic_suggestion_from_flags": flag_actions,
+            "candidates": candidates_summary,
+            "available_candidates": available,
         }
 
-        raw = self.chat(system=system, user="Context:\n" + json.dumps(summary, ensure_ascii=False))
-        obj = _extract_first_json_object(raw)
-        if obj is None:
-            raise ValueError(f"LLM did not return valid JSON. Raw:\n{raw}")
+        # =========================================================
+        # STEP 1: DECISION (no JSON required)
+        # =========================================================
+        decision_system = (
+            "You are a portfolio candidate comparison assistant.\n"
+            "You will be given multiple candidate portfolios produced by a deterministic optimizer.\n"
+            "Choose exactly ONE candidate from available_candidates that best matches the user's intent.\n"
+            "\n"
+            "Use the provided 'intent' as the main interpretation of the feedback.\n"
+            "Decision rubric:\n"
+            "- If intent.risk_aversion is high -> prefer LOWER volatility and more diversification.\n"
+            "- If intent.return_seeking is high -> prefer HIGHER Sharpe ratio and/or higher return.\n"
+            "- Use ONLY the provided metrics; do not invent anything.\n"
+            "\n"
+            "Output format:\n"
+            "FINAL_CHOICE: <candidate>\n"
+        )
 
-        ok, reason = validate_llm_decision_payload(obj)
+        decision_user = "Context JSON:\n" + json.dumps(ctx, ensure_ascii=False)
+        reasoner_text = self.chat(system=decision_system, user=decision_user)
+
+        chosen = _extract_final_choice(reasoner_text, available)
+        if chosen is None:
+            retry_system = (
+                "Return ONLY the final line:\n"
+                "FINAL_CHOICE: <candidate>\n"
+                f"Candidate must be one of: {available}\n"
+            )
+            retry_text = self.chat(system=retry_system, user=reasoner_text)
+            chosen = _extract_final_choice(retry_text, available)
+
+        # fallback if model fails formatting
+        if chosen is None:
+            safer_intent = str(intent.get("risk_aversion", "medium")).lower() == "high"
+            if safer_intent:
+                vol_map: Dict[str, float] = {}
+                for k in available:
+                    m = (candidates_summary.get(k) or {}).get("metrics") or {}
+                    v = _safe_float(m.get("vol"))
+                    if v is not None:
+                        vol_map[k] = float(v)
+                chosen = min(vol_map.keys(), key=lambda x: vol_map[x]) if vol_map else available[0]
+            else:
+                sharpe_map: Dict[str, float] = {}
+                for k in available:
+                    m = (candidates_summary.get(k) or {}).get("metrics") or {}
+                    s = _safe_float(m.get("sharpe"))
+                    if s is not None:
+                        sharpe_map[k] = float(s)
+                chosen = max(sharpe_map.keys(), key=lambda x: sharpe_map[x]) if sharpe_map else available[0]
+
+        ok, _ = validate_choice(chosen, available)
         if not ok:
-            raise ValueError(f"Invalid LLM decision payload: {reason}. Raw:\n{raw}")
+            chosen = available[0]
 
-        llm_actions = normalize_actions(obj.get("proposed_actions", []) or [])
-        flag_actions = normalize_actions(flag_actions)
+        # =========================================================
+        # STEP 1.5: VERIFIER (LLM self-check)  ✅
+        # =========================================================
+        metric_table = _extract_metric_table(ctx, available)
 
-        # Priority merge: deterministic flags win if same type (keeps stability)
-        actions = _merge_actions_priority(flag_actions, llm_actions)
-        actions = normalize_actions(actions)
+        verify_system = (
+            "You are a strict verifier of a portfolio choice.\n"
+            "Check whether the chosen_candidate contradicts the user's intent.\n"
+            "Use ONLY intent + metric_table.\n"
+            "\n"
+            "If intent.risk_aversion is high, choosing the higher-volatility candidate is likely a contradiction.\n"
+            "If intent.return_seeking is high, choosing the clearly lower-sharpe candidate is likely a contradiction.\n"
+            "\n"
+            "Output ONLY one line:\n"
+            "FINAL_CHOICE: <candidate>\n"
+        )
 
-        # Limit number of actions after merge: keep most impactful/safe
-        # preference: objective switch > lambda_l2 > w_max > exclude (but exclude only when allowed)
-        def _score(a: Dict[str, Any]) -> int:
-            t = a.get("type")
-            if t == "set_objective_key":
-                return 4
-            if t == "set_lambda_l2":
-                return 3
-            if t == "set_w_max":
-                return 2
-            if t == "exclude_assets":
-                return 1
-            return 0
+        verify_payload = {
+            "intent": intent,
+            "chosen_candidate": chosen,
+            "available_candidates": available,
+            "metric_table": metric_table,
+        }
 
-        actions = sorted(actions, key=_score, reverse=True)[:_MAX_ACTIONS]
+        try:
+            verify_text = self.chat(system=verify_system, user=json.dumps(verify_payload, ensure_ascii=False))
+            verified = _extract_final_choice(verify_text, available)
+            if verified and verified != chosen:
+                if os.getenv("LLM_DEBUG_VERIFIER", "0") == "1":
+                    print(f"[LLM Verifier] corrected choice: {chosen} -> {verified}")
+                chosen = verified
+        except Exception as e:
+            if os.getenv("LLM_DEBUG_VERIFIER", "0") == "1":
+                print(f"[LLM Verifier] skipped due to error: {e}")
 
-        # ----------------------------
-        # Post-guards (server authority)
-        # ----------------------------
-        # 1) If wants_div -> no w_max increase
-        if wants_div:
-            filtered: List[Dict[str, Any]] = []
-            for a in actions:
-                if a.get("type") == "set_w_max":
-                    try:
-                        if float(a.get("value")) > float(w_max):
-                            continue
-                    except Exception:
-                        continue
-                filtered.append(a)
-            actions = filtered
+        # =========================================================
+        # STEP 2: EXPLANATION (free-form text)
+        # =========================================================
+        rationale = self.generate_candidate_explanation(
+            chosen_candidate=chosen,
+            available_candidates=available,
+            ctx=ctx,
+        )
 
-        # 2) Exclude only if user allowed it
-        if not user_signaled_dislike_assets:
-            actions = [a for a in actions if a.get("type") != "exclude_assets"]
-
-        # 3) Conflict case: mild changes only (lambda_l2 and optional objective switch)
-        if conflict_risk:
-            actions = [a for a in actions if a.get("type") in ("set_lambda_l2", "set_objective_key")]
-
-        # 4) If decision refine but no actions -> accept
-        decision = str(obj.get("decision", "accept")).lower().strip()
-
-        # If we have actions, refine regardless of model's decision
-        if actions:
-            return {
-                "decision": "refine",
-                "rationale": str(obj.get("rationale") or "Applying small adjustments based on feedback/notes."),
-                "proposed_actions": actions,
-            }
-
-        # otherwise accept
         return {
             "decision": "accept",
-            "rationale": str(obj.get("rationale") or "Looks aligned / no safe actions proposed."),
+            "chosen_candidate": chosen,
+            "rationale": rationale,
+        }
+
+    def generate_candidate_explanation(
+        self,
+        *,
+        chosen_candidate: str,
+        available_candidates: List[str],
+        ctx: Dict[str, Any],
+    ) -> str:
+        """
+        Separate interpretability call (no JSON).
+        Produces the user-facing explanation of why chosen_candidate was selected.
+        """
+        explain_system = (
+            "You are writing a short user-facing explanation for a portfolio selection decision.\n"
+            "Write 3-5 sentences.\n"
+            "Requirements:\n"
+            "- Mention the user's feedback (pain_points and extra_notes).\n"
+            "- Compare chosen candidate vs alternatives using ONLY provided metrics.\n"
+            "- Prefer *_pct fields when available and express them as percentages.\n"
+            "- Do NOT contradict the metrics.\n"
+            "- If assets were explicitly excluded by the user, acknowledge this clearly in the explanation.\n"
+            "- Keep it clear and non-technical.\n"
+
+        )
+
+        payload = {
+            "chosen_candidate": chosen_candidate,
+            "available_candidates": available_candidates,
+            "preferences": (ctx.get("preferences") or {}),
+            "intent": (ctx.get("intent") or {}),
+            "candidates": (ctx.get("candidates") or {}),
+        }
+        cand_map = (ctx.get("candidates") or {})
+        payload["metric_table"] = {
+            k: ((cand_map.get(k) or {}).get("metrics") or {}) for k in available_candidates
+        }
+        payload["excluded_assets"] = ctx["preferences"].get("excluded_assets", [])
+
+        if os.getenv("LLM_DEBUG_METRICS", "0") == "1":
+            print("\n===== LLM DEBUG: METRICS PASSED TO EXPLANATION =====")
+            print(json.dumps(payload.get("metric_table"), indent=2))
+            print("===================================================\n")
+
+        text = self.chat(system=explain_system, user="Context:\n" + json.dumps(payload, ensure_ascii=False))
+        text = (text or "").strip()
+
+        if len(text) > 900:
+            text = text[:900].rsplit(" ", 1)[0] + "…"
+
+        return text or "Selected the most preference-aligned candidate based on the provided metrics and your feedback."
+
+    # =========================================================
+    # Backward compatibility (optional)
+    # =========================================================
+    def decide_refine_actions(self, *args, **kwargs) -> Dict[str, Any]:
+        return {
+            "decision": "accept",
+            "rationale": "Legacy refine-actions API disabled in A/B selection mode.",
             "proposed_actions": [],
         }

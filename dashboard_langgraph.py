@@ -1,9 +1,15 @@
- # dashboard_langgraph_app.py
-# ✅ Updated dashboard to give REAL LLM value:
-# - When "Use LLM" is ON, extra_notes is passed raw so LLM can interpret (no hardcoded phrase rules).
-# - Deterministic extra_note_flags parsing is OPTIONAL (debug-only).
-# - Ticker mentions in notes require explicit confirmation before becoming excluded_assets.
-# - Works with portfolio_langgraph.py + llm_client.py where action set_objective_key is allowed.
+# dashboard_langgraph_app.py
+# ✅ Updated for A/B Candidate Selection + LLM-in-the-loop (Option A compatible)
+# - Base run: deterministic single portfolio (maxsharpe) for baseline comparison.
+# - Refine run: deterministic candidates (maxsharpe + minvar) + LLM selects the best candidate.
+# - No refine-actions / parameter updates. Selection only.
+#
+# FIXES INCLUDED:
+# 1) ✅ Import run_graph from `portfolio_langgraph_withllm` (your current backend file)
+#    - If you renamed it to portfolio_langgraph.py, change the import accordingly.
+# 2) ✅ Efficient Frontier marker uses FINAL metrics consistently (x_vol and y_ret both from optimized_metrics when present).
+# 3) ✅ Risk Contribution chart safely falls back: if optimized_metrics missing, show a helpful message (no crash).
+# 4) ✅ Minor safety: frontier marker won’t plot if either x or y missing.
 
 from __future__ import annotations
 
@@ -18,9 +24,10 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-# ✅ IMPORTANT: adjust this import to your real file name
-# from portfolio_langgraph_withllm import run_graph
+# ✅ IMPORTANT: your backend runner (you said your portfolio code is in portfolio_langgraph_withllm)
 from portfolio_langgraph_withllm import run_graph
+# If you later move it to portfolio_langgraph.py, swap to:
+# from portfolio_langgraph import run_graph
 
 DATA_DIR = Path("data/processed_yahoo")
 
@@ -47,29 +54,92 @@ def _safe_normalize_current_inputs(df: pd.DataFrame, mode: str) -> Optional[dict
     return {str(t): float(v) for t, v in w.items()}
 
 
-def _extract_weights_and_metrics(graph_state: Dict[str, Any]):
-    optimization_result = graph_state.get("optimization_result") or {}
-    objective_key = graph_state.get("objective_key", "maxsharpe")
+def _get_chosen_candidate(state: Dict[str, Any]) -> str:
+    chosen = state.get("chosen_candidate") or state.get("objective_key") or "maxsharpe"
+    chosen = str(chosen).lower().strip()
+    return chosen or "maxsharpe"
+
+
+def _safe_float(x) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        x = float(x)
+        if not np.isfinite(x):
+            return None
+        return x
+    except Exception:
+        return None
+
+
+def _extract_weights_and_metrics(state: Dict[str, Any]):
+    """
+    ✅ Option A compatible extraction.
+    Prefer finalized results:
+      - optimized_weights (final selection)
+      - optimized_metrics (final selection risk metrics)
+    Fallback:
+      - optimization_result[chosen] if optimized_* absent.
+    """
+    optimization_result = state.get("optimization_result") or {}
+    chosen = _get_chosen_candidate(state)
 
     weights_series = None
     portfolio_metrics = None
 
-    if optimization_result and objective_key in optimization_result:
-        port = optimization_result[objective_key]
+    # 1) Prefer finalized weights/metrics
+    opt_w = state.get("optimized_weights") or {}
+    opt_m = state.get("optimized_metrics") or {}
+
+    if opt_w:
+        w = pd.Series(opt_w, dtype=float)
+        w = w[w.abs() > 1e-6].sort_values(ascending=False)
+        weights_series = w
+
+        sharpe = _safe_float(opt_m.get("sharpe", None))
+        ret = _safe_float(opt_m.get("return", None))
+        vol = _safe_float(opt_m.get("vol", None))
+
+        # active_assets might exist; otherwise derive from weights
+        active_assets = opt_m.get("active_assets", None)
+        try:
+            active_assets = int(active_assets) if active_assets is not None else int(len(w))
+        except Exception:
+            active_assets = int(len(w))
+
+        portfolio_metrics = {
+            "candidate": chosen,
+            "return": ret if ret is not None else float(np.nan),
+            "vol": vol if vol is not None else float(np.nan),
+            "sharpe": sharpe,
+            "used_assets": int(len(w)),
+            "universe_assets": int(len(state.get("selected_tickers", []))),
+            "active_assets": active_assets,
+        }
+        return optimization_result, chosen, weights_series, portfolio_metrics
+
+    # 2) Fallback: read directly from optimization_result[chosen]
+    if optimization_result and chosen in optimization_result:
+        port = optimization_result[chosen]
         w = pd.Series(port.get("weights", {}), dtype=float)
         w = w[w.abs() > 1e-6].sort_values(ascending=False)
         weights_series = w
 
+        sharpe = _safe_float(port.get("sharpe", None))
+        ret = _safe_float(port.get("return", None))
+        vol = _safe_float(port.get("vol", None))
+
         portfolio_metrics = {
-            "objective_key": objective_key,
-            "return": float(port.get("return", np.nan)),
-            "vol": float(port.get("vol", np.nan)),
-            "sharpe": port.get("sharpe", None),
+            "candidate": chosen,
+            "return": ret if ret is not None else float(np.nan),
+            "vol": vol if vol is not None else float(np.nan),
+            "sharpe": sharpe,
             "used_assets": int(len(w)),
-            "universe_assets": int(len(graph_state.get("selected_tickers", []))),
+            "universe_assets": int(len(state.get("selected_tickers", []))),
+            "active_assets": int(len(w)),
         }
 
-    return optimization_result, objective_key, weights_series, portfolio_metrics
+    return optimization_result, chosen, weights_series, portfolio_metrics
 
 
 def _active_portfolio_label(is_refined: bool) -> str:
@@ -77,18 +147,55 @@ def _active_portfolio_label(is_refined: bool) -> str:
 
 
 def _portfolio_summary_from_state(state: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    ✅ For Evaluation section.
+    Prefer optimized_* (final) to avoid mismatch.
+    """
     if not state:
         return None
 
+    chosen = _get_chosen_candidate(state)
+    opt_m = state.get("optimized_metrics") or {}
+    opt_w = state.get("optimized_weights") or {}
+
+    if opt_w:
+        w = pd.Series(opt_w, dtype=float)
+        w = w[w.abs() > 1e-6]
+        if w.empty:
+            return None
+
+        w = w.sort_values(ascending=False)
+        eff_n = float(1.0 / np.sum(np.square(w.values)))
+        max_w = float(w.max())
+
+        sharpe = _safe_float(opt_m.get("sharpe", None))
+        ret = _safe_float(opt_m.get("return", None))
+        vol = _safe_float(opt_m.get("vol", None))
+
+        active_assets = opt_m.get("active_assets", None)
+        try:
+            active_assets = int(active_assets) if active_assets is not None else int(len(w))
+        except Exception:
+            active_assets = int(len(w))
+
+        return {
+            "candidate": chosen,
+            "return": ret if ret is not None else float(np.nan),
+            "vol": vol if vol is not None else float(np.nan),
+            "sharpe": sharpe,
+            "active_assets": active_assets,
+            "max_weight": max_w,
+            "effective_n": eff_n,
+        }
+
+    # fallback older-style
     opt_res = state.get("optimization_result") or {}
-    obj = state.get("objective_key", "maxsharpe")
-    if obj not in opt_res:
+    if chosen not in opt_res:
         return None
 
-    port = opt_res[obj]
+    port = opt_res[chosen]
     w = pd.Series(port.get("weights", {}), dtype=float)
     w = w[w.abs() > 1e-6]
-
     if w.empty:
         return None
 
@@ -96,13 +203,14 @@ def _portfolio_summary_from_state(state: Optional[Dict[str, Any]]) -> Optional[D
     eff_n = float(1.0 / np.sum(np.square(w.values)))
     max_w = float(w.max())
 
-    sharpe = port.get("sharpe", None)
-    sharpe = float(sharpe) if sharpe is not None else None
+    sharpe = _safe_float(port.get("sharpe", None))
+    ret = _safe_float(port.get("return", None))
+    vol = _safe_float(port.get("vol", None))
 
     return {
-        "objective_key": obj,
-        "return": float(port.get("return", np.nan)),
-        "vol": float(port.get("vol", np.nan)),
+        "candidate": chosen,
+        "return": ret if ret is not None else float(np.nan),
+        "vol": vol if vol is not None else float(np.nan),
         "sharpe": sharpe,
         "active_assets": int(len(w)),
         "max_weight": max_w,
@@ -123,7 +231,7 @@ def _fmt_num(x: Optional[float]) -> str:
 
 
 # ============================================================
-# Helper: conflict-safe pain points logic
+# Pain point labels (must match backend constants)
 # ============================================================
 PP_TOO_RISKY = "It feels too risky"
 PP_TOO_CONSERVATIVE = "It feels too conservative"
@@ -136,56 +244,34 @@ def _sanitize_pain_points(raw: list[str]) -> list[str]:
     if not raw:
         return []
     s = set(raw)
-
     if PP_NOT_SURE in s:
         return [PP_NOT_SURE]
-
     if (PP_TOO_RISKY in s) and (PP_TOO_CONSERVATIVE in s):
         s.remove(PP_TOO_CONSERVATIVE)
-
     return list(s)
 
+def _rc_series_aligned_to(tickers_target: list[str], metrics: dict):
+    """
+    metrics: {'tickers': [...], 'rc_pct': [...]}
+    returns: rc_pct aligned to tickers_target order (np.ndarray)
+    """
+    if not metrics:
+        return None
 
-def _infer_targets_from_feedback(
-    pain_points: list[str],
-    comfort_pref: Optional[str],
-    growth_pref: Optional[str],
-    concentration_hint: Optional[str],
-) -> tuple[str, str, str]:
-    goal = "best_tradeoff"
-    stability = "balanced"
-    concentration = "low"
+    src_t = metrics.get("tickers")
+    src_rc = metrics.get("rc_pct")
+    if src_t is None or src_rc is None:
+        return None
 
-    if (PP_TOO_RISKY in pain_points) or (PP_NOT_SURE in pain_points):
-        goal = "lowest_risk"
-        concentration = "low"
+    src_t = list(map(str, src_t))
+    src_rc = np.array(src_rc, dtype=float)
 
-        if comfort_pref in ("A smoother ride overall", "Lower ups & downs, even if returns drop"):
-            stability = "stable"
-        else:
-            stability = "balanced"
+    if len(src_t) != len(src_rc):
+        return None
 
-        if comfort_pref == "Limit big positions":
-            concentration = "low"
+    m = {t: float(v) for t, v in zip(src_t, src_rc)}
+    return np.array([m.get(str(t), np.nan) for t in tickers_target], dtype=float)
 
-    if PP_TOO_CONSERVATIVE in pain_points:
-        goal = "best_tradeoff"
-        if growth_pref == "Higher ups & downs for better returns":
-            stability = "swingy"
-        else:
-            stability = "balanced"
-        if growth_pref == "Bigger positions in strong assets":
-            concentration = "high"
-
-    if PP_TOO_CONCENTRATED in pain_points:
-        concentration = "low"
-
-    return goal, stability, concentration
-
-
-# ============================================================
-# Optional: notes parsing (DEBUG only, NOT required for LLM value)
-# ============================================================
 def _extract_tickers_from_notes(extra_notes: str, universe: list[str], max_n: int = 10) -> list[str]:
     if not extra_notes:
         return []
@@ -200,24 +286,6 @@ def _extract_tickers_from_notes(extra_notes: str, universe: list[str], max_n: in
         if len(found) >= max_n:
             break
     return found
-
-
-def _extra_note_flags(extra_notes: str) -> dict[str, Any]:
-    text = (extra_notes or "").lower().strip()
-    if not text:
-        return {}
-
-    def has_any(words: list[str]) -> bool:
-        return any(w in text for w in words)
-
-    flags = {
-        "avoid_drawdowns": has_any(["drawdown", "crash", "downside", "big loss", "lose", "loss"]),
-        "safer_smoother": has_any(["safer", "smooth", "stable", "less volatile", "low volatility", "sleep at night"]),
-        "prefer_diversification": has_any(["diversif", "spread", "less concentrated", "more assets", "many assets"]),
-        "avoid_big_positions": has_any(["limit big", "cap", "no more than", "max weight", "too big position"]),
-        "still_want_growth": has_any(["still want growth", "long term", "growth", "upside"]),
-    }
-    return {k: v for k, v in flags.items() if v}
 
 
 # ---------------- PAGE ----------------
@@ -354,7 +422,6 @@ if run_base and selected_tickers:
         w_max=float(w_max),
         preferences={},
         current_weights=current_weights_dict,
-        max_iterations=0,
         clarification_answers=None,
         mode="base",
         use_llm=False,
@@ -375,7 +442,7 @@ st.markdown(
       <div style="display:flex; justify-content:space-between; align-items:center;">
         <div>
           <div class="header-title">📈 Financial Risk & Portfolio Optimizer</div>
-          <div class="header-sub">Two-step UX: Run Base → then Refine with user feedback (LangGraph loop)</div>
+          <div class="header-sub">Two-step UX: Run Base → then Refine with A/B candidate selection (LLM-in-the-loop)</div>
           <div class="header-sub" style="margin-top:0.35rem;">Currently showing: <b>{active_label}</b></div>
         </div>
       </div>
@@ -395,10 +462,10 @@ portfolio_metrics = None
 baseline_metrics = None
 optimized_metrics = None
 current_metrics = None
-objective_key = "maxsharpe"
+chosen_candidate = "maxsharpe"
 
 if graph_state is not None:
-    optimization_result, objective_key, portfolio_weights, portfolio_metrics = _extract_weights_and_metrics(graph_state)
+    optimization_result, chosen_candidate, portfolio_weights, portfolio_metrics = _extract_weights_and_metrics(graph_state)
     baseline_metrics = graph_state.get("baseline_metrics")
     optimized_metrics = graph_state.get("optimized_metrics")
     current_metrics = graph_state.get("current_metrics")
@@ -435,8 +502,9 @@ with col_right:
         st.info("Metrics will appear after base portfolio runs.")
     else:
         opt = portfolio_metrics
-        obj_label = "Max Sharpe" if opt["objective_key"] == "maxsharpe" else "Min Variance"
-        st.caption(f"Objective: **{obj_label}**")
+        cand = opt["candidate"]
+        obj_label = "Max Sharpe" if cand == "maxsharpe" else "Min Variance"
+        st.caption(f"Selected candidate: **{obj_label}** (`{cand}`)")
 
         c1, c2 = st.columns(2)
         with c1:
@@ -444,7 +512,7 @@ with col_right:
             st.markdown('<div class="metric-label">Sharpe</div>', unsafe_allow_html=True)
             st.markdown(
                 f'<div class="metric-value">{float(opt["sharpe"]):.2f}</div>'
-                if opt["sharpe"] is not None
+                if opt.get("sharpe") is not None
                 else '<div class="metric-value">–</div>',
                 unsafe_allow_html=True,
             )
@@ -476,14 +544,14 @@ with col_right:
     st.markdown("</div>", unsafe_allow_html=True)
 
 # ============================================================
-# Refinement UI
+# Refinement UI (Candidate selection)
 # ============================================================
 st.markdown("")
 st.markdown('<div class="card">', unsafe_allow_html=True)
 st.markdown('<div class="section-title">🔁 Refine (after base portfolio)</div>', unsafe_allow_html=True)
 
 if st.session_state["base_state"] is None:
-    st.info("Run **Base Portfolio** first. Then you can refine based on what you see.")
+    st.info("Run **Base Portfolio** first. Then you can refine using A/B candidate selection.")
 else:
     happy_ui = st.radio(
         "Are you happy with this portfolio?",
@@ -493,25 +561,16 @@ else:
     )
     is_happy = happy_ui.startswith("✅")
 
-    # ✅ LLM toggle (only relevant if user says "no")
     use_llm_refine = st.checkbox(
-        "🤖 Use LLM to interpret my feedback + notes",
+        "🤖 Use LLM to choose among candidate portfolios",
         value=True,
         disabled=is_happy,
-        help="When enabled, the model can interpret your free-text notes (e.g., 'avoid drawdowns') and may switch objective to Min-Variance if appropriate.",
-    )
-
-    # ✅ Optional: debug mode for deterministic note parsing (NOT the main path)
-    parse_notes_into_flags = st.checkbox(
-        "🧪 Debug: also extract keyword flags from notes",
-        value=False,
-        disabled=is_happy or (not use_llm_refine),
-        help="Optional. Only for debugging; main value is the LLM reading raw notes.",
+        help="When enabled, the model compares candidates (Max-Sharpe vs Min-Variance) and selects the one most aligned with your feedback/notes.",
     )
 
     if is_happy:
         st.success("Keeping the current portfolio as-is (ACCEPT).")
-        st.caption("If you change your mind, select “No” above to adjust it.")
+        st.caption("If you change your mind, select “No” above to compare alternatives.")
     else:
         st.markdown(
             '<div class="section-title" style="margin-top:0.6rem;">What doesn’t feel right?</div>',
@@ -519,20 +578,14 @@ else:
         )
 
         current_pp = list(st.session_state.get("pain_points", []))
-        base_options = [
-            PP_TOO_RISKY,
-            PP_TOO_CONSERVATIVE,
-            PP_TOO_CONCENTRATED,
-            PP_DISLIKE_ASSETS,
-            PP_NOT_SURE,
-        ]
+        base_options = [PP_TOO_RISKY, PP_TOO_CONSERVATIVE, PP_TOO_CONCENTRATED, PP_DISLIKE_ASSETS, PP_NOT_SURE]
 
         if PP_NOT_SURE in current_pp:
             pain_points = st.multiselect(
                 "Select all that apply",
                 options=[PP_NOT_SURE],
                 default=[PP_NOT_SURE],
-                help="If you’re not sure, we’ll aim for a safer/smoother portfolio first.",
+                help="If you’re not sure, we’ll prioritize safer / smoother candidates.",
             )
             pain_points = [PP_NOT_SURE]
         else:
@@ -546,47 +599,11 @@ else:
                 "Select all that apply (optional)",
                 options=options,
                 default=[p for p in current_pp if p in options],
-                help="Optional. If you leave this empty and just write notes, the LLM will still interpret your notes.",
+                help="Optional. If empty, your notes still help the LLM choose a candidate.",
             )
 
         pain_points = _sanitize_pain_points(pain_points)
         st.session_state["pain_points"] = pain_points
-
-        comfort_pref = None
-        if (PP_TOO_RISKY in pain_points) or (PP_NOT_SURE in pain_points):
-            comfort_pref = st.selectbox(
-                "What would make you more comfortable?",
-                [
-                    "Lower ups & downs, even if returns drop",
-                    "Limit big positions",
-                    "A smoother ride overall",
-                ],
-                index=0,
-            )
-
-        growth_pref = None
-        if PP_TOO_CONSERVATIVE in pain_points:
-            growth_pref = st.selectbox(
-                "What are you willing to accept for higher returns?",
-                [
-                    "Higher ups & downs for better returns",
-                    "Bigger positions in strong assets",
-                    "I’m investing long-term",
-                ],
-                index=0,
-            )
-
-        concentration_hint = None
-        if PP_TOO_CONCENTRATED in pain_points:
-            concentration_hint = st.selectbox(
-                "How concentrated is acceptable?",
-                [
-                    "Strict cap per asset",
-                    "Balanced",
-                    "Some big positions are fine",
-                ],
-                index=0,
-            )
 
         excluded_assets: list[str] = []
         if PP_DISLIKE_ASSETS in pain_points:
@@ -602,7 +619,6 @@ else:
             height=90,
         ).strip()
 
-        # ✅ We still detect ticker mentions for explicit confirmation (safe)
         notes_tickers = _extract_tickers_from_notes(extra_notes, selected_tickers)
 
         if notes_tickers and (PP_DISLIKE_ASSETS not in pain_points):
@@ -613,7 +629,7 @@ else:
             confirm_exclude_from_notes = st.checkbox(
                 "✅ Exclude tickers mentioned in notes",
                 value=False,
-                help="This adds them to excluded assets (explicit confirmation).",
+                help="This adds them to excluded assets only with explicit confirmation.",
             )
             if confirm_exclude_from_notes:
                 if PP_DISLIKE_ASSETS not in pain_points:
@@ -623,43 +639,14 @@ else:
                     if t not in excluded_assets:
                         excluded_assets.append(t)
 
-        # ✅ Infer targets automatically (still useful for deterministic base behavior)
-        goal, stability, concentration = _infer_targets_from_feedback(
-            pain_points=pain_points,
-            comfort_pref=comfort_pref,
-            growth_pref=growth_pref,
-            concentration_hint=concentration_hint,
-        )
-
-        # ✅ Optional debug flags (NOT required)
-        note_flags = _extra_note_flags(extra_notes) if (use_llm_refine and parse_notes_into_flags) else {}
-
-        if note_flags:
-            with st.expander("🧪 Debug: keyword flags from notes"):
-                st.json(note_flags)
-
-        max_iterations = st.slider("Max refinement loops", min_value=0, max_value=5, value=2, step=1)
-        apply_refine = st.button("✅ Apply Refinements", width="stretch")
+        apply_refine = st.button("✅ Run Candidate Selection (Refine)", width="stretch")
 
         if apply_refine and selected_tickers:
             refined_answers = {
-                # deterministic mapping inputs (perception node uses these)
-                "goal": goal,
-                "stability": stability,
-                "concentration": concentration,
-                "excluded_assets": excluded_assets,
-
-                # feedback bundle (LLM + rules can use)
                 "satisfaction": "no",
                 "pain_points": pain_points,
-                "comfort_pref": comfort_pref,
-                "growth_pref": growth_pref,
-                "concentration_hint": concentration_hint,
-
-                # ✅ key: raw notes for the LLM (main value path)
+                "excluded_assets": excluded_assets,
                 "extra_notes": extra_notes,
-                # optional debug structure (can be empty)
-                "extra_note_flags": note_flags,
                 "notes_tickers": notes_tickers,
             }
 
@@ -669,35 +656,27 @@ else:
                 w_max=float(w_max),
                 preferences={},
                 current_weights=current_weights_dict,
-                max_iterations=int(max_iterations),
                 clarification_answers=refined_answers,
                 mode="refine",
                 use_llm=bool(use_llm_refine),
             )
             st.session_state["refined_state"] = refined_state
-            st.success("Refinement applied. Scroll up to see updated portfolio & charts.")
+            st.success("Refinement applied. Scroll up to see the selected candidate portfolio.")
             st.rerun()
 
         if st.session_state.get("refined_state") is not None:
             rs = st.session_state["refined_state"]
-            with st.expander("🔧 Refinement summary (what changed?)"):
-                st.write(f"Iterations used: **{rs.get('iteration', 0)}** / {rs.get('max_iterations', 0)}")
+            with st.expander("🔧 Selection summary (what was chosen?)"):
+                chosen = _get_chosen_candidate(rs)
+                st.write(f"Chosen candidate: **`{chosen}`**")
 
-                obj_key = rs.get("objective_key")
-                obj_label = "Max Sharpe" if obj_key == "maxsharpe" else "Min Variance"
-                st.write(f"Objective (final): **{obj_label}** (`{obj_key}`)")
+                llm_decision = rs.get("llm_decision") or {}
+                if llm_decision:
+                    st.write("LLM decision payload:")
+                    st.json(llm_decision)
 
-                try:
-                    st.write(f"w_max (final): **{float(rs.get('w_max', np.nan)):.2f}**")
-                except Exception:
-                    st.write("w_max: **–**")
-
-                st.write("Applied actions:")
-                st.json(rs.get("changes_applied", []))
-
-                if rs.get("changes_rejected"):
-                    st.write("Rejected actions:")
-                    st.json(rs.get("changes_rejected", []))
+                cand_keys = list((rs.get("optimization_result") or {}).keys())
+                st.write(f"Available candidates: {cand_keys}")
 
 st.markdown("</div>", unsafe_allow_html=True)
 
@@ -716,7 +695,7 @@ else:
 
     with col1:
         st.markdown("**Base**")
-        st.write(f"- Objective: `{base_sum['objective_key']}`")
+        st.write(f"- Candidate: `{base_sum['candidate']}`")
         st.write(f"- Return: {_fmt_pct(base_sum['return'])}")
         st.write(f"- Vol: {_fmt_pct(base_sum['vol'])}")
         st.write(f"- Sharpe: {_fmt_num(base_sum['sharpe'])}")
@@ -729,7 +708,7 @@ else:
         if ref_sum is None:
             st.write("Not computed yet.")
         else:
-            st.write(f"- Objective: `{ref_sum['objective_key']}`")
+            st.write(f"- Candidate: `{ref_sum['candidate']}`")
             st.write(f"- Return: {_fmt_pct(ref_sum['return'])}")
             st.write(f"- Vol: {_fmt_pct(ref_sum['vol'])}")
             st.write(f"- Sharpe: {_fmt_num(ref_sum['sharpe'])}")
@@ -786,10 +765,14 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-if (optimization_result is None) or (not optimization_result.get("frontier")) or (portfolio_metrics is None):
+frontier = None
+if isinstance(optimization_result, dict):
+    frontier = optimization_result.get("frontier")
+
+if (frontier is None) or (portfolio_metrics is None):
     st.info("Run base/refine to visualize the efficient frontier.")
 else:
-    frontier_df = pd.DataFrame(optimization_result["frontier"])
+    frontier_df = pd.DataFrame(frontier)
     y_col = (
         "realized_return"
         if "realized_return" in frontier_df.columns
@@ -797,20 +780,35 @@ else:
     )
     fig_frontier = px.line(frontier_df, x="vol", y=y_col, markers=True)
 
-    port = optimization_result[portfolio_metrics["objective_key"]]
-    port_y = float(port.get("return", np.nan))
+    # Mark chosen portfolio point: ✅ use FINAL metrics consistently when present
+    chosen = portfolio_metrics["candidate"]
+    port = optimization_result.get(chosen, {}) if isinstance(optimization_result, dict) else {}
 
-    fig_frontier.add_trace(
-        go.Scatter(
-            x=[float(port.get("vol", np.nan))],
-            y=[port_y],
-            mode="markers+text",
-            name=active_label,
-            text=[active_label],
-            textposition="top left",
-            marker=dict(size=10),
+    # Defaults from optimizer
+    x_vol = _safe_float(port.get("vol", None))
+    y_ret = _safe_float(port.get("return", None))
+
+    # ✅ Override BOTH X and Y from optimized_metrics if available
+    if optimized_metrics is not None and optimized_metrics:
+        x_final = _safe_float(optimized_metrics.get("vol", None))
+        y_final = _safe_float(optimized_metrics.get("return", None))
+        if x_final is not None:
+            x_vol = x_final
+        if y_final is not None:
+            y_ret = y_final
+
+    if x_vol is not None and y_ret is not None:
+        fig_frontier.add_trace(
+            go.Scatter(
+                x=[x_vol],
+                y=[y_ret],
+                mode="markers+text",
+                name=active_label,
+                text=[active_label],
+                textposition="top left",
+                marker=dict(size=10),
+            )
         )
-    )
 
     if current_metrics is not None:
         fig_frontier.add_trace(
@@ -850,49 +848,69 @@ else:
     st.plotly_chart(fig_frontier, width="stretch")
 
 st.markdown("</div>", unsafe_allow_html=True)
-
 # ---------------- Risk Contribution by Asset ----------------
 st.markdown("")
 st.markdown('<div class="card">', unsafe_allow_html=True)
-st.markdown(f'<div class="section-title">📊 Risk Contribution by Asset — {active_label}</div>', unsafe_allow_html=True)
+st.markdown(
+    f'<div class="section-title">📊 Risk Contribution by Asset — {active_label}</div>',
+    unsafe_allow_html=True,
+)
 
 if optimized_metrics is None or not optimized_metrics:
-    st.info("Run base/refine to see risk contributions.")
+    st.info("Risk contributions are available after the graph computes `optimized_metrics` (risk_agent output).")
 else:
-    tickers_rc = optimized_metrics["tickers"]
-    active_rc = np.array(optimized_metrics["rc_pct"], dtype=float)
+    # --- Active (final portfolio) ---
+    tickers_rc = list(map(str, optimized_metrics.get("tickers", [])))
+    active_rc = np.array(optimized_metrics.get("rc_pct", []), dtype=float)
 
-    main_col = "Active"
-    df_rc = pd.DataFrame({"Ticker": tickers_rc, main_col: active_rc})
+    if len(tickers_rc) == 0 or len(active_rc) == 0 or len(tickers_rc) != len(active_rc):
+        st.info("Risk contribution data is missing or malformed (tickers/rc_pct mismatch).")
+    else:
+        df_rc = pd.DataFrame({"Ticker": tickers_rc, "Active": active_rc})
 
-    compare_label = None
-    if current_metrics is not None:
-        df_rc["Current"] = np.array(current_metrics["rc_pct"], dtype=float)
-        compare_label = "Current"
-    elif baseline_metrics is not None:
-        df_rc["Baseline (Equal Weight)"] = np.array(baseline_metrics["rc_pct"], dtype=float)
-        compare_label = "Baseline (Equal Weight)"
+        compare_label = None
 
-    df_long = df_rc.melt(id_vars="Ticker", var_name="Portfolio", value_name="Risk Contribution")
-    fig_rc = px.bar(df_long, x="Ticker", y="Risk Contribution", color="Portfolio", barmode="group")
-    fig_rc.update_layout(
-        paper_bgcolor="#0b1020",
-        plot_bgcolor="#0b1020",
-        font=dict(color="#E2E6FF"),
-        margin=dict(l=10, r=10, t=10, b=10),
-        yaxis_title="Risk contribution (share of total σ)",
-        xaxis_title="",
-        legend_title="",
-    )
-    fig_rc.update_yaxes(tickformat=".0%")
-    st.plotly_chart(fig_rc, width="stretch")
+        # --- Align current_metrics to active tickers (avoid length mismatch) ---
+        if current_metrics is not None:
+            aligned = _rc_series_aligned_to(tickers_rc, current_metrics)
+            if aligned is not None:
+                df_rc["Current"] = aligned
+                compare_label = "Current"
+            else:
+                st.info("Current RC cannot be aligned (current_metrics should include 'tickers' + 'rc_pct').")
 
-    if compare_label:
-        st.caption(
-            f"Bars show each asset’s share of total portfolio risk (σ). Comparison: **{compare_label}** vs **{active_label}**."
+        # --- Align baseline_metrics to active tickers (avoid length mismatch) ---
+        elif baseline_metrics is not None:
+            aligned = _rc_series_aligned_to(tickers_rc, baseline_metrics)
+            if aligned is not None:
+                df_rc["Baseline (Equal Weight)"] = aligned
+                compare_label = "Baseline (Equal Weight)"
+            else:
+                st.info("Baseline RC cannot be aligned (baseline_metrics should include 'tickers' + 'rc_pct').")
+
+        # Plot
+        df_long = df_rc.melt(id_vars="Ticker", var_name="Portfolio", value_name="Risk Contribution")
+        fig_rc = px.bar(df_long, x="Ticker", y="Risk Contribution", color="Portfolio", barmode="group")
+        fig_rc.update_layout(
+            paper_bgcolor="#0b1020",
+            plot_bgcolor="#0b1020",
+            font=dict(color="#E2E6FF"),
+            margin=dict(l=10, r=10, t=10, b=10),
+            yaxis_title="Risk contribution (share of total σ)",
+            xaxis_title="",
+            legend_title="",
         )
+        fig_rc.update_yaxes(tickformat=".0%")
+        st.plotly_chart(fig_rc, width="stretch")
+
+        if compare_label:
+            st.caption(
+                f"Bars show each asset’s share of total portfolio risk (σ). "
+                f"Comparison: **{compare_label}** vs **{active_label}**."
+            )
 
 st.markdown("</div>", unsafe_allow_html=True)
+
 
 # ---------------- Bottom: Weights + Explanation ----------------
 st.markdown("")
@@ -919,7 +937,7 @@ with bottom_right:
     else:
         st.write(graph_state.get("explanation", "No explanation generated."))
 
-        with st.expander("🧠 LLM decision (accept vs refine)"):
+        with st.expander("🧠 LLM decision (candidate selection)"):
             st.json(graph_state.get("llm_decision", {}))
 
         with st.expander("📰 News signals (placeholder)"):
@@ -933,4 +951,4 @@ with bottom_right:
                 for n in notes:
                     st.write(f"- {n}")
 
-    st.markdown("</div>", unsafe_allow_html=True) 
+    st.markdown("</div>", unsafe_allow_html=True)
