@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import json  
 
 from portfolio_core import run_portfolio_optimization, portfolio_stats, risk_contributions
 
@@ -26,6 +27,7 @@ def _safe_float(x: Any) -> Optional[float]:
     except Exception:
         return None
 
+
 def validate_portfolio(weights: Dict[str, float], excluded: List[str], *, tag: str = "") -> None:
     tickers = set(map(str, weights.keys()))
     excluded_set = set(map(str, excluded or []))
@@ -39,10 +41,13 @@ def validate_portfolio(weights: Dict[str, float], excluded: List[str], *, tag: s
     max_w = float(w.max()) if len(w) else 0.0
     active = int((np.abs(w) > 1e-8).sum()) if len(w) else 0
 
-    denom = float(np.sum(w ** 2)) if len(w) else 0.0
+    denom = float(np.sum(w**2)) if len(w) else 0.0
     eff_n = float(1.0 / denom) if denom > 0 else 0.0
 
-    print(f"[CHECK{':' + tag if tag else ''}] sum_w={s:.6f} max_w={max_w:.6f} active_assets={active} effective_n={eff_n:.2f}")
+    print(
+        f"[CHECK{':' + tag if tag else ''}] sum_w={s:.6f} max_w={max_w:.6f} active_assets={active} effective_n={eff_n:.2f}"
+    )
+
 
 def _normalize_return_to_decimal(r: float) -> float:
     """
@@ -402,10 +407,428 @@ def recommendation_agent(
             if vol < v_c and ret >= r_c:
                 text.append("✅ The optimized portfolio improves **both** risk and return.")
             elif vol < v_c and ret < r_c:
-                text.append("✅ The optimized portfolio reduces risk significantly, trading off some return to improve risk-adjusted performance.")
+                text.append(
+                    "✅ The optimized portfolio reduces risk significantly, trading off some return to improve risk-adjusted performance."
+                )
             elif vol >= v_c and ret > r_c:
                 text.append("⚠️ The optimized portfolio increases risk to chase higher return (check if this matches your risk tolerance).")
             else:
                 text.append("ℹ️ The optimized portfolio is a different trade-off; review the risk contribution chart to understand what changed.")
 
     return "\n\n".join(text)
+
+# ============================================================
+# Insight Generator (LLM agent) — ADDITIVE ONLY
+# Two-call design:
+#   1) Narrative TEXT for UI (no JSON)
+#   2) Optional small JSON for UI signals (parsed + verified)
+# Keeps verify_insight_output (strengthened)
+# ============================================================
+
+def _top_k_from_weights(weights: Dict[str, float], k: int = 10) -> List[Dict[str, Any]]:
+    """Returns top-k holdings sorted by weight desc."""
+    items = [(str(t), float(w)) for t, w in (weights or {}).items()]
+    items.sort(key=lambda x: x[1], reverse=True)
+    top = items[: max(0, int(k))]
+    return [{"ticker": t, "weight": w} for t, w in top]
+
+
+def _top_k_from_rc(metrics: Dict[str, Any], k: int = 10) -> List[Dict[str, Any]]:
+    """
+    Builds top-k risk contributors from risk_agent output:
+      metrics["tickers"], metrics["rc_pct"]
+    """
+    if not metrics:
+        return []
+    tickers = list(map(str, metrics.get("tickers") or []))
+    rc_pct = metrics.get("rc_pct") or []
+    if len(tickers) == 0 or len(rc_pct) == 0:
+        return []
+
+    pairs = []
+    n = min(len(tickers), len(rc_pct))
+    for i in range(n):
+        t = tickers[i]
+        v = _safe_float(rc_pct[i])
+        if v is None:
+            continue
+        pairs.append((t, float(v)))
+
+    pairs.sort(key=lambda x: x[1], reverse=True)
+    top = pairs[: max(0, int(k))]
+    return [{"ticker": t, "rc_pct": v} for t, v in top]
+
+
+def _compute_delta(base: Dict[str, Any], refine: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Computes refine - base deltas for key metrics, robust to missing values.
+    Expects outputs of risk_agent (return/vol/sharpe/max_weight/effective_n/active_assets).
+    """
+    def f(d, k):
+        return _safe_float((d or {}).get(k))
+
+    delta: Dict[str, Any] = {}
+    for k in ("return", "vol", "sharpe", "max_weight", "effective_n"):
+        b = f(base, k)
+        r = f(refine, k)
+        delta[k] = (r - b) if (b is not None and r is not None) else None
+
+    # active_assets is int
+    try:
+        b_a = int((base or {}).get("active_assets")) if (base or {}).get("active_assets") is not None else None
+        r_a = int((refine or {}).get("active_assets")) if (refine or {}).get("active_assets") is not None else None
+        delta["active_assets"] = (r_a - b_a) if (b_a is not None and r_a is not None) else None
+    except Exception:
+        delta["active_assets"] = None
+
+    return delta
+
+
+def _holdings_change(base_w: Dict[str, float], refine_w: Dict[str, float], threshold: float = 1e-6) -> Dict[str, Any]:
+    """
+    Summarizes holding changes between base and refine.
+    - entered: tickers with weight>thr in refine but <=thr in base
+    - exited: tickers with weight>thr in base but <=thr in refine
+    - increased/decreased: among common active tickers, compare weights
+    """
+    base_w = base_w or {}
+    refine_w = refine_w or {}
+
+    base_active = {t for t, w in base_w.items() if abs(float(w)) > threshold}
+    ref_active = {t for t, w in refine_w.items() if abs(float(w)) > threshold}
+
+    entered = sorted(ref_active - base_active)
+    exited = sorted(base_active - ref_active)
+
+    common = sorted(base_active & ref_active)
+    inc, dec = [], []
+    for t in common:
+        bw = float(base_w.get(t, 0.0))
+        rw = float(refine_w.get(t, 0.0))
+        if rw > bw + 1e-9:
+            inc.append({"ticker": t, "from": bw, "to": rw})
+        elif rw < bw - 1e-9:
+            dec.append({"ticker": t, "from": bw, "to": rw})
+
+    inc.sort(key=lambda x: abs(x["to"] - x["from"]), reverse=True)
+    dec.sort(key=lambda x: abs(x["to"] - x["from"]), reverse=True)
+
+    return {
+        "entered": entered,
+        "exited": exited,
+        "increased": inc[:10],
+        "decreased": dec[:10],
+    }
+
+
+def build_insight_payload(
+    *,
+    base: Optional[Dict[str, Any]] = None,
+    refine: Optional[Dict[str, Any]] = None,
+    base_objective: Optional[str] = None,
+    refine_objective: Optional[str] = None,
+    base_constraints: Optional[Dict[str, Any]] = None,
+    refine_constraints: Optional[Dict[str, Any]] = None,
+    preferences: Optional[Dict[str, Any]] = None,
+    news_signals: Optional[Dict[str, Any]] = None,
+    top_k: int = 10,
+) -> Dict[str, Any]:
+    """
+    Creates a deterministic input package for the Insight Generator LLM.
+    """
+    preferences = preferences or {}
+    base = base or {}
+    refine = refine or {}
+    base_constraints = base_constraints or {}
+    refine_constraints = refine_constraints or {}
+
+    base_obj = (base_objective or "unknown")
+    refine_obj = (refine_objective or "unknown")
+
+    base_w = (base.get("weights") or {}) if isinstance(base, dict) else {}
+    ref_w = (refine.get("weights") or {}) if isinstance(refine, dict) else {}
+
+    payload: Dict[str, Any] = {
+        "version": "insight_v1",
+        "preferences": preferences,
+        "news_signals": news_signals or {},
+        "base": {
+            "objective": base_obj,
+            "constraints": base_constraints,
+            "metrics": {
+                "return": _safe_float(base.get("return")),
+                "vol": _safe_float(base.get("vol")),
+                "sharpe": _safe_float(base.get("sharpe")),
+                "max_weight": _safe_float(base.get("max_weight")),
+                "effective_n": _safe_float(base.get("effective_n")),
+                "active_assets": base.get("active_assets"),
+            },
+            "top_holdings": _top_k_from_weights(base_w, k=top_k),
+            "top_risk_drivers": _top_k_from_rc(base, k=top_k),
+        },
+        "refine": {
+            "objective": refine_obj,
+            "constraints": refine_constraints,
+            "metrics": {
+                "return": _safe_float(refine.get("return")),
+                "vol": _safe_float(refine.get("vol")),
+                "sharpe": _safe_float(refine.get("sharpe")),
+                "max_weight": _safe_float(refine.get("max_weight")),
+                "effective_n": _safe_float(refine.get("effective_n")),
+                "active_assets": refine.get("active_assets"),
+            },
+            "top_holdings": _top_k_from_weights(ref_w, k=top_k),
+            "top_risk_drivers": _top_k_from_rc(refine, k=top_k),
+        },
+        "delta": {"metrics": {}, "holdings_change": {}},
+    }
+
+    if base and refine:
+        payload["delta"] = {
+            "metrics": _compute_delta(base, refine),
+            "holdings_change": _holdings_change(base_w, ref_w),
+        }
+
+    print(
+        "[INSIGHT:payload] built",
+        f"top_k={top_k}",
+        f"base_obj={base_obj}",
+        f"refine_obj={refine_obj}",
+        f"has_delta={'metrics' in payload.get('delta', {})}",
+    )
+    return payload
+
+
+def build_insight_prompts(payload: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
+    """
+    Returns TWO prompt packs:
+      - prompts["narrative"]  -> long product-style report (PLAIN TEXT) for UI
+      - prompts["json"]       -> strict JSON for UI signals (optional)
+    """
+    payload_json = json.dumps(payload, ensure_ascii=False)
+
+    # ----------------------------
+    # 1) Narrative (TEXT) for UI
+    # ----------------------------
+    narrative_system = (
+        "You are an Insight Generator for an agent-based portfolio decision product.\n"
+        "Output MUST be plain text only (NOT JSON).\n"
+        "Do NOT use markdown headings like '#', '##'.\n"
+        "Do NOT invent numbers or tickers.\n"
+        "Use only the payload.\n"
+    )
+
+    narrative_developer = (
+    "Write a clear product report for a non-expert user.\n"
+    "Requirements:\n"
+
+
+    "- Write as if explaining to a smart friend who has never invested before. "
+    "Use everyday language, and whenever you mention a metric "
+    "(return, volatility, Sharpe, max_weight, effective_n), immediately add a short "
+    "plain-English 'so what' explaining how it affects the user "
+    "(e.g. 'more ups and downs', 'more stable month-to-month', "
+    "'one stock can hurt you more').\n"
+
+    "- If you mention Max Sharpe, explain in the SAME sentence: "
+    "'tries to maximize return per unit of risk'.\n"
+    "- If you mention Min Variance, explain in the SAME sentence: "
+    "'tries to reduce ups and downs (volatility)'.\n"
+    "- If objective changed (base vs refine), explain what that means in practice.\n"
+    "- Mention at least THREE exact metrics from payload "
+    "(return, vol, sharpe, max_weight, effective_n, active_assets).\n"
+    "- Explain diversification using max_weight and effective_n in simple words.\n"
+    "- Include a short 'What changed / what it means' paragraph and a "
+    "'Main risk drivers' paragraph.\n"
+    "- Risk drivers MUST reference tickers only from "
+    "payload.base.top_risk_drivers or payload.refine.top_risk_drivers.\n"
+    "- Keep it ~10–20 sentences total.\n"
+    "- No JSON. No bullet formatting required (you can use short lines).\n"
+)
+
+
+    narrative_user = (
+        "Here is the deterministic portfolio payload as JSON.\n"
+        "Write the user-facing insight report now.\n\n"
+        f"{payload_json}"
+    )
+
+    # ----------------------------
+    # 2) Strict JSON (optional)
+    # ----------------------------
+    json_system = "Return ONLY valid JSON. No markdown. No extra text."
+
+    # Keep your original 7-key schema (but make it extremely strict).
+    # This is optional for UI signals; you can hide it.
+    json_developer = (
+        "Return ONLY valid JSON.\n"
+        "The output MUST start with '{' and end with '}'.\n"
+        "No markdown. No headings. No extra text.\n\n"
+        "You MUST output EXACTLY these 7 top-level keys and NO OTHERS:\n"
+        "headline, portfolio_story, risk_drivers, diversification_read, base_vs_refine, news_overlay, action_suggestions_optional.\n\n"
+        "Schema:\n"
+        "{\n"
+        '  \"headline\": string,\n'
+        '  \"portfolio_story\": [string, ...],\n'
+        '  \"risk_drivers\": [{\"ticker\": string, \"reason\": string, \"rc_pct\": number|null}],\n'
+        '  \"diversification_read\": {\"max_weight\": number|null, \"effective_n\": number|null, \"comment\": string},\n'
+        '  \"base_vs_refine\": {\"key_changes\": [string, ...], \"metric_deltas\": object},\n'
+        '  \"news_overlay\": [string, ...],\n'
+        '  \"action_suggestions_optional\": [string, ...]\n'
+        "}\n\n"
+        "Rules:\n"
+        "- ALL 7 keys must be present.\n"
+        "- Mention at least THREE exact metrics from payload inside strings.\n"
+        "- risk_drivers.ticker MUST be from payload.base.top_risk_drivers or payload.refine.top_risk_drivers.\n"
+        "- Do NOT invent numbers or tickers.\n"
+        "- Do NOT add any extra keys (no global, no metrics_changes, etc.).\n"
+    )
+
+    json_user = (
+        "Here is the deterministic portfolio payload as JSON.\n"
+        "Produce the STRICT JSON object now.\n\n"
+        f"{payload_json}"
+    )
+
+    print("[INSIGHT:prompt] prepared", f"bytes={len(payload_json)}")
+    return {
+        "narrative": {"system": narrative_system, "developer": narrative_developer, "user": narrative_user},
+        "json": {"system": json_system, "developer": json_developer, "user": json_user},
+    }
+
+
+def verify_insight_output(insight_json: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Strengthened deterministic verifier for the JSON insight output.
+    Keeps your function name. More robust for 7B outputs:
+      - drops extra keys
+      - ensures all required keys exist
+      - enforces risk_driver ticker whitelist
+      - injects metric_deltas from payload.delta.metrics (source of truth)
+    """
+    issues: List[str] = []
+
+    required_keys = [
+        "headline",
+        "portfolio_story",
+        "risk_drivers",
+        "diversification_read",
+        "base_vs_refine",
+        "news_overlay",
+        "action_suggestions_optional",
+    ]
+
+    # If model didn't return dict, fail cleanly
+    if not isinstance(insight_json, dict):
+        return {"ok": False, "issues": ["insight_not_a_dict"], "cleaned": {}}
+
+    # Drop extra top-level keys (THIS fixes the "global", "metrics_changes" etc.)
+    cleaned: Dict[str, Any] = {k: insight_json.get(k) for k in required_keys if k in insight_json}
+    extra_keys = [k for k in insight_json.keys() if k not in set(required_keys)]
+    if extra_keys:
+        issues.append(f"extra_top_level_keys_removed: {extra_keys}")
+
+    # Fill missing keys
+    for k in required_keys:
+        if k not in cleaned:
+            issues.append(f"missing_key_filled: {k}")
+            if k in ("portfolio_story", "news_overlay", "action_suggestions_optional"):
+                cleaned[k] = []
+            elif k == "risk_drivers":
+                cleaned[k] = []
+            elif k == "diversification_read":
+                cleaned[k] = {"max_weight": None, "effective_n": None, "comment": "not provided"}
+            elif k == "base_vs_refine":
+                cleaned[k] = {"key_changes": [], "metric_deltas": {}}
+            else:
+                cleaned[k] = "not provided"
+
+    # Allowed tickers for risk_drivers
+    allowed = set()
+    for side in ("base", "refine"):
+        for item in ((payload.get(side) or {}).get("top_risk_drivers") or []):
+            t = str(item.get("ticker"))
+            if t:
+                allowed.add(t)
+
+    # Sanitize risk_drivers list
+    rd = cleaned.get("risk_drivers")
+    if not isinstance(rd, list):
+        issues.append("risk_drivers_not_list")
+        rd = []
+    kept = []
+    for item in rd:
+        if not isinstance(item, dict):
+            issues.append("risk_driver_item_invalid")
+            continue
+        t = str(item.get("ticker") or "")
+        if t and t in allowed:
+            # Ensure keys exist
+            kept.append(
+                {
+                    "ticker": t,
+                    "reason": str(item.get("reason") or "not provided"),
+                    "rc_pct": _safe_float(item.get("rc_pct")),
+                }
+            )
+        else:
+            issues.append(f"risk_driver_ticker_not_allowed: {t}")
+    cleaned["risk_drivers"] = kept
+
+    # Force metric_deltas from payload (source of truth)
+    delta = ((payload.get("delta") or {}).get("metrics") or {})
+    bvr = cleaned.get("base_vs_refine")
+    if not isinstance(bvr, dict):
+        issues.append("base_vs_refine_not_dict")
+        bvr = {"key_changes": [], "metric_deltas": {}}
+
+    if "key_changes" not in bvr or not isinstance(bvr.get("key_changes"), list):
+        bvr["key_changes"] = []
+
+    bvr["metric_deltas"] = delta
+    cleaned["base_vs_refine"] = bvr
+
+    # Diversification read: keep dict shape
+    div = cleaned.get("diversification_read")
+    if not isinstance(div, dict):
+        issues.append("diversification_read_not_dict")
+        div = {"max_weight": None, "effective_n": None, "comment": "not provided"}
+    div.setdefault("max_weight", None)
+    div.setdefault("effective_n", None)
+    div.setdefault("comment", "not provided")
+    cleaned["diversification_read"] = div
+
+    ok = len([x for x in issues if not x.startswith("missing_key_filled") and not x.startswith("extra_top_level_keys_removed")]) == 0
+    print("[INSIGHT:verify]", "ok" if ok else "issues", issues[:5], f"(total={len(issues)})")
+    return {"ok": ok, "issues": issues, "cleaned": cleaned}
+
+
+def insight_agent_prepare(
+    *,
+    base_metrics: Optional[Dict[str, Any]],
+    refine_metrics: Optional[Dict[str, Any]],
+    preferences: Optional[Dict[str, Any]] = None,
+    news_signals: Optional[Dict[str, Any]] = None,
+    base_objective: Optional[str] = None,
+    refine_objective: Optional[str] = None,
+    base_constraints: Optional[Dict[str, Any]] = None,
+    refine_constraints: Optional[Dict[str, Any]] = None,
+    top_k: int = 10,
+) -> Dict[str, Any]:
+    """
+    Prepares payload + TWO prompt packs.
+    """
+    payload = build_insight_payload(
+        base=base_metrics,
+        refine=refine_metrics,
+        base_objective=base_objective,
+        refine_objective=refine_objective,
+        base_constraints=base_constraints,
+        refine_constraints=refine_constraints,
+        preferences=preferences,
+        news_signals=news_signals,
+        top_k=top_k,
+    )
+    prompts = build_insight_prompts(payload)
+    return {"payload": payload, "prompts": prompts}
+

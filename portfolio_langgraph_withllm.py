@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from typing import TypedDict, List, Dict, Any, Optional, Literal
+
 import pandas as pd
 from langgraph.graph import StateGraph, END
 
@@ -11,6 +12,12 @@ from agents_langgraph import (
     risk_agent,
     recommendation_agent,
 )
+
+# ✅ Insight Generator helpers
+try:
+    from agents_langgraph import insight_agent_prepare  # type: ignore
+except Exception:  # pragma: no cover
+    insight_agent_prepare = None  # type: ignore
 
 try:
     from llm_client import LLMClient
@@ -56,13 +63,27 @@ class PortfolioState(TypedDict, total=False):
     candidates: Dict[str, Dict[str, Any]]
 
     optimized_weights: Dict[str, float]
-    optimized_metrics: Dict[str, Any]  # normalized + raw both included, see _normalize_metrics
+    optimized_metrics: Dict[str, Any]
 
     news_raw: Optional[List[Dict[str, Any]]]
     news_signals: Optional[Dict[str, Any]]
 
     debug_notes: List[str]
     explanation: str
+
+    # ✅ Insight Generator outputs
+    # - insight_raw_text: UI should render this as the narrative "report"
+    # - insight: optional JSON (kept for backward compatibility)
+    insight: Optional[Dict[str, Any]]
+    insight_ok: Optional[bool]
+    insight_issues: List[str]
+    insight_raw_text: Optional[str]
+    insight_parse_mode: Optional[str]
+
+    # ✅ carry the user's previous portfolio (Run Base output) into refine run
+    base_portfolio_weights: Optional[Dict[str, float]]
+    base_portfolio_metrics: Optional[Dict[str, Any]]
+    base_portfolio_objective: Optional[str]
 
 
 # =========================================================
@@ -101,6 +122,19 @@ def _init_defaults(state: PortfolioState) -> PortfolioState:
 
     state.setdefault("debug_notes", [])
     state.setdefault("explanation", "")
+
+    # ✅ Insight outputs
+    state.setdefault("insight", None)
+    state.setdefault("insight_ok", None)
+    state.setdefault("insight_issues", [])
+    state.setdefault("insight_raw_text", None)
+    state.setdefault("insight_parse_mode", None)
+
+    # ✅ Base portfolio from previous run (optional)
+    state.setdefault("base_portfolio_weights", None)
+    state.setdefault("base_portfolio_metrics", None)
+    state.setdefault("base_portfolio_objective", None)
+
     return state
 
 
@@ -147,7 +181,7 @@ def _build_default_questions(state: PortfolioState) -> List[Dict[str, Any]]:
 
 
 # =========================================================
-# Metrics helpers (single-source-of-truth normalization)
+# Metrics helpers
 # =========================================================
 def _extract_active_weights(weights_all: Dict[str, Any]) -> Dict[str, float]:
     return {t: float(v) for t, v in (weights_all or {}).items() if abs(float(v)) > 1e-6}
@@ -165,10 +199,6 @@ def _effective_n(weights: Dict[str, float]) -> float:
 
 
 def _attach_concentration_metrics(metrics: Dict[str, Any], weights: Dict[str, float]) -> Dict[str, Any]:
-    """
-    risk_agent() returns return/vol/sharpe/rc_* and active_assets,
-    but NOT max_weight/effective_n. Compute them deterministically.
-    """
     out = dict(metrics or {})
     out["max_weight"] = _safe_max_weight(weights)
     out["effective_n"] = _effective_n(weights)
@@ -181,7 +211,6 @@ def _as_float(x: Any) -> Optional[float]:
         if x is None:
             return None
         v = float(x)
-        # NaN check
         if v != v:
             return None
         return v
@@ -190,18 +219,11 @@ def _as_float(x: Any) -> Optional[float]:
 
 
 def _normalize_metrics(m: Dict[str, Any], *, rf: float) -> Dict[str, Any]:
-    """
-    Create ONE consistent metrics payload:
-    - raw decimals: return, vol, max_weight
-    - pct values: return_pct, vol_pct, max_weight_pct
-    - sharpe is unitless
-    """
     out = dict(m or {})
     r = _as_float(out.get("return"))
     v = _as_float(out.get("vol"))
     s = _as_float(out.get("sharpe"))
 
-    # If sharpe missing, compute if possible
     if s is None and (r is not None) and (v is not None) and v > 0:
         s = (r - float(rf)) / v
         out["sharpe"] = s
@@ -212,7 +234,6 @@ def _normalize_metrics(m: Dict[str, Any], *, rf: float) -> Dict[str, Any]:
     mw = _as_float(out.get("max_weight"))
     out["max_weight_pct"] = (mw * 100.0) if mw is not None else None
 
-    # keep rf for downstream formatting/debug
     out["rf"] = float(rf)
     return out
 
@@ -356,12 +377,13 @@ def node_extract_candidates(state: PortfolioState) -> PortfolioState:
             w = _extract_active_weights(res[obj].get("weights", {}))
             state["candidates"][obj] = {"weights": w, "metrics": None}
             state["chosen_candidate"] = obj
-            state["debug_notes"].append(f"Extract(BASE): objective={obj} active={len(w)} max_w={_safe_max_weight(w):.4f}")
+            state["debug_notes"].append(
+                f"Extract(BASE): objective={obj} active={len(w)} max_w={_safe_max_weight(w):.4f}"
+            )
         else:
             state["debug_notes"].append(f"Extract(BASE): objective '{obj}' not found.")
         return state
 
-    # stable insertion order
     for obj in ("maxsharpe", "minvar"):
         if obj in res:
             w = _extract_active_weights(res[obj].get("weights", {}))
@@ -388,7 +410,6 @@ def node_risk_candidates(state: PortfolioState) -> PortfolioState:
         try:
             m = risk_agent(w, tickers, rf=float(state["rf"]))
             m = _attach_concentration_metrics(m, w)
-            # ✅ normalize here → LLM + UI see one consistent representation
             item["metrics"] = _normalize_metrics(m, rf=float(state["rf"]))
         except Exception as e:
             item["metrics"] = {}
@@ -505,7 +526,9 @@ def node_llm_select_candidate(state: PortfolioState) -> PortfolioState:
             if chosen not in candidates:
                 chosen = "maxsharpe" if "maxsharpe" in candidates else next(iter(candidates.keys()))
 
-            rationale = str(llm_payload.get("rationale", "")).strip() or "LLM selected the most preference-aligned candidate."
+            rationale = str(llm_payload.get("rationale", "")).strip() or (
+                "LLM selected the most preference-aligned candidate."
+            )
             state["chosen_candidate"] = chosen  # type: ignore
             state["llm_decision"] = {"decision": "accept", "rationale": rationale, "chosen_candidate": chosen}
             state["debug_notes"].append(f"LLM_Select(LLM): chosen={chosen}")
@@ -531,7 +554,6 @@ def node_finalize_selection(state: PortfolioState) -> PortfolioState:
 
     if chosen in candidates:
         state["optimized_weights"] = candidates[chosen].get("weights") or {}
-        # ✅ already normalized in node_risk_candidates
         state["optimized_metrics"] = candidates[chosen].get("metrics") or {}
         state["objective_key"] = chosen
         state["debug_notes"].append(
@@ -545,11 +567,113 @@ def node_finalize_selection(state: PortfolioState) -> PortfolioState:
     return state
 
 
+# =========================================================
+# ✅ Insight Generator Node (Narrative mode, base-vs-refine semantics)
+# =========================================================
+def node_insight_generator(state: PortfolioState) -> PortfolioState:
+    """
+    Insight MUST compare:
+      Base Portfolio (user's previous portfolio from Run Base)  ->  Refined Portfolio (chosen candidate)
+    NOT equal-weight baseline, unless base portfolio wasn't provided.
+
+    ✅ FIX: generate narrative text (not strict JSON) so UI can display a "report".
+    """
+    state = _init_defaults(state)
+
+    use_llm = bool(state.get("use_llm", False))
+    if (not use_llm) or (LLMClient is None) or (insight_agent_prepare is None):
+        state["debug_notes"].append("Insight: skipped (use_llm disabled or LLMClient/insight_agent_prepare unavailable).")
+        return state
+
+    refine_metrics = state.get("optimized_metrics") or {}
+    if not refine_metrics:
+        state["debug_notes"].append("Insight: skipped (missing optimized_metrics).")
+        return state
+
+    # 1) Prefer REAL previous portfolio (Run Base output)
+    base_metrics = state.get("base_portfolio_metrics")
+    base_obj = state.get("base_portfolio_objective")
+
+    # 2) If user entered current portfolio
+    if not base_metrics:
+        base_metrics = state.get("current_metrics")
+        if base_metrics and not base_obj:
+            base_obj = "user_current"
+
+    # 3) Last resort: equal-weight baseline
+    if not base_metrics:
+        base_metrics = state.get("baseline_metrics") or {}
+        if not base_obj:
+            base_obj = "equal_weight"
+
+    prefs = _merged_prefs(state)
+    news_signals = state.get("news_signals")
+
+    chosen = str(state.get("objective_key") or "maxsharpe").lower().strip()
+    refine_obj = chosen
+
+    try:
+        # Optional tightening: keep base_constraints minimal if base is "real previous"
+        base_constraints = {"rf": float(state.get("rf", 0.02))}
+        refine_constraints = {
+            "rf": float(state.get("rf", 0.02)),
+            "w_max": float(state.get("w_max", 0.30)),
+            "lambda_l2": float(state.get("lambda_l2", 1e-3)),
+        }
+
+        prep = insight_agent_prepare(
+            base_metrics=base_metrics,
+            refine_metrics=refine_metrics,
+            preferences=prefs,
+            news_signals=news_signals,
+            base_objective=base_obj,
+            refine_objective=refine_obj,
+            base_constraints=base_constraints,
+            refine_constraints=refine_constraints,
+        )
+
+        prompts = prep.get("prompts") or {}
+        payload = prep.get("payload") or {}
+
+        client = LLMClient()
+
+        # ✅ IMPORTANT: narrative mode (LLM returns a long text report)
+        # This requires llm_client.generate_portfolio_insights to accept mode="narrative"
+        out = client.generate_portfolio_insights(
+            prompts=prompts,
+            payload=payload,
+            mode="narrative",
+        )
+
+        state["insight_ok"] = bool(out.get("ok"))
+        state["insight_issues"] = list(out.get("issues") or [])
+        state["insight_parse_mode"] = out.get("parse_mode") or "narrative"
+
+        # ✅ UI should render this
+        state["insight_raw_text"] = (out.get("text") or out.get("raw_text") or "").strip() or None
+
+        # Keep JSON insight optional (not used in narrative mode)
+        state["insight"] = out.get("insight") if isinstance(out.get("insight"), dict) else None
+
+        state["debug_notes"].append(
+            f"Insight: generated ok={state['insight_ok']} issues={len(state['insight_issues'])} mode={state['insight_parse_mode']}"
+        )
+        return state
+
+    except Exception as e:
+        state["insight_ok"] = False
+        state["insight_raw_text"] = None
+        state["insight"] = None
+        state["insight_issues"] = [f"insight_exception: {e}"]
+        state["insight_parse_mode"] = "error"
+        state["debug_notes"].append(f"Insight: failed → {e}")
+        return state
+
+
 def node_explain(state: PortfolioState) -> PortfolioState:
     """
-    Fix #2:
-    - Use the chosen candidate as the SINGLE source-of-truth for the explanation,
-      so we don't accidentally narrate a different objective than the one selected.
+    - Always narrate the chosen objective
+    - Use final_metrics=optimized_metrics so numbers match UI (single source of truth)
     """
     if not state.get("optimization_result"):
         state["explanation"] = "No optimization result available (empty universe)."
@@ -559,16 +683,15 @@ def node_explain(state: PortfolioState) -> PortfolioState:
     chosen = state.get("objective_key") or "maxsharpe"
     obj = "max_sharpe" if chosen == "maxsharpe" else "min_var"
 
-    # ✅ keep recommendation_agent but force it to talk about the chosen key
     text = recommendation_agent(
         state["optimization_result"],
         objective=obj,
         current_metrics=state.get("current_metrics"),
         rf=float(state["rf"]),
         preferences=_merged_prefs(state),
+        final_metrics=state.get("optimized_metrics") or None,  # ✅ IMPORTANT
     )
 
-  
     om = state.get("optimized_metrics") or {}
     r_pct = om.get("return_pct")
     v_pct = om.get("vol_pct")
@@ -608,6 +731,8 @@ def build_portfolio_graph():
 
     g.add_node("llm_select", node_llm_select_candidate)
     g.add_node("finalize", node_finalize_selection)
+
+    g.add_node("insight", node_insight_generator)
     g.add_node("explain", node_explain)
 
     g.set_entry_point("ask_clarifications")
@@ -629,7 +754,9 @@ def build_portfolio_graph():
     g.add_edge("news_fetch", "news_signals")
     g.add_edge("news_signals", "llm_select")
     g.add_edge("llm_select", "finalize")
-    g.add_edge("finalize", "explain")
+
+    g.add_edge("finalize", "insight")
+    g.add_edge("insight", "explain")
     g.add_edge("explain", END)
 
     return g.compile()
@@ -645,6 +772,10 @@ def run_graph(
     clarification_answers: Optional[Dict[str, Any]] = None,
     mode: Mode = "refine",
     use_llm: bool = False,
+    # ✅ pass base portfolio from the previous Run Base
+    base_portfolio_metrics: Optional[Dict[str, Any]] = None,
+    base_portfolio_weights: Optional[Dict[str, float]] = None,
+    base_portfolio_objective: Optional[str] = None,
 ) -> PortfolioState:
     app = build_portfolio_graph()
 
@@ -665,6 +796,15 @@ def run_graph(
         "llm_decision": None,
         "optimized_weights": {},
         "optimized_metrics": {},
+        "insight": None,
+        "insight_ok": None,
+        "insight_issues": [],
+        "insight_raw_text": None,
+        "insight_parse_mode": None,
+        # ✅ base portfolio injection
+        "base_portfolio_metrics": base_portfolio_metrics,
+        "base_portfolio_weights": base_portfolio_weights,
+        "base_portfolio_objective": base_portfolio_objective,
     }
 
     return app.invoke(init, config={"recursion_limit": 200})

@@ -595,7 +595,6 @@ class LLMClient:
             "- Do NOT contradict the metrics.\n"
             "- If assets were explicitly excluded by the user, acknowledge this clearly in the explanation.\n"
             "- Keep it clear and non-technical.\n"
-
         )
 
         payload = {
@@ -606,9 +605,7 @@ class LLMClient:
             "candidates": (ctx.get("candidates") or {}),
         }
         cand_map = (ctx.get("candidates") or {})
-        payload["metric_table"] = {
-            k: ((cand_map.get(k) or {}).get("metrics") or {}) for k in available_candidates
-        }
+        payload["metric_table"] = {k: ((cand_map.get(k) or {}).get("metrics") or {}) for k in available_candidates}
         payload["excluded_assets"] = ctx["preferences"].get("excluded_assets", [])
 
         if os.getenv("LLM_DEBUG_METRICS", "0") == "1":
@@ -633,3 +630,157 @@ class LLMClient:
             "rationale": "Legacy refine-actions API disabled in A/B selection mode.",
             "proposed_actions": [],
         }
+
+    # =========================================================
+    # ✅ NEW: Insight Generator call (JSON output)  [ADD ONLY]
+    # =========================================================
+    def _parse_json_best_effort(self, text: str) -> Tuple[Optional[Dict[str, Any]], str]:
+        """
+        Tries to parse JSON even if the model wraps it with extra text.
+        Returns (json_dict_or_none, parse_mode_string).
+        """
+        if not text or not isinstance(text, str):
+            return None, "empty"
+
+        s = text.strip()
+
+        # 1) direct parse
+        try:
+            j = json.loads(s)
+            if isinstance(j, dict):
+                return j, "direct"
+        except Exception:
+            pass
+
+        # 2) find first {...} block
+        #    (naive but effective for LLM leakage)
+        start = s.find("{")
+        end = s.rfind("}")
+        if start >= 0 and end > start:
+            chunk = s[start : end + 1].strip()
+            try:
+                j = json.loads(chunk)
+                if isinstance(j, dict):
+                    return j, "brace_slice"
+            except Exception:
+                pass
+
+        return None, "failed"
+
+    def _verify_insight_output_light(self, insight: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Lightweight deterministic verifier (no imports, no circular deps).
+        - Ensures risk_drivers tickers are in allowed set (top_risk_drivers from payload).
+        - Ensures base_vs_refine.metric_deltas exists (fills from payload.delta.metrics if missing).
+        Returns {ok, issues, cleaned}
+        """
+        issues: List[str] = []
+        cleaned = dict(insight or {})
+
+        allowed = set()
+        for side in ("base", "refine"):
+            for item in ((payload.get(side) or {}).get("top_risk_drivers") or []):
+                t = str((item or {}).get("ticker") or "").strip()
+                if t:
+                    allowed.add(t)
+
+        rd = cleaned.get("risk_drivers")
+        if isinstance(rd, list):
+            kept = []
+            for item in rd:
+                if not isinstance(item, dict):
+                    issues.append("risk_driver_item_not_dict")
+                    continue
+                t = str(item.get("ticker") or "").strip()
+                if t and t in allowed:
+                    kept.append(item)
+                else:
+                    issues.append(f"risk_driver_ticker_not_allowed: {t}")
+            cleaned["risk_drivers"] = kept
+
+        # Ensure metric_deltas exists
+        delta_metrics = ((payload.get("delta") or {}).get("metrics") or {})
+        bvr = cleaned.get("base_vs_refine")
+        if not isinstance(bvr, dict):
+            bvr = {}
+        if "metric_deltas" not in bvr:
+            bvr["metric_deltas"] = delta_metrics
+        cleaned["base_vs_refine"] = bvr
+
+        ok = len(issues) == 0
+        return {"ok": ok, "issues": issues, "cleaned": cleaned}
+
+    def generate_portfolio_insights(
+        self,
+        *,
+        prompts: Dict[str, Any],   # artık Any çünkü içinde narrative/json olabilir
+        payload: Dict[str, Any],
+        mode: str = "json",        # "narrative" | "json"
+        max_chars: int = 8000,
+    ) -> Dict[str, Any]:
+        """
+        Insight Generator:
+        - If mode="narrative": returns plain text for UI (no JSON parse)
+        - If mode="json": parses JSON best-effort + verifies
+
+        prompts can be either:
+        A) single pack: {"system":..., "developer":..., "user":...}
+        B) two packs: {"narrative": {...}, "json": {...}}
+        """
+
+        # --- pick correct prompt pack ---
+        pack = prompts
+        if isinstance(prompts, dict) and ("narrative" in prompts or "json" in prompts):
+            pack = prompts.get(mode, {}) if isinstance(prompts.get(mode, {}), dict) else {}
+
+        system = (pack or {}).get("system", "")
+        developer = (pack or {}).get("developer", "")
+        user = (pack or {}).get("user", "")
+
+        system_full = (system.rstrip() + "\n\n" + developer.strip()).strip()
+        user_text = (user or "").strip()
+        if len(user_text) > max_chars:
+            user_text = user_text[:max_chars] + "\n\n[TRUNCATED]\n"
+
+        raw = self.chat(system=system_full, user=user_text)
+        raw = (raw or "").strip()
+
+        # ----------------------------
+        # NARRATIVE MODE: return text directly
+        # ----------------------------
+        if mode == "narrative":
+            if not raw:
+                raw = "Insights not available (empty LLM response)."
+            return {
+                "ok": True,
+                "text": raw,
+                "issues": [],
+                "raw_text": raw,
+                "parse_mode": "text",
+            }
+
+        # ----------------------------
+        # JSON MODE: parse + verify
+        # ----------------------------
+        j, parse_mode = self._parse_json_best_effort(raw)
+
+        if j is None:
+            fallback = {
+                "headline": "Insights not available (LLM returned non-JSON).",
+                "portfolio_story": [],
+                "risk_drivers": [],
+                "diversification_read": {"max_weight": None, "effective_n": None, "comment": "not provided"},
+                "base_vs_refine": {"key_changes": [], "metric_deltas": ((payload.get("delta") or {}).get("metrics") or {})},
+                "news_overlay": [],
+                "action_suggestions_optional": [],
+            }
+            issues = [f"json_parse_failed(mode={parse_mode})"]
+            return {"ok": False, "insight": fallback, "issues": issues, "raw_text": raw, "parse_mode": parse_mode}
+
+        verified = self._verify_insight_output_light(j, payload)
+        ok = bool(verified.get("ok"))
+        issues = list(verified.get("issues") or [])
+        cleaned = verified.get("cleaned") or j
+
+        return {"ok": ok, "insight": cleaned, "issues": issues, "raw_text": raw, "parse_mode": parse_mode}
+
