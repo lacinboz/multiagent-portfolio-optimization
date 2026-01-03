@@ -521,6 +521,11 @@ def _holdings_change(base_w: Dict[str, float], refine_w: Dict[str, float], thres
     }
 
 
+# ✅ ONLY REQUIRED FIX:
+# - Add *_pct fields into build_insight_payload() so the Insight LLM
+#   sees percentages (51.0%) instead of decimals (0.51) and stops writing "0.51%".
+# Everything else is unchanged.
+
 def build_insight_payload(
     *,
     base: Optional[Dict[str, Any]] = None,
@@ -556,12 +561,17 @@ def build_insight_payload(
             "objective": base_obj,
             "constraints": base_constraints,
             "metrics": {
+                # decimals (still useful for math / consistency)
                 "return": _safe_float(base.get("return")),
                 "vol": _safe_float(base.get("vol")),
                 "sharpe": _safe_float(base.get("sharpe")),
                 "max_weight": _safe_float(base.get("max_weight")),
                 "effective_n": _safe_float(base.get("effective_n")),
                 "active_assets": base.get("active_assets"),
+                # ✅ add percent fields for correct UI wording in Insight LLM
+                "return_pct": _safe_float(base.get("return_pct")),
+                "vol_pct": _safe_float(base.get("vol_pct")),
+                "max_weight_pct": _safe_float(base.get("max_weight_pct")),
             },
             "top_holdings": _top_k_from_weights(base_w, k=top_k),
             "top_risk_drivers": _top_k_from_rc(base, k=top_k),
@@ -570,12 +580,17 @@ def build_insight_payload(
             "objective": refine_obj,
             "constraints": refine_constraints,
             "metrics": {
+                # decimals
                 "return": _safe_float(refine.get("return")),
                 "vol": _safe_float(refine.get("vol")),
                 "sharpe": _safe_float(refine.get("sharpe")),
                 "max_weight": _safe_float(refine.get("max_weight")),
                 "effective_n": _safe_float(refine.get("effective_n")),
                 "active_assets": refine.get("active_assets"),
+                # ✅ add percent fields for correct UI wording in Insight LLM
+                "return_pct": _safe_float(refine.get("return_pct")),
+                "vol_pct": _safe_float(refine.get("vol_pct")),
+                "max_weight_pct": _safe_float(refine.get("max_weight_pct")),
             },
             "top_holdings": _top_k_from_weights(ref_w, k=top_k),
             "top_risk_drivers": _top_k_from_rc(refine, k=top_k),
@@ -596,6 +611,9 @@ def build_insight_payload(
         f"refine_obj={refine_obj}",
         f"has_delta={'metrics' in payload.get('delta', {})}",
     )
+    print("[INSIGHT:payload] base_top_risk_drivers=", [x["ticker"] for x in payload["base"]["top_risk_drivers"][:5]])
+    print("[INSIGHT:payload] refine_top_risk_drivers=", [x["ticker"] for x in payload["refine"]["top_risk_drivers"][:5]])
+
     return payload
 
 

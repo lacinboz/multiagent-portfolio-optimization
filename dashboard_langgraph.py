@@ -564,6 +564,35 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+def _get_compare_state_for_charts():
+    """
+    Chart comparison should follow Insight story:
+    - If refined exists: compare Base Portfolio -> Refined Portfolio
+    - Else if user provided Current portfolio: compare Current -> Active (base)
+    - Else: fallback to baseline (equal weight) only when nothing else exists
+    """
+    base_state = st.session_state.get("base_state")
+    refined_state = st.session_state.get("refined_state")
+    active_state = refined_state or base_state
+
+    # Active metrics already extracted later; for compare we want "previous"
+    if refined_state is not None and base_state is not None:
+        prev_metrics = (base_state.get("optimized_metrics") or {})
+        prev_label = "Base Portfolio"
+        return prev_metrics, prev_label
+
+    # If no refined: compare against user current portfolio if exists
+    if active_state is not None:
+        cm = active_state.get("current_metrics")
+        if cm:
+            return cm, "Current"
+
+        bm = active_state.get("baseline_metrics")
+        if bm:
+            return bm, "Baseline (Equal Weight)"
+
+    return None, None
+
 
 # ---------------- ACTIVE STATE ----------------
 graph_state = st.session_state["refined_state"] or st.session_state["base_state"]
@@ -957,36 +986,25 @@ else:
             )
         )
 
-    if current_metrics is not None and current_metrics:
-        x_c = _safe_float(current_metrics.get("vol"))
-        y_c = _safe_float(current_metrics.get("return"))
-        if x_c is not None and y_c is not None:
+    # ✅ Compare point should match Insight story
+    compare_metrics, compare_label = _get_compare_state_for_charts()
+
+    if compare_metrics is not None and compare_label:
+        x_cmp = _safe_float(compare_metrics.get("vol"))
+        y_cmp = _safe_float(compare_metrics.get("return"))
+        if x_cmp is not None and y_cmp is not None:
             fig_frontier.add_trace(
                 go.Scatter(
-                    x=[x_c],
-                    y=[y_c],
+                    x=[x_cmp],
+                    y=[y_cmp],
                     mode="markers+text",
-                    name="Current",
-                    text=["Current"],
+                    name=compare_label,
+                    text=[compare_label],
                     textposition="bottom right",
                     marker=dict(size=10),
                 )
             )
-    elif baseline_metrics is not None and baseline_metrics:
-        x_b = _safe_float(baseline_metrics.get("vol"))
-        y_b = _safe_float(baseline_metrics.get("return"))
-        if x_b is not None and y_b is not None:
-            fig_frontier.add_trace(
-                go.Scatter(
-                    x=[x_b],
-                    y=[y_b],
-                    mode="markers+text",
-                    name="Baseline (Equal Weight)",
-                    text=["Baseline (Equal Weight)"],
-                    textposition="bottom right",
-                    marker=dict(size=10),
-                )
-            )
+
 
     fig_frontier.update_layout(
         paper_bgcolor="#0b1020",
@@ -1023,20 +1041,20 @@ else:
 
         compare_label = None
 
-        if current_metrics is not None:
-            aligned = _rc_series_aligned_to(tickers_rc, current_metrics)
+        # ✅ Compare series should match Insight story
+        compare_metrics, compare_label = _get_compare_state_for_charts()
+
+        if compare_metrics is not None and compare_label:
+            aligned = _rc_series_aligned_to(tickers_rc, compare_metrics)
             if aligned is not None:
-                df_rc["Current"] = aligned
-                compare_label = "Current"
+                df_rc[compare_label] = aligned
+                compare_label_used = compare_label
             else:
-                st.info("Current RC cannot be aligned (current_metrics should include 'tickers' + 'rc_pct').")
-        elif baseline_metrics is not None:
-            aligned = _rc_series_aligned_to(tickers_rc, baseline_metrics)
-            if aligned is not None:
-                df_rc["Baseline (Equal Weight)"] = aligned
-                compare_label = "Baseline (Equal Weight)"
-            else:
-                st.info("Baseline RC cannot be aligned (baseline_metrics should include 'tickers' + 'rc_pct').")
+                st.info(f"{compare_label} RC cannot be aligned (needs 'tickers' + 'rc_pct').")
+                compare_label_used = None
+        else:
+            compare_label_used = None
+
 
         df_long = df_rc.melt(id_vars="Ticker", var_name="Portfolio", value_name="Risk Contribution")
         fig_rc = px.bar(df_long, x="Ticker", y="Risk Contribution", color="Portfolio", barmode="group")
@@ -1052,11 +1070,12 @@ else:
         fig_rc.update_yaxes(tickformat=".0%")
         st.plotly_chart(fig_rc, use_container_width=True)
 
-        if compare_label:
+        if compare_label_used:
             st.caption(
                 f"Bars show each asset’s share of total portfolio risk (σ). "
-                f"Comparison: **{compare_label}** vs **{active_label}**."
+                f"Comparison: **{compare_label_used}** vs **{active_label}**."
             )
+
 
 st.markdown("</div>", unsafe_allow_html=True)
 
