@@ -1,20 +1,15 @@
-# llm_client.py
+   # llm_client.py
 # ✅ Option A (robust): Decision + Explanation are DECOUPLED
 # + ✅ NEW: LLM Interpretation + LLM Verifier (self-check)
+# + ✅ NEW (ADDITIVE): News Snapshot + News Risk Check (LLM) + Deterministic verifier
 #
-# Flow:
+# Flow (refine):
 # 0) LLM interprets user feedback -> tiny intent JSON (no hard mapping)
 # 1) LLM chooses candidate -> FINAL_CHOICE: <candidate>
 # 1.5) LLM verifies choice against intent + metric_table -> may correct
 # 2) LLM generates explanation (free-form)
-#
-# FIXES INCLUDED:
-# 1) ✅ Normalize return/vol to DECIMALS (fixes 51% vs 5.1% scale confusion)
-# 2) ✅ Prefer *_pct fields in explanation context (return_pct/vol_pct/max_weight_pct)
-# 3) ✅ Infer a small structured hint from extra_notes → pain_points (not a rule tree)
-# 4) ✅ Decision rubric handles "accept lower returns to reduce drawdowns"
-# 5) ✅ Explanation call no longer receives reasoner_text
-# 6) ✅ NEW: LLM interpretation + verifier + debug logging
+# 3) ✅ (optional) LLM summarizes recent news -> snapshot + risk flags (verifier cleans output)
+# 4) ✅ (optional) LLM proposes news actions -> deterministic cleaner -> optional LLM verifier -> deterministic cleaner
 
 from __future__ import annotations
 
@@ -23,6 +18,7 @@ import os
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Literal
+from evidence_utils import assign_evidence_ids_and_map
 
 import requests
 from dotenv import load_dotenv
@@ -42,10 +38,45 @@ PP_NOT_SURE = "I’m not sure — I just want something safer/smoother"
 
 _ALLOWED_CANDIDATES = {"maxsharpe", "minvar"}
 
+# =========================================================
+# NEWS actions schema (shared by generator + verifier + deterministic cleaner)
+# =========================================================
+_ALLOWED_NEWS_ACTION_TYPES = {
+    "exclude_ticker",
+    "set_w_max",
+    "shift_objective",
+    "reduce_exposure",
+    "hedge",
+}
 
 # =========================================================
 # Small helpers
 # =========================================================
+from datetime import datetime, timezone
+
+
+
+def _fmt_news_dt(x: Any) -> str:
+    # epoch seconds -> ISO string
+    if isinstance(x, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(x), tz=timezone.utc).strftime("%Y-%m-%d")
+        except Exception:
+            return "unknown"
+    # already string?
+    s = str(x or "").strip()
+    if not s:
+        return "unknown"
+    # if ISO-like, keep only date
+    try:
+        if s.endswith("Z"):
+            s = s[:-1]
+        dt = datetime.fromisoformat(s)
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return "unknown"
+
+
 def _pref_list(x: Any) -> List[str]:
     if x is None:
         return []
@@ -75,6 +106,17 @@ def _safe_float(x: Any) -> Optional[float]:
         return None
 
 
+def _clamp01(x: Any) -> Optional[float]:
+    v = _safe_float(x)
+    if v is None:
+        return None
+    if v < 0.0:
+        return 0.0
+    if v > 1.0:
+        return 1.0
+    return float(v)
+
+
 def _norm_pct_to_decimal(x: Any) -> Any:
     """
     Enforce return/vol as decimals.
@@ -91,9 +133,7 @@ def _norm_pct_to_decimal(x: Any) -> Any:
 
 def _infer_pain_points_from_notes(extra_notes: str, pain_points: List[str]) -> List[str]:
     """
-    Minimal structured hint from free text (NOT a rule tree):
-    If notes indicate 'smoother/avoid drawdowns/safer', add one label so the LLM
-    doesn't miss the intent when pain_points UI is empty.
+    Minimal structured hint from free text (NOT a rule tree).
     """
     if not extra_notes:
         return pain_points
@@ -124,7 +164,6 @@ def _extract_final_choice(text: str, available: List[str]) -> Optional[str]:
     """
     Parse a line like:
       FINAL_CHOICE: minvar
-    Accepts casing/whitespace variants.
     """
     if not text:
         return None
@@ -140,25 +179,16 @@ def _extract_final_choice(text: str, available: List[str]) -> Optional[str]:
 
 def _compact_candidate(c: Dict[str, Any]) -> Dict[str, Any]:
     """
-    candidates expected shape (from portfolio_langgraph):
-      {
-        "weights": {...},
-        "metrics": {...}   # may include *_pct fields (recommended)
-      }
-
-    ✅ IMPORTANT:
-    - Normalize return/vol so the LLM never sees mixed scales (0.51 vs 51.0 etc.)
-    - Pass *_pct fields through so the LLM writes "10.4%" not "0.104%".
+    ✅ Normalize return/vol so the LLM never sees mixed scales
+    ✅ Pass *_pct fields so the LLM writes "10.4%" not "0.104%".
     """
     m = _safe_dict(c.get("metrics"))
     w = _safe_dict(c.get("weights"))
 
-    # decimals (for safe comparisons / fallback logic)
     ret = _norm_pct_to_decimal(m.get("return"))
     vol = _norm_pct_to_decimal(m.get("vol"))
     sharpe = _safe_float(m.get("sharpe"))
 
-    # normalized display (preferred for explanation text)
     ret_pct = _safe_float(m.get("return_pct"))
     vol_pct = _safe_float(m.get("vol_pct"))
     max_w_pct = _safe_float(m.get("max_weight_pct"))
@@ -166,14 +196,12 @@ def _compact_candidate(c: Dict[str, Any]) -> Dict[str, Any]:
     top_w = sorted([(k, float(v)) for k, v in w.items()], key=lambda x: x[1], reverse=True)[:5]
     return {
         "metrics": {
-            # raw decimals (still useful)
             "return": ret,
             "vol": vol,
             "sharpe": sharpe,
             "max_weight": m.get("max_weight"),
             "effective_n": m.get("effective_n"),
             "active_assets": m.get("active_assets"),
-            # ✅ preferred for natural-language
             "return_pct": ret_pct,
             "vol_pct": vol_pct,
             "max_weight_pct": max_w_pct,
@@ -192,11 +220,6 @@ def validate_choice(choice: str, available: List[str]) -> Tuple[bool, str]:
 
 
 def _sort_available(candidates: Dict[str, Any]) -> List[str]:
-    """
-    Stable ordering to reduce tiny-model randomness:
-    - prefer known keys order: maxsharpe then minvar
-    - else fallback to sorted keys
-    """
     keys = list(candidates.keys())
     ordered = [k for k in ["maxsharpe", "minvar"] if k in keys]
     rest = sorted([k for k in keys if k not in ordered])
@@ -231,6 +254,16 @@ class HFConfig:
 
 
 class LLMClient:
+    _ALLOWED_FLAGS = {
+        "none",
+        "event_risk",
+        "earnings_uncertainty",
+        "regulatory",
+        "litigation",
+        "product_issue",
+        "macro",
+    }
+
     def __init__(self):
         self.provider = (os.getenv("LLM_PROVIDER", "ollama") or "ollama").lower().strip()
 
@@ -323,10 +356,6 @@ class LLMClient:
     # NEW: Interpret user feedback (LLM) -> tiny intent JSON
     # =========================================================
     def _interpret_feedback(self, pain_points: List[str], extra_notes: str) -> Dict[str, Any]:
-        """
-        Returns a tiny JSON intent. No hard mapping.
-        This lets us LOG what the LLM thinks "too risky" means.
-        """
         system = (
             "You interpret portfolio feedback into a tiny structured intent.\n"
             "Return ONLY valid JSON (no markdown).\n"
@@ -345,13 +374,11 @@ class LLMClient:
         user = json.dumps({"pain_points": pain_points, "extra_notes": extra_notes}, ensure_ascii=False)
         text = self.chat(system=system, user=user).strip()
 
-        # best-effort JSON parse
         try:
             j = json.loads(text)
             if not isinstance(j, dict):
                 raise ValueError("intent not dict")
         except Exception:
-            # fallback intent (still not hard mapping; just safe default)
             j = {
                 "risk_aversion": "medium",
                 "return_seeking": "medium",
@@ -359,7 +386,6 @@ class LLMClient:
                 "notes_summary": (extra_notes or "")[:160],
             }
 
-        # debug log
         if os.getenv("LLM_DEBUG_INTENT", "0") == "1":
             print("\n===== LLM DEBUG: INTERPRETED INTENT =====")
             print(json.dumps(j, indent=2))
@@ -385,16 +411,6 @@ class LLMClient:
         preferences: Dict[str, Any],
         news_signals: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        """
-        Returns:
-          {
-            "decision": "accept",
-            "chosen_candidate": "maxsharpe" | "minvar",
-            "rationale": "..."
-          }
-        """
-
-        # ---- hard guards ----
         if mode == "base":
             chosen0 = str(objective_key or "maxsharpe").lower().strip() or "maxsharpe"
             if chosen0 not in candidates:
@@ -408,7 +424,6 @@ class LLMClient:
         prefs = preferences or {}
         satisfaction = str(prefs.get("satisfaction") or "").lower().strip()
 
-        # satisfaction yes -> keep current objective (no selection)
         if satisfaction == "yes":
             chosen = str(objective_key or "maxsharpe").lower().strip() or "maxsharpe"
             if chosen not in candidates:
@@ -419,7 +434,6 @@ class LLMClient:
                 "rationale": "User satisfaction=yes; skipping candidate comparison.",
             }
 
-        # only run selection if explicit dissatisfaction
         if satisfaction != "no":
             chosen = str(objective_key or "maxsharpe").lower().strip() or "maxsharpe"
             if chosen not in candidates:
@@ -430,22 +444,19 @@ class LLMClient:
                 "rationale": "No explicit dissatisfaction; defaulting to the current objective.",
             }
 
-        # availability (stable order)
         available = _sort_available(candidates)
         available = [k for k in available if k in _ALLOWED_CANDIDATES] or available
         if not available:
             return {"decision": "accept", "chosen_candidate": "maxsharpe", "rationale": "No candidates provided."}
 
-        # compact payload (normalized + includes *_pct fields)
         candidates_summary = {k: _compact_candidate(_safe_dict(v)) for k, v in candidates.items()}
 
         pain_points = _pref_list(prefs.get("pain_points"))
         extra_notes = str(prefs.get("extra_notes") or "").strip()
 
-        # ✅ infer one structured hint from free-text notes (helps when UI pain_points empty)
         pain_points = _infer_pain_points_from_notes(extra_notes, pain_points)
 
-        # ✅ NEW: LLM interprets feedback -> intent (and we can log it)
+        # ✅ NEW: LLM interprets feedback -> intent
         intent = self._interpret_feedback(pain_points, extra_notes)
 
         ctx = {
@@ -461,28 +472,23 @@ class LLMClient:
                 "extra_notes": extra_notes,
                 "extra_notes_present": _has_meaningful_text(extra_notes),
             },
-            "intent": intent,  # ✅ NEW
+            "intent": intent,
             "baseline_metrics": baseline_metrics,
             "current_metrics": current_metrics,
-            "news_signals": news_signals,
+            # NOTE: news_signals intentionally excluded from candidate selection context.
+            # News is handled in a separate stage (snapshot/actions) and must not influence this decision.
             "candidates": candidates_summary,
             "available_candidates": available,
         }
 
-        # =========================================================
-        # STEP 1: DECISION (no JSON required)
-        # =========================================================
         decision_system = (
             "You are a portfolio candidate comparison assistant.\n"
-            "You will be given multiple candidate portfolios produced by a deterministic optimizer.\n"
             "Choose exactly ONE candidate from available_candidates that best matches the user's intent.\n"
-            "\n"
             "Use the provided 'intent' as the main interpretation of the feedback.\n"
             "Decision rubric:\n"
             "- If intent.risk_aversion is high -> prefer LOWER volatility and more diversification.\n"
             "- If intent.return_seeking is high -> prefer HIGHER Sharpe ratio and/or higher return.\n"
-            "- Use ONLY the provided metrics; do not invent anything.\n"
-            "\n"
+            "Use ONLY the provided metrics; do not invent anything.\n"
             "Output format:\n"
             "FINAL_CHOICE: <candidate>\n"
         )
@@ -500,7 +506,6 @@ class LLMClient:
             retry_text = self.chat(system=retry_system, user=reasoner_text)
             chosen = _extract_final_choice(retry_text, available)
 
-        # fallback if model fails formatting
         if chosen is None:
             safer_intent = str(intent.get("risk_aversion", "medium")).lower() == "high"
             if safer_intent:
@@ -525,7 +530,7 @@ class LLMClient:
             chosen = available[0]
 
         # =========================================================
-        # STEP 1.5: VERIFIER (LLM self-check)  ✅
+        # STEP 1.5: VERIFIER (LLM self-check)
         # =========================================================
         metric_table = _extract_metric_table(ctx, available)
 
@@ -533,10 +538,6 @@ class LLMClient:
             "You are a strict verifier of a portfolio choice.\n"
             "Check whether the chosen_candidate contradicts the user's intent.\n"
             "Use ONLY intent + metric_table.\n"
-            "\n"
-            "If intent.risk_aversion is high, choosing the higher-volatility candidate is likely a contradiction.\n"
-            "If intent.return_seeking is high, choosing the clearly lower-sharpe candidate is likely a contradiction.\n"
-            "\n"
             "Output ONLY one line:\n"
             "FINAL_CHOICE: <candidate>\n"
         )
@@ -559,9 +560,6 @@ class LLMClient:
             if os.getenv("LLM_DEBUG_VERIFIER", "0") == "1":
                 print(f"[LLM Verifier] skipped due to error: {e}")
 
-        # =========================================================
-        # STEP 2: EXPLANATION (free-form text)
-        # =========================================================
         rationale = self.generate_candidate_explanation(
             chosen_candidate=chosen,
             available_candidates=available,
@@ -581,10 +579,6 @@ class LLMClient:
         available_candidates: List[str],
         ctx: Dict[str, Any],
     ) -> str:
-        """
-        Separate interpretability call (no JSON).
-        Produces the user-facing explanation of why chosen_candidate was selected.
-        """
         explain_system = (
             "You are writing a short user-facing explanation for a portfolio selection decision.\n"
             "Write 3-5 sentences.\n"
@@ -593,7 +587,7 @@ class LLMClient:
             "- Compare chosen candidate vs alternatives using ONLY provided metrics.\n"
             "- Prefer *_pct fields when available and express them as percentages.\n"
             "- Do NOT contradict the metrics.\n"
-            "- If assets were explicitly excluded by the user, acknowledge this clearly in the explanation.\n"
+            "- If assets were explicitly excluded by the user, acknowledge this clearly.\n"
             "- Keep it clear and non-technical.\n"
         )
 
@@ -632,19 +626,14 @@ class LLMClient:
         }
 
     # =========================================================
-    # ✅ NEW: Insight Generator call (JSON output)  [ADD ONLY]
+    # ✅ NEW: Robust JSON parsing helper (used by insights + news)
     # =========================================================
     def _parse_json_best_effort(self, text: str) -> Tuple[Optional[Dict[str, Any]], str]:
-        """
-        Tries to parse JSON even if the model wraps it with extra text.
-        Returns (json_dict_or_none, parse_mode_string).
-        """
         if not text or not isinstance(text, str):
             return None, "empty"
 
         s = text.strip()
 
-        # 1) direct parse
         try:
             j = json.loads(s)
             if isinstance(j, dict):
@@ -652,8 +641,6 @@ class LLMClient:
         except Exception:
             pass
 
-        # 2) find first {...} block
-        #    (naive but effective for LLM leakage)
         start = s.find("{")
         end = s.rfind("}")
         if start >= 0 and end > start:
@@ -667,13 +654,10 @@ class LLMClient:
 
         return None, "failed"
 
+    # =========================================================
+    # ✅ NEW: Insight Generator call (supports "narrative" + "json")
+    # =========================================================
     def _verify_insight_output_light(self, insight: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Lightweight deterministic verifier (no imports, no circular deps).
-        - Ensures risk_drivers tickers are in allowed set (top_risk_drivers from payload).
-        - Ensures base_vs_refine.metric_deltas exists (fills from payload.delta.metrics if missing).
-        Returns {ok, issues, cleaned}
-        """
         issues: List[str] = []
         cleaned = dict(insight or {})
 
@@ -698,7 +682,6 @@ class LLMClient:
                     issues.append(f"risk_driver_ticker_not_allowed: {t}")
             cleaned["risk_drivers"] = kept
 
-        # Ensure metric_deltas exists
         delta_metrics = ((payload.get("delta") or {}).get("metrics") or {})
         bvr = cleaned.get("base_vs_refine")
         if not isinstance(bvr, dict):
@@ -713,22 +696,11 @@ class LLMClient:
     def generate_portfolio_insights(
         self,
         *,
-        prompts: Dict[str, Any],   # artık Any çünkü içinde narrative/json olabilir
+        prompts: Dict[str, Any],
         payload: Dict[str, Any],
-        mode: str = "json",        # "narrative" | "json"
+        mode: str = "json",  # "narrative" | "json"
         max_chars: int = 8000,
     ) -> Dict[str, Any]:
-        """
-        Insight Generator:
-        - If mode="narrative": returns plain text for UI (no JSON parse)
-        - If mode="json": parses JSON best-effort + verifies
-
-        prompts can be either:
-        A) single pack: {"system":..., "developer":..., "user":...}
-        B) two packs: {"narrative": {...}, "json": {...}}
-        """
-
-        # --- pick correct prompt pack ---
         pack = prompts
         if isinstance(prompts, dict) and ("narrative" in prompts or "json" in prompts):
             pack = prompts.get(mode, {}) if isinstance(prompts.get(mode, {}), dict) else {}
@@ -745,23 +717,11 @@ class LLMClient:
         raw = self.chat(system=system_full, user=user_text)
         raw = (raw or "").strip()
 
-        # ----------------------------
-        # NARRATIVE MODE: return text directly
-        # ----------------------------
         if mode == "narrative":
             if not raw:
                 raw = "Insights not available (empty LLM response)."
-            return {
-                "ok": True,
-                "text": raw,
-                "issues": [],
-                "raw_text": raw,
-                "parse_mode": "text",
-            }
+            return {"ok": True, "text": raw, "issues": [], "raw_text": raw, "parse_mode": "text"}
 
-        # ----------------------------
-        # JSON MODE: parse + verify
-        # ----------------------------
         j, parse_mode = self._parse_json_best_effort(raw)
 
         if j is None:
@@ -770,7 +730,10 @@ class LLMClient:
                 "portfolio_story": [],
                 "risk_drivers": [],
                 "diversification_read": {"max_weight": None, "effective_n": None, "comment": "not provided"},
-                "base_vs_refine": {"key_changes": [], "metric_deltas": ((payload.get("delta") or {}).get("metrics") or {})},
+                "base_vs_refine": {
+                    "key_changes": [],
+                    "metric_deltas": ((payload.get("delta") or {}).get("metrics") or {}),
+                },
                 "news_overlay": [],
                 "action_suggestions_optional": [],
             }
@@ -783,4 +746,1103 @@ class LLMClient:
         cleaned = verified.get("cleaned") or j
 
         return {"ok": ok, "insight": cleaned, "issues": issues, "raw_text": raw, "parse_mode": parse_mode}
+    
 
+
+    def _clean_evidence_list(self, ev: Any) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        if not isinstance(ev, list):
+            return out
+        for x in ev:
+            if not isinstance(x, dict):
+                continue
+            headline = str(x.get("headline") or "").strip()
+            if not headline:
+                continue
+            if len(headline) > 180:
+                headline = headline[:177] + "..."
+            date = str(x.get("date") or "").strip() or None
+            source = str(x.get("source") or "").strip() or None
+            e = {"headline": headline, "date": date, "source": source}
+            url = str(x.get("url") or "").strip()
+            if url:
+                e["url"] = url
+            out.append(e)
+            if len(out) >= 3:
+                break
+        return out
+
+    # =========================================================
+    # ✅ NEW: News Snapshot + News Risk Check (ADD ONLY)
+    # =========================================================
+    def _collect_allowed_evidence_ids(
+        self,
+        *,
+        snapshot_text: Optional[str],
+        risk_json: Optional[Dict[str, Any]],
+    ) -> set[str]:
+        """
+        Allowed evidence IDs are:
+        - IDs appearing in snapshot_text bullet tags: ([ID] ...)
+        - IDs listed in risk_json.by_ticker[*].evidence_ids
+        """
+        allowed: set[str] = set()
+
+        # From snapshot_text: match "([ID]" where ID is inside [ ... ]
+        st = str(snapshot_text or "")
+        # bullet format: " - ([ID] DATE | SOURCE) ..."
+        for m in re.finditer(r"\(\[([^\]]+)\]", st):
+            _id = m.group(1).strip()
+            if _id:
+                allowed.add(_id)
+
+        # From risk_json.by_ticker.*.evidence_ids
+        rj = risk_json if isinstance(risk_json, dict) else {}
+        bt = rj.get("by_ticker")
+        if isinstance(bt, dict):
+            for _, v in bt.items():
+                if not isinstance(v, dict):
+                    continue
+                ev = v.get("evidence_ids")
+                if isinstance(ev, list):
+                    for x in ev:
+                        sx = str(x).strip()
+                        if sx:
+                            allowed.add(sx)
+
+        return allowed
+
+    def _verify_news_risk_json(
+        self,
+        j: Dict[str, Any],
+        tickers: List[str],
+        *,
+        allowed_evidence_ids: Optional[set[str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Deterministic cleaner:
+        - keeps keys: summary, by_ticker, global
+        - enforces ticker whitelist
+        - clamps confidence to [0,1]
+        - ✅ filters evidence_ids against allowed_evidence_ids (if provided)
+        """
+        issues: List[str] = []
+        allowed = set(str(t).upper() for t in (tickers or []))
+
+        cleaned: Dict[str, Any] = {
+            "summary": "",
+            "by_ticker": {},
+            "global": {"risk_flags": [], "vol_regime": "normal"},
+        }
+
+        if not isinstance(j, dict):
+            return {"ok": False, "issues": ["news_not_dict"], "cleaned": cleaned}
+
+        if isinstance(j.get("summary"), str):
+            cleaned["summary"] = j["summary"].strip()
+
+        bt = j.get("by_ticker")
+        if isinstance(bt, dict):
+            for k, v in bt.items():
+                t = str(k).upper().strip()
+                if t not in allowed:
+                    issues.append(f"ticker_not_allowed:{t}")
+                    continue
+                if not isinstance(v, dict):
+                    issues.append(f"ticker_value_not_dict:{t}")
+                    continue
+
+                risk_flag = str(v.get("risk_flag") or "none").strip().lower()
+                if risk_flag not in self._ALLOWED_FLAGS:
+                    risk_flag = "none"
+                conf = _clamp01(v.get("confidence"))
+
+                ev = v.get("evidence_ids")
+                ev_ids: List[str] = []
+                if isinstance(ev, list):
+                    tmp = [str(x).strip() for x in ev if str(x).strip()]
+                    if allowed_evidence_ids is not None:
+                        tmp = [x for x in tmp if x in allowed_evidence_ids]
+                    ev_ids = tmp
+
+                cleaned["by_ticker"][t] = {
+                    "risk_flag": risk_flag,
+                    "confidence": conf,
+                    "evidence_ids": ev_ids,
+                }
+
+        glob = j.get("global")
+        if isinstance(glob, dict):
+            vr = str(glob.get("vol_regime") or "normal").strip().lower()
+            if vr not in ("normal", "high"):
+                vr = "normal"
+            cleaned["global"]["vol_regime"] = vr
+
+            rf = glob.get("risk_flags")
+            if isinstance(rf, list):
+                kept_flags = []
+                for item in rf:
+                    if not isinstance(item, dict):
+                        continue
+                    t = str(item.get("ticker") or "").upper().strip()
+                    flag = str(item.get("flag") or "").strip()
+                    if t and (t in allowed) and flag:
+                        kept_flags.append({"ticker": t, "flag": flag})
+                cleaned["global"]["risk_flags"] = kept_flags
+
+        ok = len(issues) == 0
+        return {"ok": ok, "issues": issues, "cleaned": cleaned}
+    def format_news_snapshot_strict(
+        self,
+        *,
+        tickers: List[str],
+        news_items: List[Dict[str, Any]],   # items (evidence_id'li)
+        draft_snapshot_text: str,
+        draft_risk_json: Dict[str, Any],
+        max_bullets_per_ticker: int = 6,
+    ) -> Dict[str, Any]:
+        """
+        LLM-2 formatter:
+        - snapshot_text'i kanonik formata sokar ve evidence_id ekler
+        - risk_json.by_ticker.*.evidence_ids üretir (sadece verilen evidence_id'lerden)
+        - ÇIKTI: {"snapshot_text": str, "risk_json": dict}
+        """
+        tickers_u = [str(t).upper().strip() for t in (tickers or []) if str(t).strip()]
+
+        # küçük, güvenli paket
+        compact_items = []
+        for it in (news_items or []):
+            compact_items.append(
+                {
+                    "evidence_id": it.get("evidence_id"),
+                    "ticker": str(it.get("ticker") or "").upper().strip(),
+                    "date": it.get("date"),
+                    "source": it.get("source"),
+                    "headline": it.get("headline"),
+                    "url": it.get("url"),
+                }
+            )
+
+        system = (
+            "You are a strict NEWS snapshot formatter.\n"
+            "Your job: produce a canonical snapshot_text and a risk_json that references evidence_ids.\n"
+            "Return ONLY valid JSON (no markdown, no extra text). Output must start with '{' and end with '}'.\n"
+            "\n"
+            "Hard rules:\n"
+            f"- Allowed tickers: {tickers_u}\n"
+            "- You may use ONLY evidence_id values that appear in news_items.\n"
+            f"- Max {max_bullets_per_ticker} bullets per ticker.\n"
+            "- Do NOT invent any events or companies.\n"
+            "\n"
+            "snapshot_text rules:\n"
+            "- Must be ticker-by-ticker.\n"
+            "- Each bullet MUST be anchored to exactly ONE news item.\n"
+            "- Bullet format MUST be exactly:\n"
+            " - ([EVIDENCE_ID] DATE | SOURCE) HEADLINE: <headline> — <one short explanation>\n"
+            "- DATE must come from news_items.date (or 'unknown').\n"
+            "- SOURCE must come from news_items.source (or 'unknown').\n"
+            "\n"
+            "risk_json schema:\n"
+            "{\n"
+            '  \"summary\": string,\n'
+            '  \"by_ticker\": {\n'
+            '     \"TICKER\": {\"risk_flag\": \"none|event_risk|earnings_uncertainty|regulatory|litigation|product_issue|macro\", \"confidence\": number, \"evidence_ids\": [\"TICKER_01\"]}\n'
+            "  },\n"
+            '  \"global\": {\"risk_flags\": [{\"ticker\":\"TICKER\",\"flag\":\"string\"}], \"vol_regime\": \"normal|high\"}\n'
+            "}\n"
+        )
+
+        user = json.dumps(
+            {
+                "tickers": tickers_u,
+                "news_items": compact_items,
+                "draft_snapshot_text": draft_snapshot_text or "",
+                "draft_risk_json": draft_risk_json or {},
+            },
+            ensure_ascii=False,
+        )
+
+        raw = (self.chat(system=system, user=user) or "").strip()
+        j, _mode = self._parse_json_best_effort(raw)
+
+        # fail-safe: draft'ı bozma
+        if not isinstance(j, dict):
+            return {
+                "ok": False,
+                "snapshot_text": draft_snapshot_text or "",
+                "risk_json": draft_risk_json or {},
+                "raw_text": raw,
+            }
+
+        out_snapshot = j.get("snapshot_text")
+        out_risk = j.get("risk_json")
+
+        if not isinstance(out_snapshot, str):
+            out_snapshot = draft_snapshot_text or ""
+        if not isinstance(out_risk, dict):
+            out_risk = draft_risk_json or {}
+
+        return {"ok": True, "snapshot_text": out_snapshot.strip(), "risk_json": out_risk, "raw_text": raw}
+    
+    def generate_news_snapshot(
+        self,
+        *,
+        tickers: List[str],
+        news_raw: List[Dict[str, Any]],
+        lookback_days: int = 7,
+        max_items_total: int = 60,
+    ) -> Dict[str, Any]:
+        """
+        Produces:
+        - snapshot_text: UI text paragraph(s)
+        - risk_json: structured {summary, by_ticker, global} (verified/cleaned)
+        This is meant for your "News Snapshot / News Risk Check" UI step.
+        """
+        tickers_u = [str(t).upper().strip() for t in (tickers or []) if str(t).strip()]
+        allowed = set(tickers_u)
+
+        # light truncate to keep prompt stable
+        items: List[Dict[str, Any]] = []
+        for it in (news_raw or []):
+            t = str(it.get("ticker") or "").upper().strip()
+            if t and t in allowed:
+                items.append(
+                    {
+                        "id": it.get("id"),
+                        "ticker": t,
+                        "evidence_id": it.get("evidence_id"),
+                        "date": it.get("date") or "unknown",
+                        "headline": it.get("headline"),
+                        "summary": it.get("summary"),
+                        "source": it.get("source") or it.get("provider"),
+                        "url": it.get("url"),
+                    }
+                )
+        items = items[: max(0, int(max_items_total))]
+
+        has_eids = any(isinstance(it, dict) and it.get("evidence_id") for it in (items or []))
+        if not has_eids:
+            items, _evidence_map = assign_evidence_ids_and_map(items)
+       
+        # ✅ DEBUG: show assigned evidence_ids (does NOT affect snapshot_text)
+        if os.getenv("LLM_DEBUG_NEWS_EVIDENCE_IDS", "0") == "1":
+            print("\n===== DEBUG: evidence_id assignment (input news_items) =====")
+            by_t: Dict[str, List[Dict[str, Any]]] = {}
+            for it2 in items:
+                by_t.setdefault(it2.get("ticker", "UNK"), []).append(it2)
+
+            for t2 in sorted(by_t.keys()):
+                print(f"Ticker={t2} count={len(by_t[t2])}")
+                for x in by_t[t2][:5]:
+                    print(
+                        f"  {x.get('evidence_id')} | finnhub_id={x.get('id')} | date={x.get('date')} | "
+                        f"source={x.get('source')} | headline={(x.get('headline') or '')[:70]}"
+                    )
+            print("===========================================================\n")
+
+
+        system = (
+            "You summarize recent market/company news for a portfolio risk overlay.\n"
+            "Return ONLY valid JSON (no markdown, no extra text).\n"
+            "The output MUST start with '{' and end with '}'.\n"
+            "Do NOT wrap the JSON in ``` fences.\n"
+            "Do NOT use trailing commas.\n"
+            "Do NOT use NaN/Infinity; use null instead.\n"
+            "Use ONLY the provided news items. Do NOT invent events.\n"
+            "\n"
+            "CRITICAL HARD RULES:\n"
+            f"- You may mention ONLY these tickers: {tickers_u}\n"
+            "- Do NOT mention any other company/ticker names (e.g., SKIL) even as examples.\n"
+            "- Do NOT create extra sections like 'General Market Context' or 'Partnership'.\n"
+            "- Only output ticker sections for the allowed tickers.\n"
+            "\n"
+            "Schema:\n"
+            "{\n"
+            '  \"snapshot_text\": string,\n'
+            '  \"risk_json\": {\n'
+            '    \"summary\": string,\n'
+            '    \"by_ticker\": { \"TICKER\": {\"risk_flag\": string, \"confidence\": number}, ... },\n'
+            '    \"global\": { \"risk_flags\": [{\"ticker\": string, \"flag\": string}, ...], \"vol_regime\": \"normal\"|\"high\" }\n'
+            "  }\n"
+            "}\n"
+            "\n"
+            "Guidance:\n"
+            "- risk_flag examples: none, event_risk, earnings_uncertainty, regulatory, litigation, product_issue, macro\n"
+            "- confidence must be between 0 and 1.\n"
+            "- vol_regime='high' only if multiple strong risk items appear.\n"
+            "\n"
+            "snapshot_text formatting:\n"
+            "- MUST be ticker-by-ticker.\n"
+            "- For EACH ticker: include UP TO 6 bullet points (0 to 6). If there are not enough relevant items, write fewer (including 0).\n"
+            "- Do NOT create filler bullets to reach any minimum (there is no minimum).\n"
+            "- If a ticker has no relevant items, output that ticker with NO bullets (do not add extra sections).\n"
+            "- IMPORTANT: NEVER exceed the number of provided items for that ticker.\n"
+            "- Each bullet MUST be anchored to ONE provided news item.\n"
+            "- Bullet format MUST be exactly:\n"
+            " - (DATE | SOURCE) HEADLINE: <headline> — <one short explanation>\n"
+            "- DATE must use news_items[i].date (already derived). If missing use 'unknown'.\n"
+            "- SOURCE must use news_items[i].source. If missing use 'unknown'.\n"
+        )
+
+        user = json.dumps(
+            {
+                "tickers": tickers_u,
+                "lookback_days": int(lookback_days),
+                "news_items": items,
+            },
+            ensure_ascii=False,
+        )
+
+        raw = (self.chat(system=system, user=user) or "").strip()
+        j, parse_mode = self._parse_json_best_effort(raw)
+
+        # ✅ 2nd pass: JSON repair if needed (mirrors your decision retry pattern)
+        if j is None:
+            repair_system = (
+                "You are a JSON repair tool.\n"
+                "Convert the given text into VALID JSON that matches the schema.\n"
+                "Return ONLY JSON. No markdown. No extra text.\n"
+                "The output MUST start with '{' and end with '}'.\n"
+            )
+            schema_hint = (
+                '{ "snapshot_text": "string", "risk_json": { "summary": "string", '
+                '"by_ticker": { "TICKER": {"risk_flag": "string", "confidence": "number", "evidence_ids": ["string"]} }, '
+                '"global": { "risk_flags": [{"ticker": "string", "flag": "string"}], "vol_regime": "normal|high" } } }'
+            )
+
+            repair_user = json.dumps(
+                {
+                    "schema": schema_hint,
+                    "text": raw,
+                    "tickers": tickers_u,
+                },
+                ensure_ascii=False,
+            )
+
+            repaired = (self.chat(system=repair_system, user=repair_user) or "").strip()
+            j2, parse_mode2 = self._parse_json_best_effort(repaired)
+            if j2 is not None:
+                j, parse_mode = j2, f"repair:{parse_mode2}"
+            else:
+                # safe fallback
+                return {
+                    "ok": False,
+                    "snapshot_text": "News snapshot unavailable (LLM returned non-JSON).",
+                    "risk_json": {"summary": "", "by_ticker": {}, "global": {"risk_flags": [], "vol_regime": "normal"}},
+                    "issues": [
+                        f"news_json_parse_failed(mode={parse_mode})",
+                        f"news_json_repair_failed(mode={parse_mode2})",
+                    ],
+                    "raw_text": raw,
+                    "parse_mode": parse_mode2,
+                }
+
+        snapshot_text = ""
+        if isinstance(j.get("snapshot_text"), str):
+            snapshot_text = j["snapshot_text"].strip()
+
+        risk_json = j.get("risk_json") if isinstance(j.get("risk_json"), dict) else {}
+
+        # ✅ LLM-2 Formatter: canonical snapshot_text + risk_json(with evidence_ids)
+        fmt = self.format_news_snapshot_strict(
+            tickers=tickers_u,
+            news_items=items,  # evidence_id'li items
+            draft_snapshot_text=snapshot_text,
+            draft_risk_json=risk_json,
+            max_bullets_per_ticker=6,
+        )
+        if os.getenv("LLM_DEBUG_NEWS_FORMATTER2", "0") == "1":
+            print("\n===== DEBUG: Formatter-2 RAW =====")
+            print((fmt.get("raw_text") or "")[:2000])
+            print("===== DEBUG: Formatter-2 snapshot_text preview =====")
+            print((fmt.get("snapshot_text") or "")[:800])
+            print("===== DEBUG: Formatter-2 risk_json keys =====")
+            rj = fmt.get("risk_json") if isinstance(fmt.get("risk_json"), dict) else {}
+            print(list(rj.keys()) if isinstance(rj, dict) else type(rj))
+            bt = rj.get("by_ticker") if isinstance(rj, dict) else None
+            print("by_ticker keys:", list(bt.keys()) if isinstance(bt, dict) else bt)
+            print("==================================\n")
+        snapshot_text = (fmt.get("snapshot_text") or snapshot_text).strip()
+        risk_json = fmt.get("risk_json") if isinstance(fmt.get("risk_json"), dict) else risk_json
+
+        # ✅ allowed evidence ids setini üret (snapshot + risk_json içinden)
+        allowed_eids = self._collect_allowed_evidence_ids(
+            snapshot_text=snapshot_text,
+            risk_json=risk_json,
+        )
+
+        verified = self._verify_news_risk_json(
+            risk_json if isinstance(risk_json, dict) else {},
+            tickers_u,
+            allowed_evidence_ids=allowed_eids,   # ✅ artık filtre var
+        )
+
+
+
+        return {
+            "ok": bool(verified.get("ok")),
+            "snapshot_text": snapshot_text or "News snapshot generated.",
+            "risk_json": verified.get("cleaned"),
+            "issues": list(verified.get("issues") or []),
+            "raw_text": raw,
+            "parse_mode": parse_mode,
+        }
+    # ============================
+# ✅ NEW: News Actions (LINE)
+# ============================
+
+    def _parse_actions_lines(
+        self,
+        text: str,
+        *,
+        tickers: List[str],
+        allowed_evidence_ids: set[str],
+        max_actions: int = 8,
+    ) -> Dict[str, Any]:
+        """
+        Parses canonical action lines into list[dict].
+        Drops any action that has:
+        - invalid type
+        - invalid ticker (if required)
+        - missing/invalid evidence_ids (must be in allowed_evidence_ids)
+        """
+        issues: List[str] = []
+        actions: List[Dict[str, Any]] = []
+
+        tickers_u = {str(t).upper().strip() for t in (tickers or []) if str(t).strip()}
+        allowed_types = set(_ALLOWED_NEWS_ACTION_TYPES)
+
+        lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+        if not lines:
+            return {"ok": False, "actions": [], "issues": ["empty_lines"]}
+
+        for i, ln in enumerate(lines):
+            if len(actions) >= max_actions:
+                break
+
+            # allow comments or headers safely
+            if ln.startswith("#"):
+                continue
+
+            parts = [p.strip() for p in ln.split("|")]
+            if len(parts) < 4:
+                issues.append(f"line_{i}_too_few_fields")
+                continue
+
+            a_type = parts[0]
+            if a_type not in allowed_types:
+                issues.append(f"line_{i}_bad_type:{a_type}")
+                continue
+
+            # evidence ids are always the second last field
+            # reason is always the last field
+            reason = parts[-1].strip()
+            eids_raw = parts[-2].strip()
+
+            eids = [x.strip() for x in eids_raw.split(",") if x.strip()]
+            eids = [x for x in eids if x in allowed_evidence_ids]
+            eids = eids[:2]
+
+            if not eids:
+                issues.append(f"line_{i}_missing_or_invalid_eids")
+                continue
+
+            out: Dict[str, Any] = {"type": a_type, "reason": reason or "Derived from recent news.", "evidence_ids": eids}
+
+            # parse payload fields per type
+            if a_type == "exclude_ticker":
+                # exclude_ticker|TICKER|EIDS|REASON
+                ticker = parts[1].upper()
+                if ticker not in tickers_u:
+                    issues.append(f"line_{i}_exclude_bad_ticker:{ticker}")
+                    continue
+                out["ticker"] = ticker
+
+            elif a_type == "reduce_exposure":
+                # reduce_exposure|TICKER|INTENSITY|EIDS|REASON
+                if len(parts) < 5:
+                    issues.append(f"line_{i}_reduce_missing_fields")
+                    continue
+                ticker = parts[1].upper()
+                intensity = parts[2].lower().strip() or "medium"
+                if ticker not in tickers_u:
+                    issues.append(f"line_{i}_reduce_bad_ticker:{ticker}")
+                    continue
+                if intensity not in ("low", "medium", "high"):
+                    intensity = "medium"
+                out["ticker"] = ticker
+                out["intensity"] = intensity
+
+            elif a_type == "set_w_max":
+                # set_w_max|0.30|EIDS|REASON
+                try:
+                    v = float(parts[1])
+                except Exception:
+                    issues.append(f"line_{i}_wmax_not_float")
+                    continue
+                if not (0.05 <= v <= 0.50):
+                    issues.append(f"line_{i}_wmax_out_of_range:{v}")
+                    continue
+                out["value"] = v
+
+            elif a_type == "shift_objective":
+                # shift_objective|minvar|maxsharpe|EIDS|REASON
+                to = parts[1].lower().strip()
+                if to not in ("minvar", "maxsharpe"):
+                    issues.append(f"line_{i}_shift_bad_to:{to}")
+                    continue
+                out["to"] = to
+
+            elif a_type == "hedge":
+                # hedge|HEDGE_HINT|EIDS|REASON
+                hedge_hint = parts[1].strip()
+                if not hedge_hint:
+                    issues.append(f"line_{i}_hedge_missing_hint")
+                    continue
+                out["hedge_hint"] = hedge_hint
+
+            actions.append(out)
+
+        ok = len(actions) > 0 and len(issues) == 0
+        return {"ok": ok, "actions": actions, "issues": issues}
+
+
+    def generate_news_actions_lines(
+        self,
+        *,
+        tickers: List[str],
+        news_items: List[Dict[str, Any]],
+        max_actions: int = 8,
+    ) -> Dict[str, Any]:
+        """
+        LLM outputs line-based actions. We parse deterministically.
+        NO JSON involved.
+        """
+        tickers_u = [str(t).upper().strip() for t in (tickers or []) if str(t).strip()]
+        max_actions = max(1, min(int(max_actions), 12))
+
+        # allowed evidence ids
+        allowed_ids = sorted(
+            {str(it.get("evidence_id")).strip() for it in (news_items or []) if isinstance(it, dict) and it.get("evidence_id")}
+        )
+        allowed_set = set(allowed_ids)
+
+        # keep prompt stable
+        allowed_ids = allowed_ids[:120]
+        allowed_ids_block = "\n".join(allowed_ids)
+
+        # compact news items for grounding (LLM sees only these)
+        compact_items = []
+        for it in (news_items or []):
+            if not isinstance(it, dict):
+                continue
+            compact_items.append({
+                "evidence_id": it.get("evidence_id"),
+                "ticker": str(it.get("ticker") or "").upper().strip(),
+                "date": it.get("date"),
+                "source": it.get("source") or it.get("provider"),
+                "headline": it.get("headline"),
+            })
+
+        system = (
+            "You are a portfolio NEWS actions generator.\n"
+            "Output ONLY action lines. NO JSON. NO markdown.\n"
+            "Rules:\n"
+            f"- Allowed tickers: {tickers_u}\n"
+            f"- Max actions: {max_actions}\n"
+            "- Each action MUST include 1-2 evidence_ids copied EXACTLY.\n"
+            "- Use ONLY evidence_ids from the allowed list.\n"
+            "- If you cannot support an action with evidence_ids, DO NOT output it.\n"
+            "\n"
+            "Line formats (one per line):\n"
+            "exclude_ticker|TICKER|EID1,EID2|REASON\n"
+            "reduce_exposure|TICKER|low|EID1,EID2|REASON\n"
+            "reduce_exposure|TICKER|medium|EID1,EID2|REASON\n"
+            "reduce_exposure|TICKER|high|EID1,EID2|REASON\n"
+            "set_w_max|0.30|EID1,EID2|REASON   (value must be 0.05-0.50)\n"
+            "shift_objective|minvar|EID1,EID2|REASON\n"
+            "shift_objective|maxsharpe|EID1,EID2|REASON\n"
+            "hedge|HEDGE_HINT|EID1,EID2|REASON\n"
+            "\n"
+            "Allowed evidence_ids (one per line):\n"
+            f"{allowed_ids_block}\n"
+        )
+
+        user = json.dumps(
+            {"tickers": tickers_u, "news_items": compact_items},
+            ensure_ascii=False,
+        )
+
+        raw = (self.chat(system=system, user=user) or "").strip()
+
+        parsed = self._parse_actions_lines(
+            raw,
+            tickers=tickers_u,
+            allowed_evidence_ids=allowed_set,
+            max_actions=max_actions,
+        )
+
+        return {
+            "ok": bool(parsed.get("ok")),
+            "actions": parsed.get("actions") or [],
+            "issues": parsed.get("issues") or [],
+            "raw_text": raw,
+            "parse_mode": "lines",
+        }
+
+    # =========================================================
+    # ✅ NEW: News Actions (LLM) + Verifier (LLM) + Deterministic Cleaner
+    # =========================================================
+    def _verify_news_actions_json(
+        self,
+        j: Dict[str, Any],
+        tickers: List[str],
+        *,
+        allowed_evidence_ids: Optional[set[str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Deterministic cleaner for actions JSON:
+        Output shape:
+          {"ok": bool, "issues": [...], "cleaned": {"actions": [...]}}
+        ✅ Additionally filters evidence_ids against allowed_evidence_ids (if provided).
+        """
+        issues: List[str] = []
+        allowed = set(str(t).upper().strip() for t in (tickers or []))
+
+        cleaned_actions: List[Dict[str, Any]] = []
+
+        if not isinstance(j, dict):
+            return {"ok": False, "issues": ["actions_not_dict"], "cleaned": {"actions": []}}
+
+        actions = j.get("actions")
+        if not isinstance(actions, list):
+            return {"ok": False, "issues": ["actions_missing_or_not_list"], "cleaned": {"actions": []}}
+
+        for a in actions:
+            if not isinstance(a, dict):
+                issues.append("action_item_not_dict")
+                continue
+
+            t = str(a.get("type") or "").strip()
+            if t not in _ALLOWED_NEWS_ACTION_TYPES:
+                issues.append(f"unsupported_action_type:{t}")
+                continue
+
+            out: Dict[str, Any] = {"type": t, "reason": str(a.get("reason") or "").strip()}
+
+            out["evidence"] = self._clean_evidence_list(a.get("evidence"))
+    
+            ev = a.get("evidence_ids")
+            ev_ids: List[str] = []
+            if isinstance(ev, list):
+                tmp = [str(x).strip() for x in ev if str(x).strip()]
+                if allowed_evidence_ids is not None:
+                    tmp = [x for x in tmp if x in allowed_evidence_ids]
+                ev_ids = tmp[:2]
+
+            out["evidence_ids"] = ev_ids
+
+            # ✅ require evidence_ids (no ungrounded actions)
+            if not out["evidence_ids"]:
+                issues.append("missing_evidence_ids")
+                continue
+
+
+
+            if t == "exclude_ticker":
+                ticker = str(a.get("ticker") or "").upper().strip()
+                if not ticker or ticker not in allowed:
+                    issues.append(f"exclude_outside_universe:{ticker}")
+                    continue
+                out["ticker"] = ticker
+
+            elif t == "set_w_max":
+                try:
+                    v = float(a.get("value"))
+                except Exception:
+                    issues.append("w_max_not_float")
+                    continue
+                if not (0.05 <= v <= 0.50):
+                    issues.append(f"w_max_out_of_range:{v}")
+                    continue
+                out["value"] = v
+
+            elif t == "shift_objective":
+                to = str(a.get("to") or "").lower().strip()
+                if to not in ("minvar", "maxsharpe"):
+                    issues.append(f"invalid_shift_objective:{to}")
+                    continue
+                out["to"] = to
+
+            elif t == "reduce_exposure":
+                ticker = str(a.get("ticker") or "").upper().strip()
+                if not ticker or ticker not in allowed:
+                    issues.append(f"reduce_exposure_outside_universe:{ticker}")
+                    continue
+                intensity = str(a.get("intensity") or "medium").lower().strip()
+                if intensity not in ("low", "medium", "high"):
+                    intensity = "medium"
+                out["ticker"] = ticker
+                out["intensity"] = intensity
+
+            elif t == "hedge":
+                out["hedge_hint"] = str(a.get("hedge_hint") or "").strip()
+
+            cleaned_actions.append(out)
+
+        ok = len(issues) == 0
+        return {"ok": ok, "issues": issues, "cleaned": {"actions": cleaned_actions}}
+
+    def generate_news_actions(
+        self,
+        *,
+        tickers: List[str],
+        snapshot: Optional[Dict[str, Any]] = None,
+        risk_json: Optional[Dict[str, Any]] = None,
+        max_actions: int = 8,
+        news_items: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """
+        LLM proposes actionable portfolio changes based on news.
+        Returns:
+          { ok, actions, issues, raw_text, parse_mode }
+        """
+        tickers_u = [str(t).upper().strip() for t in (tickers or []) if str(t).strip()]
+        max_actions = max(1, min(int(max_actions), 12))
+        allowed_ids = sorted(
+            {str(it.get("evidence_id")).strip() for it in (news_items or []) if isinstance(it, dict) and it.get("evidence_id")}
+        )
+        # prompt çok uzamasın diye (opsiyonel)
+        allowed_ids = allowed_ids[:120]
+        allowed_ids_block = "\n".join(allowed_ids)
+        system = (
+            "You are a portfolio NEWS actions generator.\n"
+            "Your goal: propose practical portfolio adjustment actions driven by recent news.\n"
+            "Return ONLY valid JSON (no markdown, no extra text).\n"
+            "Do NOT invent news. Use ONLY snapshot + risk_json + news_items.\n"
+            "\n"
+            "Allowed action types:\n"
+            "- exclude_ticker: {type, ticker, reason, evidence_ids, evidence}\n"
+            "- set_w_max: {type, value, reason, evidence_ids, evidence}\n"
+            "- shift_objective: {type, to, reason, evidence_ids, evidence}\n"
+            "- reduce_exposure: {type, ticker, intensity, reason, evidence_ids, evidence}\n"
+            "- hedge: {type, hedge_hint, reason, evidence_ids, evidence}\n"
+            "\n"
+            "evidence format:\n"
+            '- evidence is a list of 0-3 objects: {"headline": string, "date": "YYYY-MM-DD"|null, "source": string|null, "url": string|null}\n'
+            "- If you are not sure, you may return evidence: [] (empty list).\n"
+
+            "\n"
+            "Hard rules:\n"
+            f"- ticker must be one of: {tickers_u}\n"
+            f"- return at most {max_actions} actions\n"
+            "- Keep reasons short and specific.\n"
+            "- Each action MUST include evidence_ids (1-2 ids).\n"
+            f"- Allowed evidence_ids (one per line):\n{allowed_ids_block}\n"
+            "- If you cannot support an action with evidence_ids, DO NOT output that action.\n"
+            "Output MUST start with '{' and end with '}'.\n"
+            "Do NOT include any text outside JSON.\n"
+            "evidence_ids must match allowed_evidence_ids EXACTLY (copy-paste).\n"
+            "Never output empty evidence_ids.\n"
+            "\n"
+            "Schema:\n"
+            "{\n"
+            '  "actions": [\n'
+            '    {"type":"reduce_exposure","ticker":"NVDA","intensity":"medium","reason":"...","evidence_ids":["NVDA_01"],"evidence":[...]},\n'
+            "    ...\n"
+            "  ]\n"
+            "}\n"
+        )
+
+        compact_items = []
+        for it in (news_items or []):
+            if not isinstance(it, dict):
+                continue
+            compact_items.append({
+                "evidence_id": it.get("evidence_id"),
+                "ticker": it.get("ticker"),
+                "date": it.get("date"),
+                "source": it.get("source") or it.get("provider"),
+                "headline": it.get("headline"),
+                "url": it.get("url"),
+            })
+
+        user = json.dumps(
+            {
+                "tickers": tickers_u,
+                "snapshot": snapshot or {},
+                "risk_json": risk_json or {},
+                "news_items": compact_items,
+            },
+            ensure_ascii=False,
+        )
+
+        raw = (self.chat(system=system, user=user) or "").strip()
+        j, parse_mode = self._parse_json_best_effort(raw)
+
+        if j is None:
+
+            return {
+                "ok": False,
+                "actions": [],
+                "issues": [f"actions_json_parse_failed(mode={parse_mode})"],
+                "raw_text": raw,
+                "parse_mode": parse_mode,
+            }
+
+        # ✅ Build allowed evidence set from snapshot_text + risk_json
+        snap_text = ""
+        if isinstance((snapshot or {}).get("snapshot_text"), str):
+            snap_text = (snapshot or {}).get("snapshot_text") or ""
+
+        allowed_set = set(allowed_ids)
+
+        verified = self._verify_news_actions_json(j, tickers_u, allowed_evidence_ids=allowed_set)
+        cleaned = (verified.get("cleaned") or {}).get("actions") or []
+
+        # ✅ 2nd pass self-fix if output is unusable
+        if (not cleaned) or (verified.get("issues")):
+            fix_system = (
+                "You are a strict JSON fixer.\n"
+                "Return ONLY valid JSON. No markdown. No extra text.\n"
+                "You MUST output at least 1 action if possible.\n"
+                "Every action MUST include evidence_ids (1-2), and they MUST be chosen from allowed_evidence_ids.\n"
+                "Copy evidence_ids EXACTLY. Do not invent IDs.\n"
+                "Schema:\n"
+                '{ "actions": [ {"type":"reduce_exposure","ticker":"TICKER","intensity":"low|medium|high","reason":"...","evidence_ids":["ID1"],"evidence":[]} ] }\n'
+            )
+
+            fix_user = json.dumps(
+                {
+                    "allowed_tickers": tickers_u,
+                    "allowed_evidence_ids": allowed_ids,
+                    "news_items": compact_items,
+                    "previous_raw_output": raw,
+                    "detected_issues": list(verified.get("issues") or []),
+                    "max_actions": max_actions,
+                },
+                ensure_ascii=False,
+            )
+
+            raw2 = (self.chat(system=fix_system, user=fix_user) or "").strip()
+            j2, parse_mode2 = self._parse_json_best_effort(raw2)
+            if j2 is not None:
+                verified2 = self._verify_news_actions_json(j2, tickers_u, allowed_evidence_ids=allowed_set)
+                cleaned2 = (verified2.get("cleaned") or {}).get("actions") or []
+                # if improved, use it
+                if cleaned2:
+                    return {
+                        "ok": bool(verified2.get("ok")),
+                        "actions": cleaned2,
+                        "issues": list(verified2.get("issues") or []),
+                        "raw_text": raw2,
+                        "parse_mode": f"fix:{parse_mode2}",
+                    }
+
+        # default return
+        return {
+            "ok": bool(verified.get("ok")),
+            "actions": cleaned,
+            "issues": list(verified.get("issues") or []),
+            "raw_text": raw,
+            "parse_mode": parse_mode,
+        }
+
+        # =========================================================
+    # ✅ NEW: Attach evidence_ids to already-generated actions (2nd pass)
+    # =========================================================
+    def attach_evidence_ids_to_actions(
+        self,
+        *,
+        actions: List[Dict[str, Any]],
+        news_items: List[Dict[str, Any]],
+        tickers: List[str],
+        max_ids_per_action: int = 2,
+    ) -> Dict[str, Any]:
+        """
+        2nd LLM pass:
+        - Takes existing actions (already cleaned/verified)
+        - Attaches evidence_ids based on news_items that already contain evidence_id
+        - NEVER drops actions; if not sure -> evidence_ids=[]
+        """
+        tickers_u = [str(t).upper().strip() for t in (tickers or []) if str(t).strip()]
+
+        compact_items: List[Dict[str, Any]] = []
+        for it in (news_items or []):
+            compact_items.append(
+                {
+                    "evidence_id": it.get("evidence_id"),
+                    "ticker": str(it.get("ticker") or "").upper().strip(),
+                    "date": it.get("date"),
+                    "source": it.get("source") or it.get("provider"),
+                    "headline": it.get("headline"),
+                    "url": it.get("url"),
+                }
+            )
+
+        system = (
+            "You are an evidence linker.\n"
+            "Attach evidence_ids to each portfolio action using ONLY the provided news_items.\n"
+            "Return ONLY valid JSON (no markdown, no extra text).\n"
+            "\n"
+            "Hard rules:\n"
+            f"- Allowed tickers: {tickers_u}\n"
+            "- You may use ONLY evidence_id values that appear in news_items.\n"
+            f"- For each action, choose 1-{max_ids_per_action} evidence_ids if possible.\n"
+            "- If you cannot find strong support, set evidence_ids: []\n"
+            "- NEVER delete or drop actions.\n"
+            "\n"
+            "Schema:\n"
+            '{ "actions": [ { ...original action fields..., "evidence_ids": ["TICKER_01"] } ] }\n'
+        )
+
+        user = json.dumps(
+            {
+                "tickers": tickers_u,
+                "actions": actions or [],
+                "news_items": compact_items,
+            },
+            ensure_ascii=False,
+        )
+
+        raw = (self.chat(system=system, user=user) or "").strip()
+        j, parse_mode = self._parse_json_best_effort(raw)
+
+        if not isinstance(j, dict) or not isinstance(j.get("actions"), list):
+            # fail-safe: keep original actions
+            return {"ok": False, "actions": actions or [], "raw_text": raw, "parse_mode": parse_mode}
+
+        # soft sanitize evidence_ids to be list[str]
+        out_actions: List[Dict[str, Any]] = []
+        allowed_ids = {str(x.get("evidence_id")).strip() for x in compact_items if x.get("evidence_id")}
+
+        for a in j["actions"]:
+            if not isinstance(a, dict):
+                continue
+            ev = a.get("evidence_ids")
+            ev_ids: List[str] = []
+            if isinstance(ev, list):
+                ev_ids = [str(x).strip() for x in ev if str(x).strip() and str(x).strip() in allowed_ids]
+                ev_ids = ev_ids[: max(0, int(max_ids_per_action))]
+
+            # ensure field exists even if empty
+            a2 = dict(a)
+            a2["evidence_ids"] = ev_ids
+            out_actions.append(a2)
+
+        return {"ok": True, "actions": out_actions, "raw_text": raw, "parse_mode": parse_mode}
+
+    def verify_news_actions(
+        self,
+        *,
+        actions: List[Dict[str, Any]],
+        snapshot: Optional[Dict[str, Any]],
+        risk_json: Optional[Dict[str, Any]],
+        universe: List[str],
+    ) -> Dict[str, Any]:
+        """
+        LLM verifier rewrites / drops unsafe actions, then deterministic cleaner enforces schema.
+        Returns:
+        { ok, actions, issues, raw_text, parse_mode, notes }
+        """
+        tickers_u = [str(t).upper().strip() for t in (universe or []) if str(t).strip()]
+
+        system = (
+            "You are a strict verifier for NEWS-driven portfolio actions.\n"
+            "Your job:\n"
+            "- Remove actions that are not supported by the provided snapshot/risk_json\n"
+            "- Remove duplicates and contradictions\n"
+            "- Ensure tickers belong to the universe\n"
+            "- Keep only allowed action types and valid fields\n"
+            "Return ONLY valid JSON.\n"
+            "\n"
+            "Allowed action types: exclude_ticker, set_w_max, shift_objective, reduce_exposure, hedge\n"
+            "Constraints:\n"
+            "- set_w_max.value must be between 0.05 and 0.50\n"
+            "- shift_objective.to must be 'minvar' or 'maxsharpe'\n"
+            "- reduce_exposure.intensity must be low|medium|high\n"
+            "\n"
+            "Evidence rules (IMPORTANT):\n"
+            "- Each action may include an 'evidence' field.\n"
+            "- 'evidence' is a list of 0-3 objects.\n"
+            '- Evidence object schema: {"headline": string, "date": "YYYY-MM-DD"|null, "source": string|null, "url": string|null}\n'
+            "- Evidence must be grounded in snapshot/risk_json; if unsure, set evidence: [] (empty list).\n"
+            "\n"
+            "Action schemas:\n"
+            '- exclude_ticker: {"type":"exclude_ticker","ticker":"TICKER","reason":"...","evidence":[...]} \n'
+            '- set_w_max: {"type":"set_w_max","value":0.30,"reason":"...","evidence":[...]} \n'
+            '- shift_objective: {"type":"shift_objective","to":"minvar|maxsharpe","reason":"...","evidence":[...]} \n'
+            '- reduce_exposure: {"type":"reduce_exposure","ticker":"TICKER","intensity":"low|medium|high","reason":"...","evidence":[...]} \n'
+            '- hedge: {"type":"hedge","hedge_hint":"...","reason":"...","evidence":[...]} \n'
+            "\n"
+            "Schema:\n"
+            "{\n"
+            '  "ok": true|false,\n'
+            '  "notes": string,\n'
+            '  "actions": [ {action}, ... ]\n'
+            "}\n"
+        )
+        
+
+        user = json.dumps(
+            {
+                "universe": tickers_u,
+                "snapshot": snapshot or {},
+                "risk_json": risk_json or {},
+                "actions": actions or [],
+            },
+            ensure_ascii=False,
+        )
+
+        raw = (self.chat(system=system, user=user) or "").strip()
+        j, parse_mode = self._parse_json_best_effort(raw)
+
+        if j is None:
+            det = self._verify_news_actions_json(
+                {"actions": actions or []},
+                tickers_u,
+                allowed_evidence_ids=None,
+            )
+            return {
+                "ok": bool(det.get("ok")),
+                "actions": (det.get("cleaned") or {}).get("actions") or [],
+                "issues": [f"verifier_json_parse_failed(mode={parse_mode})"] + list(det.get("issues") or []),
+                "raw_text": raw,
+                "parse_mode": parse_mode,
+                "notes": "LLM verifier parse failed; used deterministic cleaner.",
+            }
+
+        # deterministic clean
+        det = self._verify_news_actions_json(j, tickers_u, allowed_evidence_ids=None)
+        cleaned = (det.get("cleaned") or {}).get("actions") or []
+
+        ok_llm = bool(j.get("ok")) if isinstance(j.get("ok"), bool) else None
+        notes = str(j.get("notes") or "").strip()
+
+        issues = list(det.get("issues") or [])
+        if ok_llm is False:
+            issues.append("llm_verifier_marked_not_ok")
+
+        return {
+            "ok": (len(issues) == 0),
+            "actions": cleaned,
+            "issues": issues,
+            "raw_text": raw,
+            "parse_mode": parse_mode,
+            "notes": notes or "Verifier completed.",
+        }
+
+
+    
+    def _repair_to_json(self, *, raw_text: str, schema_hint: str) -> str:
+        system = (
+            "You are a JSON repair tool.\n"
+            "Convert the given text into VALID JSON that matches the schema.\n"
+            "Return ONLY JSON. No markdown. No extra text.\n"
+            "The output MUST start with '{' and end with '}'.\n"
+        )
+        user = json.dumps({"schema": schema_hint, "text": raw_text}, ensure_ascii=False)
+        return (self.chat(system=system, user=user) or "").strip()
+ 
+
+ 

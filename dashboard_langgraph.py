@@ -1,25 +1,30 @@
 # dashboard_langgraph_app.py
 # ✅ Updated for:
-# - Your backend runner: portfolio_langgraph_withllm.py (correct import kept)
 # - Option A candidate selection (LLM chooses maxsharpe/minvar)
 # - SAFE metric rendering (no crashes when sharpe/metrics missing)
 # - Insight panel supports BOTH:
 #     - structured JSON insight in state["insight"]
 #     - narrative insight in state["insight_raw_text"]
-# - Streamlit-safe container widths (use_container_width=True instead of width="stretch")
+# - Streamlit-safe container widths (use_container_width=True)
 # - Safe delta computations (no None - None crashes)
+# - ✅ NEW: News Snapshot / News Risk Check UI rendering
+#     - supports BOTH placeholder news_signals and your new llm_client.generate_news_snapshot() output
+#     - shows a short snapshot + per-ticker risk flags if present
+# - ✅ NEW: News is OPTIONAL in refine (gated by UI checkbox)
+#     - sends refined_answers["use_news"] = "yes"/"no"
+#     - passes use_news=... into run_graph
 #
 # Notes:
-# - Base run: mode="base" use_llm=False
-# - Refine run: mode="refine" use_llm=True/False
-# - Always prefer finalized outputs:
+# - Base run: mode="base" use_llm=False use_news=False
+# - Refine run: mode="refine" use_llm=True/False use_news=True/False
+# - Prefer finalized outputs:
 #     state["optimized_weights"], state["optimized_metrics"], state["insight"/"insight_raw_text"]
 #   fallback to optimization_result[chosen] only if optimized_* absent.
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 import json
 import re
 
@@ -29,7 +34,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-# ✅ IMPORTANT: backend runner (YOU NOW USE portfolio_langgraph_withllm.py)
+# ✅ IMPORTANT: backend runner
 from portfolio_langgraph_withllm import run_graph
 
 DATA_DIR = Path("data/processed_yahoo")
@@ -88,7 +93,7 @@ def _extract_weights_and_metrics(state: Dict[str, Any]):
     ✅ Option A compatible extraction.
     Prefer FINAL outputs:
       - optimized_weights (final selection)
-      - optimized_metrics (final selection risk metrics: return/vol/sharpe + *_pct fields)
+      - optimized_metrics (final selection risk metrics)
     Fallback:
       - optimization_result[chosen] if optimized_* absent.
     """
@@ -107,7 +112,6 @@ def _extract_weights_and_metrics(state: Dict[str, Any]):
         w = w[w.abs() > 1e-6].sort_values(ascending=False)
         weights_series = w
 
-        # Prefer pct fields for display, but keep decimals too
         sharpe = _safe_float(opt_m.get("sharpe"))
         ret = _safe_float(opt_m.get("return"))
         vol = _safe_float(opt_m.get("vol"))
@@ -125,8 +129,8 @@ def _extract_weights_and_metrics(state: Dict[str, Any]):
             "candidate": chosen,
             "return": ret if ret is not None else float(np.nan),
             "vol": vol if vol is not None else float(np.nan),
-            "return_pct": ret_pct,  # may be None
-            "vol_pct": vol_pct,     # may be None
+            "return_pct": ret_pct,
+            "vol_pct": vol_pct,
             "sharpe": sharpe,
             "used_assets": int(len(w)),
             "universe_assets": int(len(state.get("selected_tickers", []))),
@@ -168,7 +172,6 @@ def _portfolio_summary_from_state(state: Optional[Dict[str, Any]]) -> Optional[D
     """
     ✅ For Evaluation section.
     Prefer optimized_* (final) to avoid mismatch.
-    Uses decimals for computation, but can display pct later.
     """
     if not state:
         return None
@@ -316,6 +319,182 @@ def _extract_tickers_from_notes(extra_notes: str, universe: list[str], max_n: in
     return found
 
 
+# ✅ NEW: News rendering helpers (supports placeholder + real LLM news snapshot output)
+def _extract_news_snapshot_and_risk(state: Dict[str, Any]) -> tuple[Optional[str], Optional[Dict[str, Any]]]:
+    if not state:
+        return None, None
+
+    # ✅ NEW: prefer explicit fields from backend
+    snapshot_text = None
+    if isinstance(state.get("news_snapshot_text"), str) and state["news_snapshot_text"].strip():
+        snapshot_text = state["news_snapshot_text"].strip()
+    elif isinstance(state.get("news_snapshot"), str) and state["news_snapshot"].strip():  # future-proof
+        snapshot_text = state["news_snapshot"].strip()
+
+    # ✅ NEW: prefer explicit risk json
+    risk_json = state.get("news_risk_json") if isinstance(state.get("news_risk_json"), dict) else None
+    if risk_json is None:
+        # fallback legacy
+        risk_json = state.get("news_signals") if isinstance(state.get("news_signals"), dict) else None
+
+    # If risk_json has summary, use it as snapshot if snapshot_text missing
+    if (not snapshot_text) and isinstance(risk_json, dict):
+        if isinstance(risk_json.get("summary"), str) and risk_json["summary"].strip():
+            snapshot_text = risk_json["summary"].strip()
+
+    # Placeholder schema fallback: global risk_flags/vol_regime -> build small text if still none
+    if (not snapshot_text) and isinstance(risk_json, dict):
+        glob = risk_json.get("global")
+        if isinstance(glob, dict):
+            flags = glob.get("risk_flags")
+            vr = glob.get("vol_regime")
+            if isinstance(flags, list) and flags:
+                snapshot_text = f"Detected {len(flags)} potential event-risk flag(s). Vol regime: {vr or 'normal'}."
+
+    return snapshot_text, risk_json
+
+
+
+def _news_section(state: Dict[str, Any]):
+    st.markdown('<div class="section-title">📰 News Snapshot & Risk Check</div>', unsafe_allow_html=True)
+
+    snapshot_text, risk_json = _extract_news_snapshot_and_risk(state)
+
+    if (snapshot_text is None) and (not isinstance(risk_json, dict) or not risk_json):
+        st.caption("No news snapshot available (yet).")
+        return
+
+    if snapshot_text:
+        st.write(snapshot_text)
+
+    if isinstance(risk_json, dict) and risk_json:
+        glob = risk_json.get("global") if isinstance(risk_json.get("global"), dict) else {}
+        by_ticker = risk_json.get("by_ticker") if isinstance(risk_json.get("by_ticker"), dict) else {}
+
+        # global
+        if isinstance(glob, dict) and glob:
+            vol_regime = str(glob.get("vol_regime") or "normal")
+            st.caption(f"Global regime: **{vol_regime}**")
+
+            flags = glob.get("risk_flags")
+            if isinstance(flags, list) and flags:
+                with st.expander("Global risk flags"):
+                    st.json(flags)
+
+        # per ticker
+        if isinstance(by_ticker, dict) and by_ticker:
+            rows = []
+            for t, v in by_ticker.items():
+                if not isinstance(v, dict):
+                    continue
+                rows.append(
+                    {
+                        "Ticker": str(t),
+                        "Risk flag": str(v.get("risk_flag") or "none"),
+                        "Confidence": v.get("confidence"),
+                    }
+                )
+            if rows:
+                df = pd.DataFrame(rows)
+                # sort: highest confidence first
+                if "Confidence" in df.columns:
+                    df["Confidence"] = pd.to_numeric(df["Confidence"], errors="coerce")
+                    df = df.sort_values(by="Confidence", ascending=False, na_position="last")
+                st.dataframe(df, use_container_width=True, height=220)
+
+def _get_news_items_by_id(state: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """
+    Build lookup map for BOTH:
+      - evidence_id (preferred; e.g. APP_9d1b573b)
+      - raw id (fallback; e.g. cea6dfaf1ff9)
+
+    This fixes: "(not found in news_items_by_id)" when actions reference evidence_ids.
+    """
+    m = state.get("news_items_by_id") or state.get("items_by_id")
+    if isinstance(m, dict) and m:
+        out = {}
+        for k, v in m.items():
+            if isinstance(v, dict):
+                out[str(k)] = v
+        return out
+
+    raw = (
+        state.get("news_raw_items")
+        or state.get("news_snapshot_raw_items")
+        or state.get("news_items")
+        or state.get("news_raw")
+        or state.get("news")
+        or []
+    )
+
+    out: Dict[str, Dict[str, Any]] = {}
+    if isinstance(raw, list):
+        for it in raw:
+            if not isinstance(it, dict):
+                continue
+
+            eid = it.get("evidence_id")
+            rid = it.get("id")
+
+            # ✅ Prefer evidence_id key
+            if eid is not None and str(eid).strip():
+                out[str(eid)] = it
+
+
+    return out
+
+
+
+def _render_action_evidence(
+    *,
+    action: Dict[str, Any],
+    news_items_by_id: Dict[str, Dict[str, Any]],
+):
+    # ✅ 1) Prefer structured evidence list (your backend output)
+    ev_list = action.get("evidence")
+    eids: List[str] = []
+
+    if isinstance(ev_list, list) and ev_list:
+        for ev in ev_list:
+            if not isinstance(ev, dict):
+                continue
+            eid = str(ev.get("evidence_id") or ev.get("id") or "").strip()
+            if eid:
+                eids.append(eid)
+
+    # ✅ 2) Fallback legacy field if present
+    if not eids:
+        raw_eids = action.get("evidence_ids") or []
+        if isinstance(raw_eids, list):
+            eids = [str(x).strip() for x in raw_eids if str(x).strip()]
+
+    if not eids:
+        st.caption("No evidence attached.")
+        return
+
+    lines = []
+    for eid in eids[:6]:  # show a few
+        item = news_items_by_id.get(eid)
+
+        # If we can't find the full item, still show the id (debug)
+        if not isinstance(item, dict):
+            lines.append(f"- `{eid}` (not found in news_items_by_id)")
+            continue
+
+        ticker = str(item.get("ticker") or "UNK").strip()
+        date = str(item.get("date") or "unknown").strip()
+        source = str(item.get("source") or item.get("provider") or "unknown").strip()
+        headline = str(item.get("headline") or "headline").strip()
+        url = str(item.get("url") or "").strip()
+
+        if url:
+            lines.append(f"- {ticker} ({date} | {source}) [{headline}]({url})")
+        else:
+            lines.append(f"- {ticker} ({date} | {source}) {headline} (no url)")
+
+    st.markdown("**Evidence**")
+    st.markdown("\n".join(lines))
+
 # ✅ NEW: Insight rendering helpers (supports narrative raw_text)
 def _insight_section(state: Dict[str, Any]):
     insight = state.get("insight")
@@ -331,7 +510,6 @@ def _insight_section(state: Dict[str, Any]):
         st.info("No insights generated yet. Run **Refine** with LLM enabled to produce insights.")
         return
 
-    # Header / status
     if ok is True:
         st.success(f"Insight generated ({parse_mode or 'unknown parse'}).")
     elif ok is False:
@@ -344,7 +522,7 @@ def _insight_section(state: Dict[str, Any]):
             for it in issues:
                 st.write(f"- {it}")
 
-    # ✅ Prefer narrative text if present (most robust)
+    # ✅ Prefer narrative text if present
     if isinstance(raw_text, str) and raw_text.strip():
         st.markdown(raw_text)
         return
@@ -449,6 +627,11 @@ if "current_input_df" not in st.session_state:
     st.session_state["current_input_df"] = None
 if "pain_points" not in st.session_state:
     st.session_state["pain_points"] = []
+if "news_actions_state" not in st.session_state:
+    st.session_state["news_actions_state"] = None
+if "selected_news_actions" not in st.session_state:
+    st.session_state["selected_news_actions"] = []
+
 
 
 # ---------------- LAYOUT ----------------
@@ -539,6 +722,7 @@ if run_base and selected_tickers:
         clarification_answers=None,
         mode="base",
         use_llm=False,
+        use_news=False,  # ✅ explicit
     )
 
     st.session_state["base_state"] = base_state
@@ -548,7 +732,7 @@ if run_base and selected_tickers:
 
 # ---------------- HEADER ----------------
 is_refined_active = st.session_state["refined_state"] is not None
-active_label = _active_portfolio_label(is_refined_active)
+active_label = "Refined Portfolio" if is_refined_active else "Base Portfolio"
 
 st.markdown(
     f"""
@@ -564,6 +748,8 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+
 def _get_compare_state_for_charts():
     """
     Chart comparison should follow Insight story:
@@ -575,18 +761,15 @@ def _get_compare_state_for_charts():
     refined_state = st.session_state.get("refined_state")
     active_state = refined_state or base_state
 
-    # Active metrics already extracted later; for compare we want "previous"
     if refined_state is not None and base_state is not None:
         prev_metrics = (base_state.get("optimized_metrics") or {})
         prev_label = "Base Portfolio"
         return prev_metrics, prev_label
 
-    # If no refined: compare against user current portfolio if exists
     if active_state is not None:
         cm = active_state.get("current_metrics")
         if cm:
             return cm, "Current"
-
         bm = active_state.get("baseline_metrics")
         if bm:
             return bm, "Baseline (Equal Weight)"
@@ -597,7 +780,7 @@ def _get_compare_state_for_charts():
 # ---------------- ACTIVE STATE ----------------
 graph_state = st.session_state["refined_state"] or st.session_state["base_state"]
 is_refined_active = st.session_state["refined_state"] is not None
-active_label = _active_portfolio_label(is_refined_active)
+active_label = "Refined Portfolio" if is_refined_active else "Base Portfolio"
 
 optimization_result = None
 portfolio_weights = None
@@ -649,7 +832,6 @@ with col_right:
         obj_label = "Max Sharpe" if cand == "maxsharpe" else "Min Variance"
         st.caption(f"Selected candidate: **{obj_label}** (`{cand}`)")
 
-        # Prefer *_pct if present; else use decimals
         ret_str = (
             _fmt_pct_from_pct_field(opt.get("return_pct"))
             if opt.get("return_pct") is not None
@@ -665,10 +847,7 @@ with col_right:
         with c1:
             st.markdown('<div class="metric-card">', unsafe_allow_html=True)
             st.markdown('<div class="metric-label">Sharpe</div>', unsafe_allow_html=True)
-            st.markdown(
-                f'<div class="metric-value">{_fmt_num(opt.get("sharpe"))}</div>',
-                unsafe_allow_html=True,
-            )
+            st.markdown(f'<div class="metric-value">{_fmt_num(opt.get("sharpe"))}</div>', unsafe_allow_html=True)
             st.markdown('<div class="metric-sub">Risk-adjusted return</div>', unsafe_allow_html=True)
             st.markdown("</div>", unsafe_allow_html=True)
 
@@ -705,6 +884,7 @@ st.markdown('<div class="section-title">🔁 Refine (after base portfolio)</div>
 
 if st.session_state["base_state"] is None:
     st.info("Run **Base Portfolio** first. Then you can refine using candidate selection + insights.")
+    st.markdown("</div>", unsafe_allow_html=True)  # close card
 else:
     happy_ui = st.radio(
         "Are you happy with this portfolio?",
@@ -720,6 +900,133 @@ else:
         disabled=is_happy,
         help="When enabled, the model selects the best candidate (Max-Sharpe vs Min-Variance) AND generates portfolio insights.",
     )
+
+    use_news_refine = st.checkbox(
+        "📰 Include news snapshot & risk check (slower)",
+        value=False,
+        disabled=is_happy,
+        help="When enabled, backend fetches news + produces risk flags for selected tickers.",
+    )
+
+    st.markdown("---")
+    st.markdown('<div class="section-title">🧠 News → LLM Action List</div>', unsafe_allow_html=True)
+
+    generate_news_actions = st.button(
+        "📰 Generate Actions from News",
+        use_container_width=True,
+        disabled=(st.session_state["base_state"] is None),
+    )
+
+    if generate_news_actions and selected_tickers:
+        base_state = st.session_state.get("base_state") or {}
+        news_actions_state = run_graph(
+            selected_tickers=selected_tickers,
+            rf=float(rf),
+            w_max=float(w_max),
+            preferences={},
+            current_weights=current_weights_dict,
+
+            # ✅ IMPORTANT: news_actions is a STAGE, not a mode
+            mode="refine",
+            stage="news_actions",
+
+            use_llm=True,
+            use_news=True,
+
+            # (opsiyonel ama iyi) UI stop olmasın diye
+            clarification_answers={"satisfaction": "yes"},
+
+            base_portfolio_metrics=base_state.get("optimized_metrics"),
+            base_portfolio_weights=base_state.get("optimized_weights"),
+            base_portfolio_objective=base_state.get("objective_key"),
+        )
+        st.session_state["news_actions_state"] = news_actions_state
+        st.session_state["selected_news_actions"] = []
+        st.rerun()
+
+
+    nas = st.session_state.get("news_actions_state")
+    if nas is not None:
+        actions = nas.get("news_actions") or []
+        verifier = nas.get("news_actions_verifier")
+
+        # ✅ DEBUG: show what the news_actions run actually produced
+        with st.expander("🔍 Debug notes (News Actions run)"):
+            for n in (nas.get("debug_notes") or []):
+                st.write(f"- {n}")
+
+        with st.expander("🧾 News snapshot text (debug)"):
+            st.write(nas.get("news_snapshot_text"))
+
+        with st.expander("🧾 News risk json (debug)"):
+            st.json(nas.get("news_risk_json") or {})
+        
+        if verifier:
+            with st.expander("✅ Verifier output"):
+                st.json(verifier)
+
+        if not actions:
+            st.info("No news actions found. (Backend should return state['news_actions'] list.)")
+        else:
+            news_items_by_id = _get_news_items_by_id(nas)
+
+            action_labels = []
+            for i, a in enumerate(actions):
+                if isinstance(a, dict):
+                    t = str(a.get("type") or a.get("action") or "").strip()
+                    ticker = str(a.get("ticker") or "").strip()
+                    value = a.get("value", None)
+                    intensity = str(a.get("intensity") or "").strip()
+                    reason = str(a.get("reason") or "").strip()
+
+                    parts = []
+                    if t:
+                        parts.append(t)
+                    if ticker:
+                        parts.append(ticker)
+                    if value is not None:
+                        parts.append(f"value={value}")
+                    if intensity:
+                        parts.append(f"intensity={intensity}")
+                    label = " | ".join(parts) if parts else f"Action #{i+1}"
+
+                    if reason:
+                        label += f" — {reason}"
+                else:
+                    label = str(a)
+
+                action_labels.append(label)
+
+            # ✅ 1) Selection UI (aynı kalsın)
+            picked = st.multiselect(
+                "Select actions to apply in Refine",
+                options=action_labels,
+                default=st.session_state.get("selected_news_actions", []),
+            )
+            st.session_state["selected_news_actions"] = picked
+
+            # ✅ 2) Evidence rendering (seçimden bağımsız olarak her action altında göster)
+            st.markdown("---")
+            st.markdown("#### Proposed actions (with evidence)")
+
+            for i, a in enumerate(actions):
+                label = action_labels[i] if i < len(action_labels) else f"Action #{i+1}"
+                with st.expander(label, expanded=False):
+                    if isinstance(a, dict):
+                        st.write(a.get("reason", ""))
+                        _render_action_evidence(action=a, news_items_by_id=news_items_by_id)
+                    else:
+                        st.write(a)
+
+            with st.expander("Raw proposed actions (debug)"):
+                st.json(actions)
+
+            with st.expander("News items by id (debug)"):
+                st.write(f"items: {len(news_items_by_id)}")
+                st.json(dict(list(news_items_by_id.items())[:5]))
+
+
+    st.markdown("---")
 
     if is_happy:
         st.success("Keeping the current portfolio as-is (ACCEPT).")
@@ -799,11 +1106,13 @@ else:
                 "satisfaction": "no",
                 "pain_points": pain_points,
                 "excluded_assets": excluded_assets,
+                "use_news": "yes" if use_news_refine else "no",
                 "extra_notes": extra_notes,
                 "notes_tickers": notes_tickers,
+                "selected_news_actions": st.session_state.get("selected_news_actions", []),
             }
-            base_state = st.session_state.get("base_state") or {}
 
+            base_state = st.session_state.get("base_state") or {}
             refined_state = run_graph(
                 selected_tickers=selected_tickers,
                 rf=float(rf),
@@ -813,8 +1122,7 @@ else:
                 clarification_answers=refined_answers,
                 mode="refine",
                 use_llm=bool(use_llm_refine),
-
-                # ✅ IMPORTANT: pass Run Base portfolio as the "base" for insights
+                use_news=bool(use_news_refine),
                 base_portfolio_metrics=base_state.get("optimized_metrics"),
                 base_portfolio_weights=base_state.get("optimized_weights"),
                 base_portfolio_objective=base_state.get("objective_key"),
@@ -823,6 +1131,8 @@ else:
             st.session_state["refined_state"] = refined_state
             st.success("Refinement applied. Scroll up to see the selected candidate portfolio.")
             st.rerun()
+
+        st.markdown("</div>", unsafe_allow_html=True)  # close card
 
         if st.session_state.get("refined_state") is not None:
             rs = st.session_state["refined_state"]
@@ -838,11 +1148,9 @@ else:
                 cand_keys = list((rs.get("optimization_result") or {}).keys())
                 st.write(f"Available candidates: {cand_keys}")
 
-                # ✅ Insight debug quick view
                 st.write("Insight status:")
                 st.write("Base portfolio objective passed to refine:", rs.get("base_portfolio_objective"))
                 st.write("Base portfolio metrics present:", rs.get("base_portfolio_metrics") is not None)
-
                 st.write(
                     {
                         "insight_ok": rs.get("insight_ok"),
@@ -956,15 +1264,12 @@ else:
     )
     fig_frontier = px.line(frontier_df, x="vol", y=y_col, markers=True)
 
-    # Mark chosen portfolio point: ✅ use FINAL metrics consistently when present
     chosen = portfolio_metrics["candidate"]
     port = optimization_result.get(chosen, {}) if isinstance(optimization_result, dict) else {}
 
-    # Defaults from optimizer (may be missing / not normalized)
     x_vol = _safe_float(port.get("vol"))
     y_ret = _safe_float(port.get("return"))
 
-    # ✅ Override BOTH X and Y from optimized_metrics (risk_agent output) if available
     if optimized_metrics is not None and optimized_metrics:
         x_final = _safe_float(optimized_metrics.get("vol"))
         y_final = _safe_float(optimized_metrics.get("return"))
@@ -986,9 +1291,7 @@ else:
             )
         )
 
-    # ✅ Compare point should match Insight story
     compare_metrics, compare_label = _get_compare_state_for_charts()
-
     if compare_metrics is not None and compare_label:
         x_cmp = _safe_float(compare_metrics.get("vol"))
         y_cmp = _safe_float(compare_metrics.get("return"))
@@ -1004,7 +1307,6 @@ else:
                     marker=dict(size=10),
                 )
             )
-
 
     fig_frontier.update_layout(
         paper_bgcolor="#0b1020",
@@ -1039,11 +1341,8 @@ else:
     else:
         df_rc = pd.DataFrame({"Ticker": tickers_rc, "Active": active_rc})
 
-        compare_label = None
-
-        # ✅ Compare series should match Insight story
         compare_metrics, compare_label = _get_compare_state_for_charts()
-
+        compare_label_used = None
         if compare_metrics is not None and compare_label:
             aligned = _rc_series_aligned_to(tickers_rc, compare_metrics)
             if aligned is not None:
@@ -1051,10 +1350,6 @@ else:
                 compare_label_used = compare_label
             else:
                 st.info(f"{compare_label} RC cannot be aligned (needs 'tickers' + 'rc_pct').")
-                compare_label_used = None
-        else:
-            compare_label_used = None
-
 
         df_long = df_rc.melt(id_vars="Ticker", var_name="Portfolio", value_name="Risk Contribution")
         fig_rc = px.bar(df_long, x="Ticker", y="Risk Contribution", color="Portfolio", barmode="group")
@@ -1076,10 +1371,9 @@ else:
                 f"Comparison: **{compare_label_used}** vs **{active_label}**."
             )
 
-
 st.markdown("</div>", unsafe_allow_html=True)
 
-# ---------------- Bottom: Weights + Insight + Explanation ----------------
+# ---------------- Bottom: Weights + News + Insight + Explanation ----------------
 st.markdown("")
 bottom_left, bottom_right = st.columns([1.3, 1.0])
 
@@ -1099,9 +1393,14 @@ with bottom_right:
     st.markdown('<div class="card">', unsafe_allow_html=True)
 
     if graph_state is None:
-        st.info("Insight & explanation will appear after base/refine.")
+        st.info("News, insight & explanation will appear after base/refine.")
     else:
-        # ✅ Insight panel (top)
+        # ✅ News panel
+        _news_section(graph_state)
+
+        st.markdown("---")
+
+        # ✅ Insight panel
         _insight_section(graph_state)
 
         st.markdown("---")
@@ -1111,8 +1410,9 @@ with bottom_right:
         with st.expander("🧠 LLM decision (candidate selection)"):
             st.json(graph_state.get("llm_decision", {}))
 
-        with st.expander("📰 News signals (placeholder)"):
-            st.json(graph_state.get("news_signals", {}))
+        with st.expander("📰 News risk (raw JSON)"):
+            st.json(graph_state.get("news_risk_json") or graph_state.get("news_signals") or {})
+
 
         with st.expander("🔍 Debug notes (graph trace)"):
             notes = graph_state.get("debug_notes", [])
