@@ -228,7 +228,7 @@ def main() -> None:
     print(f"  - {args.out_prefix}_market_filtered.json")
 
     if company_results["empty_tickers"]:
-        print("\n⚠️ company_news returned EMPTY for these tickers (possible non-NA coverage / no news in window):")
+        print("\n company_news returned EMPTY for these tickers (possible non-NA coverage / no news in window):")
         print(company_results["empty_tickers"])
 
 

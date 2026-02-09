@@ -101,3 +101,13 @@ def assign_evidence_ids_and_map(
             }
 
     return out, evidence_map
+
+def filter_news_by_evidence_ids(news_items: list[dict], evidence_ids: set[str]) -> list[dict]:
+    if not evidence_ids:
+        return []
+    out = []
+    for it in news_items:
+        eid = it.get("evidence_id") or it.get("evidenceId")  # hangi alan varsa
+        if eid in evidence_ids:
+            out.append(it)
+    return out

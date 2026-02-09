@@ -1,4 +1,4 @@
-   # llm_client.py
+# llm_client.py
 # ✅ Option A (robust): Decision + Explanation are DECOUPLED
 # + ✅ NEW: LLM Interpretation + LLM Verifier (self-check)
 # + ✅ NEW (ADDITIVE): News Snapshot + News Risk Check (LLM) + Deterministic verifier
@@ -983,7 +983,119 @@ class LLMClient:
             out_risk = draft_risk_json or {}
 
         return {"ok": True, "snapshot_text": out_snapshot.strip(), "risk_json": out_risk, "raw_text": raw}
-    
+    def generate_evidence_snapshot_from_actions(
+        self,
+        *,
+        actions: List[Dict[str, Any]],
+        news_items: List[Dict[str, Any]],
+        max_items: int = 12,
+    ) -> Dict[str, Any]:
+        """
+        Evidence Snapshot (LLM):
+        - Collect evidence_ids from actions (1-2 each)
+        - Pull matching news_items
+        - Ask LLM to produce a UI-friendly evidence snapshot text
+        Output: { ok, evidence_snapshot_text, used_evidence_ids, issues, raw_text }
+        """
+        issues: List[str] = []
+
+        # 1) collect evidence_ids from actions
+        eids: List[str] = []
+        for a in (actions or []):
+            if not isinstance(a, dict):
+                continue
+            ev = a.get("evidence_ids")
+            if isinstance(ev, list):
+                for x in ev:
+                    sx = str(x).strip()
+                    if sx:
+                        eids.append(sx)
+
+        # unique preserve order
+        seen = set()
+        eids_u = []
+        for x in eids:
+            if x not in seen:
+                seen.add(x)
+                eids_u.append(x)
+
+        if not eids_u:
+            return {
+                "ok": False,
+                "evidence_snapshot_text": "No evidence_ids found in actions.",
+                "used_evidence_ids": [],
+                "issues": ["no_evidence_ids_in_actions"],
+                "raw_text": "",
+            }
+
+        # 2) match news items
+        by_id: Dict[str, Dict[str, Any]] = {}
+        for it in (news_items or []):
+            if not isinstance(it, dict):
+                continue
+            _id = str(it.get("evidence_id") or "").strip()
+            if _id:
+                by_id[_id] = it
+
+        matched = []
+        for eid in eids_u:
+            it = by_id.get(eid)
+            if it:
+                matched.append({
+                    "evidence_id": eid,
+                    "ticker": str(it.get("ticker") or "").upper().strip(),
+                    "date": str(it.get("date") or "unknown"),
+                    "source": str(it.get("source") or it.get("provider") or "unknown"),
+                    "headline": str(it.get("headline") or "").strip(),
+                    "url": str(it.get("url") or "").strip() or None,
+                })
+
+        if not matched:
+            return {
+                "ok": False,
+                "evidence_snapshot_text": "Evidence ids were present but no matching news_items were found.",
+                "used_evidence_ids": eids_u[: max_items],
+                "issues": ["no_matching_news_items"],
+                "raw_text": "",
+            }
+
+        matched = matched[: max(1, int(max_items))]
+
+        # 3) LLM render
+        system = (
+            "You create an Evidence Snapshot for portfolio actions.\n"
+            "Return ONLY plain text. No JSON. No markdown.\n"
+            "Hard rules:\n"
+            "- You MUST include EVERY provided evidence item exactly once.\n"
+            "- Do NOT merge items.\n"
+            "- Do NOT invent any events.\n"
+            "\n"
+            "Output format:\n"
+            "EVIDENCE SNAPSHOT\n"
+            "- ([EVIDENCE_ID] DATE | SOURCE | TICKER) HEADLINE\n"
+            "- ...\n"
+        )
+
+        user = json.dumps({"evidence_items": matched}, ensure_ascii=False)
+        raw = (self.chat(system=system, user=user) or "").strip()
+
+        if not raw:
+            return {
+                "ok": False,
+                "evidence_snapshot_text": "Evidence snapshot unavailable (empty LLM response).",
+                "used_evidence_ids": [x["evidence_id"] for x in matched],
+                "issues": ["empty_llm_response"],
+                "raw_text": raw,
+            }
+
+        return {
+            "ok": True,
+            "evidence_snapshot_text": raw,
+            "used_evidence_ids": [x["evidence_id"] for x in matched],
+            "issues": issues,
+            "raw_text": raw,
+        }
+
     def generate_news_snapshot(
         self,
         *,
@@ -1170,6 +1282,19 @@ class LLMClient:
             snapshot_text=snapshot_text,
             risk_json=risk_json,
         )
+        # ✅ DEBUG: snapshot format + allowed_eids check
+        if os.getenv("LLM_DEBUG_NEWS_ALLOWED_EIDS", "0") == "1":
+            print("\n===== DEBUG: allowed_eids extraction =====")
+            print("items_count:", len(items))
+            print("missing_evidence_id_count:", sum(1 for it in items if not it.get("evidence_id")))
+            print("evidence_id_sample:", [it.get("evidence_id") for it in items[:8]])
+            print("--- snapshot_text head ---")
+            print((snapshot_text or "")[:600])
+            print("--- allowed_eids ---")
+            print("allowed_eids_count:", len(allowed_eids))
+            print("allowed_eids_sample:", sorted(list(allowed_eids))[:20])
+            print("========================================\n")
+
 
         verified = self._verify_news_risk_json(
             risk_json if isinstance(risk_json, dict) else {},
@@ -1374,6 +1499,15 @@ class LLMClient:
         )
 
         raw = (self.chat(system=system, user=user) or "").strip()
+        # ✅ DEBUG: actions input/output
+        if os.getenv("LLM_DEBUG_NEWS_ACTIONS_LINES", "0") == "1":
+            print("\n===== DEBUG: news_actions_lines =====")
+            print("tickers:", tickers_u)
+            print("allowed_set_count:", len(allowed_set))
+            print("allowed_set_sample:", sorted(list(allowed_set))[:20])
+            print("--- raw actions head ---")
+            print((raw or "")[:1200])
+            print("====================================\n")
 
         parsed = self._parse_actions_lines(
             raw,
@@ -1381,6 +1515,12 @@ class LLMClient:
             allowed_evidence_ids=allowed_set,
             max_actions=max_actions,
         )
+        if os.getenv("LLM_DEBUG_NEWS_ACTIONS_LINES", "0") == "1":
+            print("parsed_ok:", bool(parsed.get("ok")))
+            print("parsed_actions_count:", len(parsed.get("actions") or []))
+            print("parsed_issues_sample:", (parsed.get("issues") or [])[:30])
+            print("====================================\n")
+
 
         return {
             "ok": bool(parsed.get("ok")),

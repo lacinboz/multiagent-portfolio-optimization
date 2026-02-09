@@ -1464,6 +1464,118 @@ def node_news_actions_generate(state: PortfolioState) -> PortfolioState:
         state["debug_notes"].append(f"NewsActions(LLM): failed -> empty: {e}")
         return state
 
+def node_news_evidence_snapshot(state: PortfolioState) -> PortfolioState:
+    state = _init_defaults(state)
+
+    # sadece news_actions stage'de çalışsın
+    if state.get("stage") != "news_actions":
+        return state
+
+    # base veya LLM/news kapalıysa skip
+    if state.get("mode") == "base":
+        state["news_evidence_snapshot_text"] = ""
+        state["news_evidence_snapshot_ok"] = True
+        state["news_evidence_snapshot_issues"] = []
+        state["debug_notes"].append("EvidenceSnapshot(BASE): skipped.")
+        return state
+
+    if (not bool(state.get("use_news", False))) or (not bool(state.get("use_llm", False))) or (LLMClient is None):
+        state["news_evidence_snapshot_text"] = ""
+        state["news_evidence_snapshot_ok"] = True
+        state["news_evidence_snapshot_issues"] = ["disabled_or_unavailable"]
+        state["debug_notes"].append("EvidenceSnapshot: skipped (use_news/use_llm off or LLMClient unavailable).")
+        return state
+
+    actions = state.get("news_actions") or []
+    evidence_map = state.get("evidence_map") or {}
+    tickers = list(state.get("selected_tickers", []) or [])
+
+    # 1) actions -> evidence_ids set
+    eids: Set[str] = set()
+    for a in actions:
+        if not isinstance(a, dict):
+            continue
+        ev = a.get("evidence_ids")
+        if isinstance(ev, list):
+            for x in ev:
+                sx = str(x).strip()
+                if sx:
+                    eids.add(sx)
+
+    state["debug_notes"].append(f"EvidenceSnapshot: collected_eids={len(eids)} from actions={len(actions)}")
+
+    if not eids:
+        state["news_evidence_snapshot_text"] = ""
+        state["news_evidence_snapshot_ok"] = True
+        state["news_evidence_snapshot_issues"] = ["no_evidence_ids"]
+        state["debug_notes"].append("EvidenceSnapshot: no evidence_ids -> empty.")
+        return state
+
+    # 2) evidence_map -> minimal news list (LLMClient.generate_news_snapshot expects news_raw-like dicts)
+    items: List[Dict[str, Any]] = []
+    missing: List[str] = []
+    for eid in sorted(eids):
+        it = evidence_map.get(eid)
+        if not isinstance(it, dict):
+            missing.append(eid)
+            continue
+
+        t = str(it.get("ticker") or "").upper().strip()
+        if not t and "_" in eid:
+            t = eid.split("_", 1)[0].upper().strip()
+
+        date = it.get("date") or _epoch_to_ymd(it.get("datetime")) or "unknown"
+        src = it.get("source") or it.get("provider") or "unknown"
+
+        items.append(
+            {
+                "id": it.get("id"),
+                "ticker": t,
+                "evidence_id": it.get("evidence_id") or eid,
+                "date": date,
+                "headline": it.get("headline"),
+                "summary": it.get("summary"),
+                "source": src,
+                "url": it.get("url"),
+                "datetime": it.get("datetime"),
+            }
+        )
+
+    if missing:
+        state["debug_notes"].append(f"EvidenceSnapshot: missing_in_evidence_map={missing[:10]}")
+
+    # 3) LLM ile snapshot üret (sadece evidence item’ları)
+    try:
+        client = LLMClient()
+        out = client.generate_news_snapshot(
+            tickers=tickers,
+            news_raw=items,
+            lookback_days=int((_merged_prefs(state).get("lookback_days") or 7)),
+            max_items_total=len(items),
+        )
+
+        text = str(out.get("snapshot_text") or "").strip()
+        ok = bool(out.get("ok"))
+        issues = list(out.get("issues") or [])
+
+        state["news_evidence_snapshot_text"] = text
+        state["news_evidence_snapshot_ok"] = ok
+        state["news_evidence_snapshot_issues"] = issues
+
+        state["debug_notes"].append(
+            f"EvidenceSnapshot(LLM): ok={ok} issues={len(issues)} items={len(items)}"
+        )
+        prev = text[:220].replace("\n", " ")
+        state["debug_notes"].append(f"EvidenceSnapshotPreview_220: {prev}")
+
+        return state
+
+    except Exception as e:
+        state["news_evidence_snapshot_text"] = ""
+        state["news_evidence_snapshot_ok"] = False
+        state["news_evidence_snapshot_issues"] = [f"exception: {e}"]
+        state["debug_notes"].append(f"EvidenceSnapshot(LLM): failed -> {e}")
+        return state
 
 def node_news_actions_verify(state: PortfolioState) -> PortfolioState:
     state = _init_defaults(state)
@@ -1775,6 +1887,7 @@ def build_portfolio_graph():
 
 
     g.add_node("news_actions_generate", node_news_actions_generate)
+    g.add_node("news_evidence_snapshot", node_news_evidence_snapshot)
     g.add_node("news_actions_verify", node_news_actions_verify)
 
     g.add_node("llm_select", node_llm_select_candidate)
@@ -1813,9 +1926,10 @@ def build_portfolio_graph():
         {"news_actions": "news_actions_generate", "main": "llm_select"},
     )
 
-    # ✅ actions stage -> end
-    g.add_edge("news_actions_generate", "news_actions_verify")
+    g.add_edge("news_actions_generate", "news_evidence_snapshot")
+    g.add_edge("news_evidence_snapshot", "news_actions_verify")
     g.add_edge("news_actions_verify", END)
+
 
     # ✅ normal flow
     g.add_edge("llm_select", "finalize")
@@ -1887,4 +2001,4 @@ def run_graph(
         "base_portfolio_objective": base_portfolio_objective,
     }
 
-    return app.invoke(init, config={"recursion_limit": 200})   
+    return app.invoke(init, config={"recursion_limit": 200})     
