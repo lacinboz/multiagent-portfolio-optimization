@@ -1336,6 +1336,19 @@ class LLMClient:
 
         tickers_u = {str(t).upper().strip() for t in (tickers or []) if str(t).strip()}
         allowed_types = set(_ALLOWED_NEWS_ACTION_TYPES)
+        # ✅ 0) Extract only the ACTION BLOCK if present
+        # We ignore any text outside the block.
+        m = re.search(r"BEGIN_ACTIONS\s*(.*?)\s*END_ACTIONS", text or "", flags=re.DOTALL | re.IGNORECASE)
+        if m:
+            text = (m.group(1) or "").strip()
+        else:
+            # If block missing, keep original behavior (fallback to full text)
+            text = (text or "").strip()
+
+        # ✅ Special explicit empty case
+        if text.strip().upper() == "NO_ACTIONS":
+            return {"ok": True, "actions": [], "issues": ["no_actions_returned"]}
+
 
         lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
         if not lines:
@@ -1366,7 +1379,7 @@ class LLMClient:
 
             eids = [x.strip() for x in eids_raw.split(",") if x.strip()]
             eids = [x for x in eids if x in allowed_evidence_ids]
-            eids = eids[:2]
+            eids = eids[:6]
 
             if not eids:
                 issues.append(f"line_{i}_missing_or_invalid_eids")
@@ -1470,15 +1483,18 @@ class LLMClient:
             })
 
         system = (
-            "You are a portfolio NEWS actions generator.\n"
-            "Output ONLY action lines. NO JSON. NO markdown.\n"
-            "Rules:\n"
-            f"- Allowed tickers: {tickers_u}\n"
-            f"- Max actions: {max_actions}\n"
-            "- Each action MUST include 1-2 evidence_ids copied EXACTLY.\n"
-            "- Use ONLY evidence_ids from the allowed list.\n"
-            "- If you cannot support an action with evidence_ids, DO NOT output it.\n"
+             "You are a portfolio NEWS actions generator.\n"
+            "You may include a brief summary, BUT you MUST include exactly one ACTION BLOCK.\n"
+            "Only lines inside the ACTION BLOCK will be parsed.\n"
             "\n"
+            "ACTION BLOCK format (MANDATORY):\n"
+            "BEGIN_ACTIONS\n"
+            "<one action line per row OR a single line: NO_ACTIONS>\n"
+            "END_ACTIONS\n"
+            "\n"
+            "Rules for the ACTION BLOCK:\n"
+            "- Inside the block: output ONLY action lines OR NO_ACTIONS.\n"
+            "- No markdown. No bullets. No headers inside the block.\n"
             "Line formats (one per line):\n"
             "exclude_ticker|TICKER|EID1,EID2|REASON\n"
             "reduce_exposure|TICKER|low|EID1,EID2|REASON\n"
@@ -1499,6 +1515,7 @@ class LLMClient:
         )
 
         raw = (self.chat(system=system, user=user) or "").strip()
+        used_fixer = False
         # ✅ DEBUG: actions input/output
         if os.getenv("LLM_DEBUG_NEWS_ACTIONS_LINES", "0") == "1":
             print("\n===== DEBUG: news_actions_lines =====")
@@ -1521,14 +1538,112 @@ class LLMClient:
             print("parsed_issues_sample:", (parsed.get("issues") or [])[:30])
             print("====================================\n")
 
+        need_fix = (
+            (not (parsed.get("actions") or [])) or
+            any("too_few_fields" in str(x) for x in (parsed.get("issues") or [])) or
+            any("bad_type" in str(x) for x in (parsed.get("issues") or [])) or
+            any("missing_or_invalid_eids" in str(x) for x in (parsed.get("issues") or []))
+            or any("exclude_bad_ticker" in str(x) for x in (parsed.get("issues") or []))
 
+        )
+
+        if need_fix:
+            used_fixer = True
+            fix_system = (
+                "You must output EXACTLY in this shape. No extra characters.\n"
+                "BEGIN_ACTIONS\n"
+                "NO_ACTIONS\n"
+                "END_ACTIONS\n"
+                "OR\n"
+                "BEGIN_ACTIONS\n"
+                "<1 to N valid action lines>\n"
+                "END_ACTIONS\n"
+                "If you output anything else, it will be discarded.\n"
+                "You are a STRICT action-line compiler/fixer.\n"
+                "\n"
+                "Hard rules:\n"
+                "- Inside the ACTION BLOCK: output ONLY action lines OR NO_ACTIONS.\n"
+                "- No prose. No markdown. No bullets. No headers inside the block.\n"
+                f"- Output 1 to {max_actions} lines (unless NO_ACTIONS).\n"
+                "- Each line MUST match EXACTLY one allowed format.\n"
+                "- Each line MUST include 1-2 evidence_ids copied EXACTLY from allowed_evidence_ids.\n"
+                "- Use ONLY allowed tickers.\n"
+                "- If you cannot produce at least 1 valid action, output exactly:\n"
+                "  BEGIN_ACTIONS\n"
+                "  NO_ACTIONS\n"
+                "  END_ACTIONS\n"
+                "\n"
+                "- The EVIDENCE FIELD (the second last field) MUST contain ONLY comma-separated evidence_ids.\n"
+                "- It must contain NO words, NO headlines, NO dates, NO ticker names, NO extra text.\n"
+                "- Example of a valid evidence field: NVDA_ab12cd34 or NVDA_ab12cd34,NVDA_ee98aa10\n"
+                "Allowed line formats (one per line):\n"
+                "exclude_ticker|TICKER|EID1,EID2|REASON\n"
+                "reduce_exposure|TICKER|low|EID1,EID2|REASON\n"
+                "reduce_exposure|TICKER|medium|EID1,EID2|REASON\n"
+                "reduce_exposure|TICKER|high|EID1,EID2|REASON\n"
+                "set_w_max|0.30|EID1,EID2|REASON\n"
+                "shift_objective|minvar|EID1,EID2|REASON\n"
+                "shift_objective|maxsharpe|EID1,EID2|REASON\n"
+                "hedge|HEDGE_HINT|EID1,EID2|REASON\n"
+                "\n"
+                "Common parser errors you MUST avoid:\n"
+                "- too_few_fields (missing | separators)\n"
+                "- bad_type (invalid action type)\n"
+                "- missing_or_invalid_eids\n"
+            )
+
+            fix_user = json.dumps(
+                {
+                    "allowed_tickers": tickers_u,
+                    "max_actions": max_actions,
+                    "allowed_evidence_ids": allowed_ids,  # keep as list for the model
+                    "previous_output": raw,
+                    "parser_issues": list(parsed.get("issues") or [])[:60],
+                },
+                ensure_ascii=False,
+            )
+
+            raw2 = (self.chat(system=fix_system, user=fix_user) or "").strip()
+
+            # If model returns NO_ACTIONS, keep it as empty result (explicit)
+            if raw2.strip() == "NO_ACTIONS":
+                parsed2 = {"ok": True, "actions": [], "issues": ["no_actions_returned"],}
+            else:
+                parsed2 = self._parse_actions_lines(
+                    raw2,
+                    tickers=tickers_u,
+                    allowed_evidence_ids=allowed_set,
+                    max_actions=max_actions,
+                )
+
+            # If fixer improved, use it
+            if parsed2.get("actions"):
+                return {
+                    "ok": bool(parsed2.get("ok")),
+                    "actions": parsed2.get("actions") or [],
+                    "issues": parsed2.get("issues") or [],
+                    "raw_text": raw2,
+                    "parse_mode": "lines:fix",
+                    "used_fixer": used_fixer,
+                }
+            return {
+                "ok": bool(parsed.get("ok")),
+                "actions": parsed.get("actions") or [],
+                "issues": parsed.get("issues") or [],
+                "raw_text": raw,
+                "parse_mode": "lines",
+                "used_fixer": used_fixer,
+
+            }
         return {
             "ok": bool(parsed.get("ok")),
             "actions": parsed.get("actions") or [],
             "issues": parsed.get("issues") or [],
             "raw_text": raw,
             "parse_mode": "lines",
+            "used_fixer": used_fixer,
         }
+
 
     # =========================================================
     # ✅ NEW: News Actions (LLM) + Verifier (LLM) + Deterministic Cleaner

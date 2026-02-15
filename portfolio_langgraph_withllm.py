@@ -1400,6 +1400,14 @@ def node_news_actions_generate(state: PortfolioState) -> PortfolioState:
         news_items=news_items,
         max_actions=8,
     )
+        state["debug_notes"].append(
+            "NewsActionsLinesMeta: "
+            f"parse_mode={out.get('parse_mode')} "
+            f"used_fixer={out.get('used_fixer', False)} "
+            f"issues={len(out.get('issues') or [])} "
+            f"text_len={len(str(out.get('raw_text') or out.get('text') or ''))}"
+        )
+
 
 
         # 🔴 1️⃣ HAM LLM ÇIKTISI
@@ -1437,6 +1445,29 @@ def node_news_actions_generate(state: PortfolioState) -> PortfolioState:
             tickers,
             allowed_eids=allowed_eids,
         )
+
+        # ✅ DEBUG: ACTION EID -> MAP CHECK (EvidenceSnapshot'tan önce)
+        try:
+            evidence_map = state.get("evidence_map") or {}
+            state["debug_notes"].append("=== DEBUG: ACTION EID -> MAP CHECK ===")
+            for a in actions:
+                for eid in a.get("evidence_ids", []):
+                    info = evidence_map.get(eid)
+                    state["debug_notes"].append(f"{eid} -> {info}")
+            state["debug_notes"].append("=== /DEBUG: ACTION EID -> MAP CHECK ===")
+            if info and isinstance(info, dict):
+                map_ticker = str(info.get("ticker") or "").upper().strip()
+                eid_ticker = eid.split("_", 1)[0]
+                if map_ticker and map_ticker != eid_ticker:
+                    state["debug_notes"].append(f"⚠️ TICKER MISMATCH: eid={eid_ticker} map={map_ticker} for {eid}")
+
+        except Exception as e:
+            state["debug_notes"].append(f"DEBUG ACTION EID MAP CHECK failed: {e}")
+
+        state["debug_notes"].append(
+            f"NewsActions(CLEAN): final_actions={len(actions)} → {actions}"
+        )
+
 
         state["debug_notes"].append(
             f"NewsActions(CLEAN): final_actions={len(actions)} → {actions}"

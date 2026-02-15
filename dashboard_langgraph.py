@@ -318,6 +318,22 @@ def _extract_tickers_from_notes(extra_notes: str, universe: list[str], max_n: in
             break
     return found
 
+def _detect_mentioned_tickers(text: str, universe: list[str], max_n: int = 6) -> list[str]:
+    if not text:
+        return []
+    text_u = text.upper()
+
+    # en basit ve güvenli yöntem: universe içindeki ticker'ları text içinde ara
+    found = []
+    for t in universe:
+        tt = str(t).upper().strip()
+        if not tt:
+            continue
+        if tt in text_u and tt not in found:
+            found.append(tt)
+        if len(found) >= max_n:
+            break
+    return found
 
 # ✅ NEW: News rendering helpers (supports placeholder + real LLM news snapshot output)
 def _extract_news_snapshot_and_risk(state: Dict[str, Any]) -> tuple[Optional[str], Optional[Dict[str, Any]]]:
@@ -449,6 +465,7 @@ def _render_action_evidence(
     *,
     action: Dict[str, Any],
     news_items_by_id: Dict[str, Dict[str, Any]],
+    universe_tickers: List[str],
 ):
     # ✅ 1) Prefer structured evidence list (your backend output)
     ev_list = action.get("evidence")
@@ -472,7 +489,7 @@ def _render_action_evidence(
         st.caption("No evidence attached.")
         return
 
-    lines = []
+    lines: List[str] = []
     for eid in eids[:6]:  # show a few
         item = news_items_by_id.get(eid)
 
@@ -485,15 +502,30 @@ def _render_action_evidence(
         date = str(item.get("date") or "unknown").strip()
         source = str(item.get("source") or item.get("provider") or "unknown").strip()
         headline = str(item.get("headline") or "headline").strip()
+        summary = str(item.get("summary") or "").strip()
         url = str(item.get("url") or "").strip()
+
+        # ✅ Cross-mention detection (headline + summary)
+        mentioned = _detect_mentioned_tickers(f"{headline} {summary}", universe_tickers)
+        # item’in kendi ticker’ını “mentions”tan çıkar
+        also_mentions = [t for t in mentioned if t != ticker.upper()]
 
         if url:
             lines.append(f"- {ticker} ({date} | {source}) [{headline}]({url})")
         else:
             lines.append(f"- {ticker} ({date} | {source}) {headline} (no url)")
 
+        if also_mentions:
+            lines.append(f"  - _Mentions:_ {', '.join(also_mentions)}")
+        else:
+            lines.append("  - _Mentions: 0")
+
+
+
+
     st.markdown("**Evidence**")
     st.markdown("\n".join(lines))
+
 
 # ✅ NEW: Insight rendering helpers (supports narrative raw_text)
 def _insight_section(state: Dict[str, Any]):
@@ -1014,7 +1046,12 @@ else:
                 with st.expander(label, expanded=False):
                     if isinstance(a, dict):
                         st.write(a.get("reason", ""))
-                        _render_action_evidence(action=a, news_items_by_id=news_items_by_id)
+                        _render_action_evidence(
+                            action=a,
+                            news_items_by_id=news_items_by_id,
+                            universe_tickers=selected_tickers,  # veya all_tickers
+                        )
+
                     else:
                         st.write(a)
 
