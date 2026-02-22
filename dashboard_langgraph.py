@@ -663,6 +663,8 @@ if "news_actions_state" not in st.session_state:
     st.session_state["news_actions_state"] = None
 if "selected_news_actions" not in st.session_state:
     st.session_state["selected_news_actions"] = []
+if "news_overview_state" not in st.session_state:
+    st.session_state["news_overview_state"] = None
 
 
 
@@ -939,6 +941,46 @@ else:
         disabled=is_happy,
         help="When enabled, backend fetches news + produces risk flags for selected tickers.",
     )
+    st.markdown("---")
+    st.markdown('<div class="section-title">📰 News Overview (snapshot + risk)</div>', unsafe_allow_html=True)
+
+    run_news_overview = st.button(
+        "📰 Run News Overview (does not change portfolio)",
+        use_container_width=True,
+        disabled=(st.session_state["base_state"] is None),
+    )
+
+    if run_news_overview and selected_tickers:
+        # Hangi portfolio “aktif” ise (refined varsa refined, yoksa base) onu referans al
+        active_state = st.session_state.get("refined_state") or st.session_state.get("base_state") or {}
+        base_state = st.session_state.get("base_state") or {}
+
+        news_overview_state = run_graph(
+            selected_tickers=selected_tickers,
+            rf=float(rf),
+            w_max=float(w_max),
+            preferences={},
+            current_weights=current_weights_dict,
+
+            mode="refine",
+            stage="news_overview",
+
+            # backend zaten stage=news_overview’da force ediyor ama açık yazmak iyi
+            use_llm=True,
+            use_news=True,
+
+            # ✅ kritik: portfolio seçimi / refine akışı değişmesin diye satisfaction=yes
+            clarification_answers={"satisfaction": "yes", "use_news": "yes"},
+
+            # insight için base/ref ilişkisi bozulmasın
+            base_portfolio_metrics=(base_state.get("optimized_metrics")),
+            base_portfolio_weights=(base_state.get("optimized_weights")),
+            base_portfolio_objective=(base_state.get("objective_key")),
+        )
+
+        st.session_state["news_overview_state"] = news_overview_state
+        st.rerun()
+    
 
     st.markdown("---")
     st.markdown('<div class="section-title">🧠 News → LLM Action List</div>', unsafe_allow_html=True)
@@ -1433,7 +1475,8 @@ with bottom_right:
         st.info("News, insight & explanation will appear after base/refine.")
     else:
         # ✅ News panel
-        _news_section(graph_state)
+        news_state = st.session_state.get("news_overview_state") or graph_state
+        _news_section(news_state)
 
         st.markdown("---")
 

@@ -983,6 +983,7 @@ class LLMClient:
             out_risk = draft_risk_json or {}
 
         return {"ok": True, "snapshot_text": out_snapshot.strip(), "risk_json": out_risk, "raw_text": raw}
+    
     def generate_evidence_snapshot_from_actions(
         self,
         *,
@@ -1237,7 +1238,7 @@ class LLMClient:
                 j, parse_mode = j2, f"repair:{parse_mode2}"
             else:
                 # safe fallback
-                return {
+                return {    
                     "ok": False,
                     "snapshot_text": "News snapshot unavailable (LLM returned non-JSON).",
                     "risk_json": {"summary": "", "by_ticker": {}, "global": {"risk_flags": [], "vol_regime": "normal"}},

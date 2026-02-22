@@ -46,7 +46,7 @@ PP_DISLIKE_ASSETS = "I don’t like some of the assets"
 PP_NOT_SURE = "I’m not sure — I just want something safer/smoother"
 
 Mode = Literal["base", "refine"]
-Stage = Literal["main", "news_actions"]
+Stage = Literal["main", "news_actions", "news_overview"]
 ObjectiveKey = Literal["maxsharpe", "minvar"]
 
 
@@ -829,9 +829,9 @@ def node_ask_clarifications(state: PortfolioState) -> PortfolioState:
     state = _init_defaults(state)
 
     # ✅ For news_actions stage, we do NOT stop for user input.
-    if state.get("stage") == "news_actions":
+    if state.get("stage") in ("news_actions", "news_overview"):
         state["needs_user_input"] = False
-        state["debug_notes"].append("Clarifications: skipped (stage=news_actions).")
+        state["debug_notes"].append(f"Clarifications: skipped (stage={state.get('stage')}).")
         return state
 
     if state.get("mode") == "base":
@@ -861,11 +861,12 @@ def node_perception(state: PortfolioState) -> PortfolioState:
     prefs = _merged_prefs(state)
 
     # ✅ stage=news_actions should force news on (unless base)
-    if state.get("stage") == "news_actions" and state.get("mode") != "base":
+    # ✅ stage=news_actions OR news_overview should force news on (unless base)
+    if state.get("stage") in ("news_actions", "news_overview") and state.get("mode") != "base":
         state["use_news"] = True
         state["use_llm"] = True
-        state["debug_notes"].append("Perception: stage=news_actions -> forcing use_llm=True.")
-        state["debug_notes"].append("Perception: stage=news_actions -> forcing use_news=True.")
+        state["debug_notes"].append(f"Perception: stage={state.get('stage')} -> forcing use_llm=True.")
+        state["debug_notes"].append(f"Perception: stage={state.get('stage')} -> forcing use_news=True.")
 
     if state.get("mode") == "base":
         # ✅ hard rule: base never fetches news
@@ -885,9 +886,7 @@ def node_perception(state: PortfolioState) -> PortfolioState:
         state["selected_tickers"] = [t for t in list(state.get("selected_tickers", [])) if t not in excluded]
         state["debug_notes"].append(f"Perception: excluded={sorted(excluded)}")
 
-    # ✅ only override programmatic use_news if user explicitly answered it
-    # (but NOT during stage=news_actions, where we want it ON)
-    if state.get("stage") != "news_actions":
+    if state.get("stage") not in ("news_actions", "news_overview"):
         if "use_news" in prefs:
             use_news_ui = str(prefs.get("use_news") or "no").lower().strip()
             state["use_news"] = (use_news_ui == "yes")
@@ -1117,6 +1116,13 @@ def node_news_fetch(state: PortfolioState) -> PortfolioState:
 def node_news_snapshot_and_risk(state: PortfolioState) -> PortfolioState:
     state = _init_defaults(state)
 
+    state["debug_notes"].append(
+        f"[DEBUG] ENTER node_news_snapshot_and_risk "
+        f"stage={state.get('stage')} "
+        f"use_news={state.get('use_news')} "
+        f"use_llm={state.get('use_llm')}"
+    )
+
     # base never does news
     if state.get("mode") == "base":
         state["news_snapshot_text"] = None
@@ -1139,7 +1145,12 @@ def node_news_snapshot_and_risk(state: PortfolioState) -> PortfolioState:
     tickers = state.get("selected_tickers", []) or []
     raw = state.get("news_raw") or []
     # ✅ BYPASS: stage=news_actions => snapshot üretme, sadece evidence_map hazırla
+    
     if state.get("stage") == "news_actions":
+        state["debug_notes"].append(
+            "[DEBUG] BYPASS TRIGGERED (stage=news_actions) "
+            "=> snapshot emptied + risk emptied"
+        )
         per_ticker = int((_merged_prefs(state).get("news_items_per_ticker") or 3))
         max_total = int((_merged_prefs(state).get("news_max_items_total") or 140))
 
@@ -1283,6 +1294,10 @@ def node_news_snapshot_and_risk(state: PortfolioState) -> PortfolioState:
             state["debug_notes"].append(f"NewsSnapshotOut(debug_failed): {e}")
 
         state["news_snapshot_text"] = str(out.get("snapshot_text") or "").strip() or None
+        state["debug_notes"].append(
+            f"[DEBUG] AFTER LLM snapshot_len="
+            f"{len(state.get('news_snapshot_text') or '')}"
+        )
         risk_json = out.get("risk_json") if isinstance(out.get("risk_json"), dict) else {}
 
         # ✅ NEW: deterministic post-clean + fill universe + normalize enums
@@ -1627,7 +1642,7 @@ def route_after_risk_candidates(state: PortfolioState) -> str:
 
 
 def route_after_news_snapshot(state: PortfolioState) -> str:
-    # ✅ NEW: split flow based on stage
+    # ✅ news_overview = main flow + overlay, so continue main
     return "news_actions" if state.get("stage") == "news_actions" else "main"
 
 
@@ -1952,10 +1967,14 @@ def build_portfolio_graph():
 
     # ✅ IMPORTANT: split after news_snapshot by stage
     g.add_conditional_edges(
-        "news_snapshot",
-        route_after_news_snapshot,
-        {"news_actions": "news_actions_generate", "main": "llm_select"},
-    )
+    "news_snapshot",
+    route_after_news_snapshot,
+    {
+        "news_actions": "news_actions_generate",
+        "main": "llm_select",
+    },
+
+)
 
     g.add_edge("news_actions_generate", "news_evidence_snapshot")
     g.add_edge("news_evidence_snapshot", "news_actions_verify")
@@ -2032,4 +2051,13 @@ def run_graph(
         "base_portfolio_objective": base_portfolio_objective,
     }
 
-    return app.invoke(init, config={"recursion_limit": 200})     
+    out = app.invoke(init, config={"recursion_limit": 200})
+
+    out["debug_notes"].append(
+        f"[DEBUG FINAL STATE] "
+        f"snapshot_len={len(out.get('news_snapshot_text') or '')} "
+        f"risk_by_ticker_keys="
+        f"{list(((out.get('news_risk_json') or {}).get('by_ticker') or {}).keys())}"
+    )
+
+    return out
