@@ -1,4 +1,4 @@
-# portfolio_langgraph.py
+
 from __future__ import annotations
 from collections import defaultdict, Counter
 import hashlib
@@ -74,6 +74,7 @@ class PortfolioState(TypedDict, total=False):
     news_evidence_snapshot_text: Optional[str]
     news_evidence_snapshot_ok: Optional[bool]
     news_evidence_snapshot_issues: List[str]
+    news_snapshot_text_raw: Optional[str]   # ✅ UI-friendly, evidence tag'siz
 
 
     mu: Optional[pd.Series]
@@ -157,12 +158,14 @@ def _init_defaults(state: PortfolioState) -> PortfolioState:
     state.setdefault("news_raw", None)
     state.setdefault("news_signals", None)
     state.setdefault("news_snapshot_text", None)
+    state.setdefault("news_snapshot_text_raw", None)
     state.setdefault("news_risk_json", None)
     state.setdefault("news_items_llm", None)
     state.setdefault("evidence_map", None)
     state.setdefault("news_evidence_snapshot_text", None)
     state.setdefault("news_evidence_snapshot_ok", None)
     state.setdefault("news_evidence_snapshot_issues", [])
+    
 
 
     # ✅ NEW: news action outputs
@@ -1293,7 +1296,27 @@ def node_news_snapshot_and_risk(state: PortfolioState) -> PortfolioState:
         except Exception as e:
             state["debug_notes"].append(f"NewsSnapshotOut(debug_failed): {e}")
 
-        state["news_snapshot_text"] = str(out.get("snapshot_text") or "").strip() or None
+        # ✅ 1) RAW snapshotı state’e koy (formatter kapalı gibi)
+        raw_txt = str(out.get("raw_text") or out.get("text") or "").strip()
+        snap_txt = str(out.get("snapshot_text") or "").strip()
+
+        # UI’da raw göstereceğiz (varsa raw, yoksa snapshot_text)
+        state["news_snapshot_text"] = (raw_txt or snap_txt) or None
+
+        # İstersen ayrı field’e de koy:
+        state["news_snapshot_text_raw"] = raw_txt or None
+        state["debug_notes"].append(
+            f"NewsSnapshotDebug: snapshot_len={len(state.get('news_snapshot_text') or '')} "
+            f"raw_len={len(state.get('news_snapshot_text_raw') or '')}"
+        )
+        state["debug_notes"].append(
+            "NewsSnapshotDebug(raw_preview_200): " + (state.get("news_snapshot_text_raw") or "")[:200].replace("\n", " ")
+        )
+        # ✅ NEW: UI-friendly raw snapshot (strip evidence tags)
+        snap = state.get("news_snapshot_text") or ""
+        # örn: "([APP_abc] 2026-02-22 | Yahoo)" gibi tag'leri kaldır
+        snap_raw = re.sub(r"\(\[[A-Z0-9_]+\]\s+[0-9]{4}-[0-9]{2}-[0-9]{2}\s+\|\s+[^)]+\)\s*", "", snap)
+        state["news_snapshot_text_raw"] = snap_raw.strip() or None
         state["debug_notes"].append(
             f"[DEBUG] AFTER LLM snapshot_len="
             f"{len(state.get('news_snapshot_text') or '')}"
@@ -1501,6 +1524,11 @@ def node_news_actions_generate(state: PortfolioState) -> PortfolioState:
         # 🟢 3️⃣ STATE’E YAZ
         state["news_actions"] = actions
         state["debug_notes"].append(
+            f"[CHECK] state.news_actions_len={len(state.get('news_actions') or [])} "
+            f"sample={ (state.get('news_actions') or [])[:2] }"
+        )
+
+        state["debug_notes"].append(
             f"NewsActions(LLM): generated n={len(actions)} (post-clean)."
         )
         return state
@@ -1509,9 +1537,15 @@ def node_news_actions_generate(state: PortfolioState) -> PortfolioState:
         state["news_actions"] = []
         state["debug_notes"].append(f"NewsActions(LLM): failed -> empty: {e}")
         return state
+    
 
 def node_news_evidence_snapshot(state: PortfolioState) -> PortfolioState:
     state = _init_defaults(state)
+    state["debug_notes"].append(
+    f"ENTER EvidenceSnapshot: stage={state.get('stage')} "
+    f"mode={state.get('mode')} use_news={state.get('use_news')} use_llm={state.get('use_llm')} "
+    f"actions={len(state.get('news_actions') or [])} evidence_map={len(state.get('evidence_map') or {})}"
+)
 
     # sadece news_actions stage'de çalışsın
     if state.get("stage") != "news_actions":
@@ -1593,16 +1627,18 @@ def node_news_evidence_snapshot(state: PortfolioState) -> PortfolioState:
     # 3) LLM ile snapshot üret (sadece evidence item’ları)
     try:
         client = LLMClient()
-        out = client.generate_news_snapshot(
-            tickers=tickers,
-            news_raw=items,
-            lookback_days=int((_merged_prefs(state).get("lookback_days") or 7)),
-            max_items_total=len(items),
+        out = client.generate_evidence_snapshot_from_actions(
+            actions=actions,
+            news_items=items,   # items zaten evidence_id + headline + summary içeriyor
+            max_items=12,
         )
 
-        text = str(out.get("snapshot_text") or "").strip()
+        text = str(out.get("snapshot_text") or out.get("text") or out.get("raw_text") or "").strip()
         ok = bool(out.get("ok"))
         issues = list(out.get("issues") or [])
+        if ok and not text:
+            ok = False
+            issues.append("missing_snapshot_text")
 
         state["news_evidence_snapshot_text"] = text
         state["news_evidence_snapshot_ok"] = ok

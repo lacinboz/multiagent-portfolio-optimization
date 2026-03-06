@@ -342,6 +342,9 @@ def _extract_news_snapshot_and_risk(state: Dict[str, Any]) -> tuple[Optional[str
 
     # ✅ NEW: prefer explicit fields from backend
     snapshot_text = None
+    # ✅ 0) UI-friendly raw snapshot (if backend provides it)
+    if isinstance(state.get("news_snapshot_text_raw"), str) and state["news_snapshot_text_raw"].strip():
+        snapshot_text = state["news_snapshot_text_raw"].strip()
     if isinstance(state.get("news_snapshot_text"), str) and state["news_snapshot_text"].strip():
         snapshot_text = state["news_snapshot_text"].strip()
     elif isinstance(state.get("news_snapshot"), str) and state["news_snapshot"].strip():  # future-proof
@@ -1096,6 +1099,31 @@ else:
 
                     else:
                         st.write(a)
+                        
+            # ✅ 3) Evidence Snapshot (only evidence referenced by actions)
+            st.markdown("---")
+            st.markdown("#### 🧾 Evidence Snapshot (linked to actions)")
+
+            ev_text = nas.get("news_evidence_snapshot_text")
+            ev_ok = nas.get("news_evidence_snapshot_ok")
+            ev_issues = nas.get("news_evidence_snapshot_issues") or []
+
+            if isinstance(ev_ok, bool):
+                if ev_ok:
+                    st.success("Evidence snapshot generated.")
+                else:
+                    st.warning("Evidence snapshot had issues (showing best-effort output).")
+
+            if isinstance(ev_text, str) and ev_text.strip():
+                # text is already formatted by backend (usually multi-line)
+                st.markdown(ev_text)
+            else:
+                st.caption("No evidence snapshot available (missing `news_evidence_snapshot_text`).")
+
+            if ev_issues:
+                with st.expander("⚠️ Evidence snapshot issues"):
+                    for it in ev_issues:
+                        st.write(f"- {it}")
 
             with st.expander("Raw proposed actions (debug)"):
                 st.json(actions)

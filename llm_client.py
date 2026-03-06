@@ -76,7 +76,41 @@ def _fmt_news_dt(x: Any) -> str:
     except Exception:
         return "unknown"
 
+def _format_evidence_snapshot_text(s: str) -> str:
+    s = (s or "").strip()
+    if not s:
+        return s
 
+    # Header yoksa ekle
+    if not s.startswith("EVIDENCE SNAPSHOT"):
+        s = "EVIDENCE SNAPSHOT\n\n" + s
+
+    # "EVIDENCE SNAPSHOT Action:" gibi yapışmaları düzelt
+    s = re.sub(r"^EVIDENCE SNAPSHOT\s+Action:", "EVIDENCE SNAPSHOT\n\nAction:", s)
+
+    # Başlıkları normalize et: Action / Why / Evidence hep satır başında olsun
+    s = re.sub(r"\s+Action:", "\n\nAction:", s)
+    s = re.sub(r"\s+Why:", "\nWhy:", s)
+    s = re.sub(r"\s+Evidence:", "\nEvidence:", s)
+
+    # Action ... Why: aynı satırdaysa -> paragraf kır
+    s = re.sub(r"(Action:[^\n]*?)\s+Why:", r"\1\n\nWhy:", s)
+
+    # Why ... Evidence: aynı satırdaysa -> paragraf kır
+    s = re.sub(r"(Why:[^\n]*?)\s+Evidence:", r"\1\n\nEvidence:", s)
+
+    # Evidence satırlarını bullet yap:
+    # [GOOGL_xxx] ile başlayan parçayı yeni satıra al ve "- " ekle
+    s = re.sub(r"\s*\[([A-Za-z0-9_:\-]+)\]\s*", r"\n - [\1] ", s)
+
+    # Double bullet temizliği
+    s = re.sub(r"\n\s*-\s*-\s*", "\n - ", s)
+
+    # Çoklu boşluk/boş satır normalize
+    s = re.sub(r"[ \t]+\n", "\n", s)
+    s = re.sub(r"\n{3,}", "\n\n", s).strip()
+
+    return s
 def _pref_list(x: Any) -> List[str]:
     if x is None:
         return []
@@ -983,7 +1017,7 @@ class LLMClient:
             out_risk = draft_risk_json or {}
 
         return {"ok": True, "snapshot_text": out_snapshot.strip(), "risk_json": out_risk, "raw_text": raw}
-    
+
     def generate_evidence_snapshot_from_actions(
         self,
         *,
@@ -992,15 +1026,15 @@ class LLMClient:
         max_items: int = 12,
     ) -> Dict[str, Any]:
         """
-        Evidence Snapshot (LLM):
-        - Collect evidence_ids from actions (1-2 each)
-        - Pull matching news_items
-        - Ask LLM to produce a UI-friendly evidence snapshot text
+        Evidence Snapshot (LLM) — ACTION-CENTRIC + NATURAL LANGUAGE
+        - Collect evidence_ids from actions
+        - Pull matching news_items (headline + summary)
+        - Ask LLM to write a short 'Why' narrative per action + list evidence used
         Output: { ok, evidence_snapshot_text, used_evidence_ids, issues, raw_text }
         """
         issues: List[str] = []
 
-        # 1) collect evidence_ids from actions
+        # 1) collect evidence_ids from actions (preserve order)
         eids: List[str] = []
         for a in (actions or []):
             if not isinstance(a, dict):
@@ -1012,9 +1046,8 @@ class LLMClient:
                     if sx:
                         eids.append(sx)
 
-        # unique preserve order
         seen = set()
-        eids_u = []
+        eids_u: List[str] = []
         for x in eids:
             if x not in seen:
                 seen.add(x)
@@ -1029,7 +1062,7 @@ class LLMClient:
                 "raw_text": "",
             }
 
-        # 2) match news items
+        # 2) map news_items by evidence_id
         by_id: Dict[str, Dict[str, Any]] = {}
         for it in (news_items or []):
             if not isinstance(it, dict):
@@ -1038,55 +1071,137 @@ class LLMClient:
             if _id:
                 by_id[_id] = it
 
-        matched = []
+        matched: List[Dict[str, Any]] = []
         for eid in eids_u:
             it = by_id.get(eid)
-            if it:
-                matched.append({
+            if not it:
+                continue
+            headline = str(it.get("headline") or "").strip()
+            if not headline:
+                continue
+
+            matched.append(
+                {
                     "evidence_id": eid,
                     "ticker": str(it.get("ticker") or "").upper().strip(),
                     "date": str(it.get("date") or "unknown"),
                     "source": str(it.get("source") or it.get("provider") or "unknown"),
-                    "headline": str(it.get("headline") or "").strip(),
-                    "url": str(it.get("url") or "").strip() or None,
-                })
+                    "headline": headline[:180],
+                    # ✅ NEW: give the LLM material to write a narrative
+                    "summary": (str(it.get("summary") or "").strip() or None),
+                    "url": (str(it.get("url") or "").strip() or None),
+                }
+            )
 
         if not matched:
             return {
                 "ok": False,
                 "evidence_snapshot_text": "Evidence ids were present but no matching news_items were found.",
-                "used_evidence_ids": eids_u[: max_items],
+                "used_evidence_ids": eids_u[: max(1, int(max_items))],
                 "issues": ["no_matching_news_items"],
                 "raw_text": "",
             }
 
         matched = matched[: max(1, int(max_items))]
 
-        # 3) LLM render
+        # 3) Compact actions for LLM (so it writes per-action narrative)
+        compact_actions: List[Dict[str, Any]] = []
+        for a in (actions or []):
+            if not isinstance(a, dict):
+                continue
+            out = {"type": str(a.get("type") or "").strip(), "reason": str(a.get("reason") or "").strip()}
+            if "ticker" in a:
+                out["ticker"] = str(a.get("ticker") or "").upper().strip()
+            if "intensity" in a:
+                out["intensity"] = str(a.get("intensity") or "").strip()
+            if "value" in a:
+                out["value"] = a.get("value")
+            if "to" in a:
+                out["to"] = str(a.get("to") or "").strip()
+            if "hedge_hint" in a:
+                out["hedge_hint"] = str(a.get("hedge_hint") or "").strip()
+
+            ev = a.get("evidence_ids")
+            if isinstance(ev, list):
+                out["evidence_ids"] = [str(x).strip() for x in ev if str(x).strip()]
+            else:
+                out["evidence_ids"] = []
+            compact_actions.append(out)
+
+        # 4) LLM render (action-centric narrative)
         system = (
-            "You create an Evidence Snapshot for portfolio actions.\n"
+            "You write a short, user-friendly Evidence Snapshot that explains WHY each action was proposed.\n"
             "Return ONLY plain text. No JSON. No markdown.\n"
-            "Hard rules:\n"
-            "- You MUST include EVERY provided evidence item exactly once.\n"
-            "- Do NOT merge items.\n"
-            "- Do NOT invent any events.\n"
             "\n"
-            "Output format:\n"
+            "Hard rules:\n"
+            "- Use ONLY the provided evidence_items (headline + summary). Do NOT invent facts.\n"
+            "- Mention evidence_ids explicitly.\n"
+            "- If evidence summary is missing, rely only on the headline and explicitly say 'headline-only'.\n"
+            "\n"
+            "CRITICAL QUALITY RULES (must follow):\n"
+            "- Do NOT copy the action's original reason sentence verbatim.\n"
+            "- 'Why' must be 2-4 sentences.\n"
+            "- At least ONE sentence must reference specifics from the evidence headlines/summaries\n"
+            "  (e.g., mention the topic/theme of the headline, not generic wording).\n"
+            "- If the evidence is weak/indirect, say so explicitly and justify the action as precautionary.\n"
+            "\n"
+            "Output format (exact):\n"
             "EVIDENCE SNAPSHOT\n"
-            "- ([EVIDENCE_ID] DATE | SOURCE | TICKER) HEADLINE\n"
-            "- ...\n"
+            "Action: <TYPE> <details>\n"
+            "Why: <2-4 sentences>\n"
+            "Evidence:\n"
+            " - [EVIDENCE_ID] TICKER | DATE | SOURCE — HEADLINE\n"
+            " - [EVIDENCE_ID] ...\n"
+            "\n"
+            "Repeat the Action/Why/Evidence block for each provided action (in the given order).\n"
         )
 
-        user = json.dumps({"evidence_items": matched}, ensure_ascii=False)
-        raw = (self.chat(system=system, user=user) or "").strip()
+        user = json.dumps(
+            {
+                "actions": compact_actions,
+                "evidence_items": matched,
+            },
+            ensure_ascii=False,
+        )
 
+        raw = (self.chat(system=system, user=user) or "").strip()
+        raw = _format_evidence_snapshot_text(raw)
+
+        # 5) Fail-safe fallback if LLM empty
         if not raw:
+            used_ids = [x["evidence_id"] for x in matched]
+            # deterministic tiny fallback
+            lines = ["EVIDENCE SNAPSHOT"]
+            for a in compact_actions:
+                a_type = a.get("type", "")
+                details = ""
+                if a_type == "exclude_ticker":
+                    details = f"{a.get('ticker','')}"
+                elif a_type == "reduce_exposure":
+                    details = f"{a.get('ticker','')} ({a.get('intensity','medium')})"
+                elif a_type == "set_w_max":
+                    details = f"{a.get('value')}"
+                elif a_type == "shift_objective":
+                    details = f"to {a.get('to')}"
+                elif a_type == "hedge":
+                    details = f"{a.get('hedge_hint','')}"
+                lines.append(f"Action: {a_type} {details}".strip())
+                lines.append("Why: Derived from the linked evidence headlines/summaries.")
+                lines.append("Evidence:")
+                for eid in (a.get("evidence_ids") or [])[:3]:
+                    it = by_id.get(eid) or {}
+                    lines.append(
+                        f" - [{eid}] {str(it.get('ticker') or '').upper()} | {str(it.get('date') or 'unknown')} | "
+                        f"{str(it.get('source') or it.get('provider') or 'unknown')} — {str(it.get('headline') or '')[:180]}"
+                    )
+            raw = "\n".join(lines)
+
             return {
                 "ok": False,
-                "evidence_snapshot_text": "Evidence snapshot unavailable (empty LLM response).",
-                "used_evidence_ids": [x["evidence_id"] for x in matched],
-                "issues": ["empty_llm_response"],
-                "raw_text": raw,
+                "evidence_snapshot_text": raw,
+                "used_evidence_ids": used_ids,
+                "issues": ["empty_llm_response_fallback_used"],
+                "raw_text": "",
             }
 
         return {
@@ -1107,14 +1222,16 @@ class LLMClient:
     ) -> Dict[str, Any]:
         """
         Produces:
-        - snapshot_text: UI text paragraph(s)
+        - snapshot_text_raw: UI’da göstereceğin LLM-1 “güzel” metin
+        - snapshot_text: canonical (evidence_id’li) metin (actions + allowed_eids için)
         - risk_json: structured {summary, by_ticker, global} (verified/cleaned)
-        This is meant for your "News Snapshot / News Risk Check" UI step.
         """
         tickers_u = [str(t).upper().strip() for t in (tickers or []) if str(t).strip()]
         allowed = set(tickers_u)
 
-        # light truncate to keep prompt stable
+        # ----------------------------
+        # 0) Build items (grounding)
+        # ----------------------------
         items: List[Dict[str, Any]] = []
         for it in (news_raw or []):
             t = str(it.get("ticker") or "").upper().strip()
@@ -1136,8 +1253,8 @@ class LLMClient:
         has_eids = any(isinstance(it, dict) and it.get("evidence_id") for it in (items or []))
         if not has_eids:
             items, _evidence_map = assign_evidence_ids_and_map(items)
-       
-        # ✅ DEBUG: show assigned evidence_ids (does NOT affect snapshot_text)
+
+        # ✅ DEBUG: show assigned evidence_ids
         if os.getenv("LLM_DEBUG_NEWS_EVIDENCE_IDS", "0") == "1":
             print("\n===== DEBUG: evidence_id assignment (input news_items) =====")
             by_t: Dict[str, List[Dict[str, Any]]] = {}
@@ -1153,7 +1270,9 @@ class LLMClient:
                     )
             print("===========================================================\n")
 
-
+        # ----------------------------
+        # 1) LLM-1: snapshot + risk (no evidence_id requirement)
+        # ----------------------------
         system = (
             "You summarize recent market/company news for a portfolio risk overlay.\n"
             "Return ONLY valid JSON (no markdown, no extra text).\n"
@@ -1165,7 +1284,7 @@ class LLMClient:
             "\n"
             "CRITICAL HARD RULES:\n"
             f"- You may mention ONLY these tickers: {tickers_u}\n"
-            "- Do NOT mention any other company/ticker names (e.g., SKIL) even as examples.\n"
+            "- Do NOT mention any other company/ticker names even as examples.\n"
             "- Do NOT create extra sections like 'General Market Context' or 'Partnership'.\n"
             "- Only output ticker sections for the allowed tickers.\n"
             "\n"
@@ -1186,14 +1305,14 @@ class LLMClient:
             "\n"
             "snapshot_text formatting:\n"
             "- MUST be ticker-by-ticker.\n"
-            "- For EACH ticker: include UP TO 6 bullet points (0 to 6). If there are not enough relevant items, write fewer (including 0).\n"
-            "- Do NOT create filler bullets to reach any minimum (there is no minimum).\n"
-            "- If a ticker has no relevant items, output that ticker with NO bullets (do not add extra sections).\n"
+            "- For EACH ticker: include UP TO 6 bullet points (0 to 6). If there are not enough relevant items, write fewer.\n"
+            "- Do NOT create filler bullets.\n"
+            "- If a ticker has no relevant items, output that ticker with NO bullets.\n"
             "- IMPORTANT: NEVER exceed the number of provided items for that ticker.\n"
             "- Each bullet MUST be anchored to ONE provided news item.\n"
             "- Bullet format MUST be exactly:\n"
             " - (DATE | SOURCE) HEADLINE: <headline> — <one short explanation>\n"
-            "- DATE must use news_items[i].date (already derived). If missing use 'unknown'.\n"
+            "- DATE must use news_items[i].date. If missing use 'unknown'.\n"
             "- SOURCE must use news_items[i].source. If missing use 'unknown'.\n"
         )
 
@@ -1209,7 +1328,9 @@ class LLMClient:
         raw = (self.chat(system=system, user=user) or "").strip()
         j, parse_mode = self._parse_json_best_effort(raw)
 
-        # ✅ 2nd pass: JSON repair if needed (mirrors your decision retry pattern)
+        # ----------------------------
+        # 1.1) JSON repair if needed
+        # ----------------------------
         if j is None:
             repair_system = (
                 "You are a JSON repair tool.\n"
@@ -1222,25 +1343,19 @@ class LLMClient:
                 '"by_ticker": { "TICKER": {"risk_flag": "string", "confidence": "number", "evidence_ids": ["string"]} }, '
                 '"global": { "risk_flags": [{"ticker": "string", "flag": "string"}], "vol_regime": "normal|high" } } }'
             )
-
             repair_user = json.dumps(
-                {
-                    "schema": schema_hint,
-                    "text": raw,
-                    "tickers": tickers_u,
-                },
+                {"schema": schema_hint, "text": raw, "tickers": tickers_u},
                 ensure_ascii=False,
             )
-
             repaired = (self.chat(system=repair_system, user=repair_user) or "").strip()
             j2, parse_mode2 = self._parse_json_best_effort(repaired)
             if j2 is not None:
                 j, parse_mode = j2, f"repair:{parse_mode2}"
             else:
-                # safe fallback
-                return {    
+                return {
                     "ok": False,
                     "snapshot_text": "News snapshot unavailable (LLM returned non-JSON).",
+                    "snapshot_text_raw": "",
                     "risk_json": {"summary": "", "by_ticker": {}, "global": {"risk_flags": [], "vol_regime": "normal"}},
                     "issues": [
                         f"news_json_parse_failed(mode={parse_mode})",
@@ -1253,65 +1368,110 @@ class LLMClient:
         snapshot_text = ""
         if isinstance(j.get("snapshot_text"), str):
             snapshot_text = j["snapshot_text"].strip()
-
         risk_json = j.get("risk_json") if isinstance(j.get("risk_json"), dict) else {}
 
-        # ✅ LLM-2 Formatter: canonical snapshot_text + risk_json(with evidence_ids)
-        fmt = self.format_news_snapshot_strict(
-            tickers=tickers_u,
-            news_items=items,  # evidence_id'li items
-            draft_snapshot_text=snapshot_text,
-            draft_risk_json=risk_json,
-            max_bullets_per_ticker=6,
-        )
-        if os.getenv("LLM_DEBUG_NEWS_FORMATTER2", "0") == "1":
-            print("\n===== DEBUG: Formatter-2 RAW =====")
-            print((fmt.get("raw_text") or "")[:2000])
-            print("===== DEBUG: Formatter-2 snapshot_text preview =====")
-            print((fmt.get("snapshot_text") or "")[:800])
-            print("===== DEBUG: Formatter-2 risk_json keys =====")
-            rj = fmt.get("risk_json") if isinstance(fmt.get("risk_json"), dict) else {}
-            print(list(rj.keys()) if isinstance(rj, dict) else type(rj))
-            bt = rj.get("by_ticker") if isinstance(rj, dict) else None
-            print("by_ticker keys:", list(bt.keys()) if isinstance(bt, dict) else bt)
-            print("==================================\n")
-        snapshot_text = (fmt.get("snapshot_text") or snapshot_text).strip()
-        risk_json = fmt.get("risk_json") if isinstance(fmt.get("risk_json"), dict) else risk_json
+        # ✅ UI RAW (LLM-1’in güzel metni) — bunu dashboard’da göster
+        snapshot_text_raw = snapshot_text
 
-        # ✅ allowed evidence ids setini üret (snapshot + risk_json içinden)
+        # ----------------------------
+        # 2) Fixer gating: LLM-2 sadece gerekiyorsa çalışsın
+        # ----------------------------
+        def _needs_fix_snapshot(st: str, tickers_local: List[str], max_bullets: int = 6) -> bool:
+            s = st or ""
+            # hiç ticker görünmüyorsa muhtemelen format bozuk
+            if tickers_local and (not any(t in s for t in tickers_local)):
+                return True
+            # hiç bullet yoksa ( - () bekliyorsun)
+            if " - (" not in s:
+                return True
+            # kaba “çok bullet” check (aşırı saçmalamayı yakalar)
+            if s.count(" - (") > max(1, len(tickers_local)) * max_bullets:
+                return True
+            return False
+
+        run_formatter2 = _needs_fix_snapshot(snapshot_text, tickers_u, 6)
+
+        # ----------------------------
+        # 3) LLM-2: canonicalize (evidence_id ekle) — sadece gerekirse
+        # ----------------------------
+        if run_formatter2:
+            fmt = self.format_news_snapshot_strict(
+                tickers=tickers_u,
+                news_items=items,  # evidence_id’li items
+                draft_snapshot_text=snapshot_text,
+                draft_risk_json=risk_json,
+                max_bullets_per_ticker=6,
+            )
+
+            if os.getenv("LLM_DEBUG_NEWS_FORMATTER2", "0") == "1":
+                print("\n===== DEBUG: Formatter-2 RAW =====")
+                print((fmt.get("raw_text") or "")[:2000])
+                print("===== DEBUG: Formatter-2 snapshot_text preview =====")
+                print((fmt.get("snapshot_text") or "")[:800])
+                print("===== DEBUG: Formatter-2 risk_json keys =====")
+                rj = fmt.get("risk_json") if isinstance(fmt.get("risk_json"), dict) else {}
+                print(list(rj.keys()) if isinstance(rj, dict) else type(rj))
+                bt = rj.get("by_ticker") if isinstance(rj, dict) else None
+                print("by_ticker keys:", list(bt.keys()) if isinstance(bt, dict) else bt)
+                print("==================================\n")
+
+            snapshot_text_canonical = (fmt.get("snapshot_text") or snapshot_text).strip()
+            risk_json = fmt.get("risk_json") if isinstance(fmt.get("risk_json"), dict) else risk_json
+        else:
+            # formatter2 gerekmediyse, canonical = LLM-1
+            snapshot_text_canonical = (snapshot_text or "").strip()
+
+        # ----------------------------
+        # 4) allowed_eids çıkar + (opsiyonel) fallback
+        # ----------------------------
         allowed_eids = self._collect_allowed_evidence_ids(
-            snapshot_text=snapshot_text,
+            snapshot_text=snapshot_text_canonical,
             risk_json=risk_json,
         )
-        # ✅ DEBUG: snapshot format + allowed_eids check
+
+        # ✅ Fallback: bazen model evidence_id yerine "AI report" gibi şey basıyor.
+        # allowed çok küçükse bütün item evidence_id’lerini kabul et ki actions pipeline kilitlenmesin.
+        if len(allowed_eids) < 5:
+            allowed_eids = {
+                str(it.get("evidence_id")).strip()
+                for it in (items or [])
+                if isinstance(it, dict) and str(it.get("evidence_id") or "").strip()
+            }
+
         if os.getenv("LLM_DEBUG_NEWS_ALLOWED_EIDS", "0") == "1":
             print("\n===== DEBUG: allowed_eids extraction =====")
             print("items_count:", len(items))
             print("missing_evidence_id_count:", sum(1 for it in items if not it.get("evidence_id")))
             print("evidence_id_sample:", [it.get("evidence_id") for it in items[:8]])
-            print("--- snapshot_text head ---")
-            print((snapshot_text or "")[:600])
+            print("--- snapshot_text_canonical head ---")
+            print((snapshot_text_canonical or "")[:600])
             print("--- allowed_eids ---")
             print("allowed_eids_count:", len(allowed_eids))
             print("allowed_eids_sample:", sorted(list(allowed_eids))[:20])
             print("========================================\n")
 
-
+        # ----------------------------
+        # 5) deterministic risk cleaner (evidence_ids filtered)
+        # ----------------------------
         verified = self._verify_news_risk_json(
             risk_json if isinstance(risk_json, dict) else {},
             tickers_u,
-            allowed_evidence_ids=allowed_eids,   # ✅ artık filtre var
+            allowed_evidence_ids=allowed_eids,
         )
-
-
 
         return {
             "ok": bool(verified.get("ok")),
-            "snapshot_text": snapshot_text or "News snapshot generated.",
+            # ✅ canonical: actions + allowed_eids için
+            "snapshot_text": snapshot_text_canonical or "News snapshot generated.",
+            # ✅ UI’da bunu göster (RAW / güzel metin)
+            "snapshot_text_raw": snapshot_text_raw or "",
             "risk_json": verified.get("cleaned"),
             "issues": list(verified.get("issues") or []),
-            "raw_text": raw,
+            "raw_text": raw,               # LLM-1 raw json text
             "parse_mode": parse_mode,
+            # debug/telemetry (istersen dashboard’da gizli tut)
+            "used_formatter2": bool(run_formatter2),
+            "allowed_eids_count": int(len(allowed_eids)),
         }
     # ============================
 # ✅ NEW: News Actions (LINE)
@@ -1345,6 +1505,17 @@ class LLMClient:
         else:
             # If block missing, keep original behavior (fallback to full text)
             text = (text or "").strip()
+        if os.getenv("LLM_DEBUG_ACTIONS_PARSE", "0") == "1":
+            print("\n===== DEBUG: _parse_actions_lines INPUT (post-block-extract) =====")
+            print("tickers_u:", sorted(list(tickers_u)))
+            print("allowed_evidence_ids_count:", len(allowed_evidence_ids))
+            print("text_len:", len(text))
+            print("--- text head (800) ---")
+            print((text or "")[:800])
+            print("--- text lines ---")
+            for idx, ln in enumerate((text or "").splitlines()[:20]):
+                print(f"{idx:02d}: {ln}")
+            print("===============================================================\n")
 
         # ✅ Special explicit empty case
         if text.strip().upper() == "NO_ACTIONS":
@@ -1484,7 +1655,7 @@ class LLMClient:
             })
 
         system = (
-             "You are a portfolio NEWS actions generator.\n"
+            "You are a portfolio NEWS actions generator.\n"
             "You may include a brief summary, BUT you MUST include exactly one ACTION BLOCK.\n"
             "Only lines inside the ACTION BLOCK will be parsed.\n"
             "\n"
@@ -1493,18 +1664,26 @@ class LLMClient:
             "<one action line per row OR a single line: NO_ACTIONS>\n"
             "END_ACTIONS\n"
             "\n"
-            "Rules for the ACTION BLOCK:\n"
-            "- Inside the block: output ONLY action lines OR NO_ACTIONS.\n"
-            "- No markdown. No bullets. No headers inside the block.\n"
+            "CRITICAL RULES (must follow):\n"
+            "- Inside the ACTION BLOCK: output ONLY action lines OR NO_ACTIONS.\n"
+            "- No markdown, no bullets, no headers inside the block.\n"
+            "- evidence_ids MUST be copied EXACTLY from the Allowed evidence_ids list below.\n"
+            "- NEVER output placeholders like EID1, EID2, ID1, NEWS1, etc.\n"
+            "- Use 1 or 2 evidence_ids per line (comma-separated). Not more.\n"
+            "- If you cannot copy real evidence_ids, output NO_ACTIONS.\n"
+            "\n"
             "Line formats (one per line):\n"
-            "exclude_ticker|TICKER|EID1,EID2|REASON\n"
-            "reduce_exposure|TICKER|low|EID1,EID2|REASON\n"
-            "reduce_exposure|TICKER|medium|EID1,EID2|REASON\n"
-            "reduce_exposure|TICKER|high|EID1,EID2|REASON\n"
-            "set_w_max|0.30|EID1,EID2|REASON   (value must be 0.05-0.50)\n"
-            "shift_objective|minvar|EID1,EID2|REASON\n"
-            "shift_objective|maxsharpe|EID1,EID2|REASON\n"
-            "hedge|HEDGE_HINT|EID1,EID2|REASON\n"
+            "exclude_ticker|TICKER|<EVIDENCE_ID_1>,<EVIDENCE_ID_2>|REASON\n"
+            "reduce_exposure|TICKER|low|<EVIDENCE_ID_1>,<EVIDENCE_ID_2>|REASON\n"
+            "reduce_exposure|TICKER|medium|<EVIDENCE_ID_1>,<EVIDENCE_ID_2>|REASON\n"
+            "reduce_exposure|TICKER|high|<EVIDENCE_ID_1>,<EVIDENCE_ID_2>|REASON\n"
+            "set_w_max|0.30|<EVIDENCE_ID_1>,<EVIDENCE_ID_2>|REASON   (value must be 0.05-0.50)\n"
+            "shift_objective|minvar|<EVIDENCE_ID_1>,<EVIDENCE_ID_2>|REASON\n"
+            "shift_objective|maxsharpe|<EVIDENCE_ID_1>,<EVIDENCE_ID_2>|REASON\n"
+            "hedge|HEDGE_HINT|<EVIDENCE_ID_1>,<EVIDENCE_ID_2>|REASON\n"
+            "\n"
+            "Examples of VALID evidence_ids (copy this style):\n"
+            f"{chr(10).join(allowed_ids[:8])}\n"
             "\n"
             "Allowed evidence_ids (one per line):\n"
             f"{allowed_ids_block}\n"
