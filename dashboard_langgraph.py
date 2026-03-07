@@ -937,13 +937,9 @@ else:
         disabled=is_happy,
         help="When enabled, the model selects the best candidate (Max-Sharpe vs Min-Variance) AND generates portfolio insights.",
     )
+    st.caption("News snapshot & risk check is enabled by default.")
 
-    use_news_refine = st.checkbox(
-        "📰 Include news snapshot & risk check (slower)",
-        value=False,
-        disabled=is_happy,
-        help="When enabled, backend fetches news + produces risk flags for selected tickers.",
-    )
+    
     st.markdown("---")
     st.markdown('<div class="section-title">📰 News Overview (snapshot + risk)</div>', unsafe_allow_html=True)
 
@@ -1213,7 +1209,7 @@ else:
                 "satisfaction": "no",
                 "pain_points": pain_points,
                 "excluded_assets": excluded_assets,
-                "use_news": "yes" if use_news_refine else "no",
+                "use_news": "yes",
                 "extra_notes": extra_notes,
                 "notes_tickers": notes_tickers,
                 "selected_news_actions": st.session_state.get("selected_news_actions", []),
@@ -1229,7 +1225,7 @@ else:
                 clarification_answers=refined_answers,
                 mode="refine",
                 use_llm=bool(use_llm_refine),
-                use_news=bool(use_news_refine),
+                use_news=True,
                 base_portfolio_metrics=base_state.get("optimized_metrics"),
                 base_portfolio_weights=base_state.get("optimized_weights"),
                 base_portfolio_objective=base_state.get("objective_key"),
