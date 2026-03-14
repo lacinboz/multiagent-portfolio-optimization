@@ -1817,92 +1817,92 @@ def node_finalize_selection(state: PortfolioState) -> PortfolioState:
 
 
 def node_insight_generator(state: PortfolioState) -> PortfolioState:
-    state = _init_defaults(state)
+        state = _init_defaults(state)
 
-    # ✅ In news_actions stage we do not generate portfolio insights
-    if state.get("stage") == "news_actions":
-        state["debug_notes"].append("Insight: skipped (stage=news_actions).")
-        return state
+        # ✅ In news_actions stage we do not generate portfolio insights
+        if state.get("stage") == "news_actions":
+            state["debug_notes"].append("Insight: skipped (stage=news_actions).")
+            return state
 
-    use_llm = bool(state.get("use_llm", False))
-    if (not use_llm) or (LLMClient is None) or (insight_agent_prepare is None):
-        state["debug_notes"].append("Insight: skipped (use_llm disabled or LLMClient/insight_agent_prepare unavailable).")
-        return state
+        use_llm = bool(state.get("use_llm", False))
+        if (not use_llm) or (LLMClient is None) or (insight_agent_prepare is None):
+            state["debug_notes"].append(
+                "Insight: skipped (use_llm disabled or LLMClient/insight_agent_prepare unavailable)."
+            )
+            return state
 
-    refine_metrics = state.get("optimized_metrics") or {}
-    if not refine_metrics:
-        state["debug_notes"].append("Insight: skipped (missing optimized_metrics).")
-        return state
+        refine_metrics = state.get("optimized_metrics") or {}
+        if not refine_metrics:
+            state["debug_notes"].append("Insight: skipped (missing optimized_metrics).")
+            return state
 
-    base_metrics = state.get("base_portfolio_metrics")
-    base_obj = state.get("base_portfolio_objective")
+        base_metrics = state.get("base_portfolio_metrics")
+        base_obj = state.get("base_portfolio_objective")
 
-    if not base_metrics:
-        base_metrics = state.get("current_metrics")
-        if base_metrics and not base_obj:
-            base_obj = "user_current"
+        if not base_metrics:
+            base_metrics = state.get("current_metrics")
+            if base_metrics and not base_obj:
+                base_obj = "user_current"
 
-    if not base_metrics:
-        base_metrics = state.get("baseline_metrics") or {}
-        if not base_obj:
-            base_obj = "equal_weight"
+        if not base_metrics:
+            base_metrics = state.get("baseline_metrics") or {}
+            if not base_obj:
+                base_obj = "equal_weight"
 
-    prefs = _merged_prefs(state)
-    news_signals = state.get("news_signals")  # ✅ now risk_json
+        prefs = _merged_prefs(state)
+        news_signals = state.get("news_signals")
 
-    chosen = str(state.get("objective_key") or "maxsharpe").lower().strip()
-    refine_obj = chosen
+        chosen = str(state.get("objective_key") or "maxsharpe").lower().strip()
+        refine_obj = chosen
 
-    try:
-        base_constraints = {"rf": float(state.get("rf", 0.02))}
-        refine_constraints = {
-            "rf": float(state.get("rf", 0.02)),
-            "w_max": float(state.get("w_max", 0.30)),
-            "lambda_l2": float(state.get("lambda_l2", 1e-3)),
-        }
+        try:
+            base_constraints = {"rf": float(state.get("rf", 0.02))}
+            refine_constraints = {
+                "rf": float(state.get("rf", 0.02)),
+                "w_max": float(state.get("w_max", 0.30)),
+                "lambda_l2": float(state.get("lambda_l2", 1e-3)),
+            }
 
-        prep = insight_agent_prepare(
-            base_metrics=base_metrics,
-            refine_metrics=refine_metrics,
-            preferences=prefs,
-            news_signals=news_signals,
-            base_objective=base_obj,
-            refine_objective=refine_obj,
-            base_constraints=base_constraints,
-            refine_constraints=refine_constraints,
-        )
+            # ✅ Keep using agents_langgraph only for payload preparation
+            prep = insight_agent_prepare(
+                base_metrics=base_metrics,
+                refine_metrics=refine_metrics,
+                preferences=prefs,
+                news_signals=news_signals,
+                base_objective=base_obj,
+                refine_objective=refine_obj,
+                base_constraints=base_constraints,
+                refine_constraints=refine_constraints,
+            )
 
-        prompts = prep.get("prompts") or {}
-        payload = prep.get("payload") or {}
+            payload = prep.get("payload") or {}
 
-        client = LLMClient()
-        out = client.generate_portfolio_insights(
-            prompts=prompts,
-            payload=payload,
-            mode="narrative",
-        )
+            client = LLMClient()
+            out = client.generate_portfolio_insights(
+                payload=payload,
+                mode="narrative",
+            )
 
-        state["insight_ok"] = bool(out.get("ok"))
-        state["insight_issues"] = list(out.get("issues") or [])
-        state["insight_parse_mode"] = out.get("parse_mode") or "narrative"
+            state["insight_ok"] = bool(out.get("ok"))
+            state["insight_issues"] = list(out.get("issues") or [])
+            state["insight_parse_mode"] = out.get("parse_mode") or "narrative"
 
-        state["insight_raw_text"] = (out.get("text") or out.get("raw_text") or "").strip() or None
-        state["insight"] = out.get("insight") if isinstance(out.get("insight"), dict) else None
+            state["insight_raw_text"] = (out.get("text") or out.get("raw_text") or "").strip() or None
+            state["insight"] = out.get("insight") if isinstance(out.get("insight"), dict) else None
 
-        state["debug_notes"].append(
-            f"Insight: generated ok={state['insight_ok']} issues={len(state['insight_issues'])} mode={state['insight_parse_mode']}"
-        )
-        return state
+            state["debug_notes"].append(
+                f"Insight: generated ok={state['insight_ok']} issues={len(state['insight_issues'])} mode={state['insight_parse_mode']}"
+            )
+            return state
 
-    except Exception as e:
-        state["insight_ok"] = False
-        state["insight_raw_text"] = None
-        state["insight"] = None
-        state["insight_issues"] = [f"insight_exception: {e}"]
-        state["insight_parse_mode"] = "error"
-        state["debug_notes"].append(f"Insight: failed → {e}")
-        return state
-
+        except Exception as e:
+            state["insight_ok"] = False
+            state["insight_raw_text"] = None
+            state["insight"] = None
+            state["insight_issues"] = [f"insight_exception: {e}"]
+            state["insight_parse_mode"] = "error"
+            state["debug_notes"].append(f"Insight: failed → {e}")
+            return state
 
 def node_explain(state: PortfolioState) -> PortfolioState:
     state = _init_defaults(state)

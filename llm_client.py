@@ -389,6 +389,126 @@ class LLMClient:
     # =========================================================
     # NEW: Interpret user feedback (LLM) -> tiny intent JSON
     # =========================================================
+
+    def _has_meaningful_news_overlay(self, payload: Dict[str, Any]) -> bool:
+        news = payload.get("news_signals") or {}
+        if not isinstance(news, dict):
+            return False
+
+        by_ticker = news.get("by_ticker")
+        if isinstance(by_ticker, dict):
+            for _, v in by_ticker.items():
+                if not isinstance(v, dict):
+                    continue
+                flag = str(v.get("risk_flag") or "none").strip().lower()
+                conf = _safe_float(v.get("confidence"))
+                if flag != "none" and (conf is None or conf > 0):
+                    return True
+
+        glob = news.get("global")
+        if isinstance(glob, dict):
+            rf = glob.get("risk_flags")
+            if isinstance(rf, list) and len(rf) > 0:
+                return True
+            vr = str(glob.get("vol_regime") or "normal").strip().lower()
+            if vr == "high":
+                return True
+
+        summary = str(news.get("summary") or "").strip()
+        return bool(summary)
+    def _build_portfolio_insight_prompt_pack(
+            self,
+            *,
+            payload: Dict[str, Any],
+            mode: str = "narrative",
+        ) -> Dict[str, str]:
+            has_news = self._has_meaningful_news_overlay(payload)
+
+            if mode == "narrative":
+                system = (
+                    "You are the final Portfolio Insight writer for a portfolio decision product.\n"
+                    "Your job is to explain the FINAL selected portfolio to a non-expert user.\n"
+                    "Return ONLY plain text. No JSON. No markdown headings.\n"
+                    "Use ONLY the provided payload. Do NOT invent numbers, facts, or tickers.\n"
+                )
+
+                developer = (
+                    "Write a clear final portfolio explanation for a non-expert user.\n"
+                    "\n"
+                    "Core purpose:\n"
+                    "- Explain the FINAL selected portfolio.\n"
+                    "- This is NOT a news snapshot.\n"
+                    "- This is NOT an evidence snapshot.\n"
+                    "- This is the final user-facing explanation of the selected portfolio.\n"
+                    "\n"
+                    "Required content:\n"
+                    "- Explain the portfolio objective in plain English.\n"
+                    "- If you mention Max Sharpe, explain immediately that it tries to maximize return per unit of risk.\n"
+                    "- If you mention Min Variance, explain immediately that it tries to reduce ups and downs (volatility).\n"
+                    "- Mention at least 3 exact metrics from the payload.\n"
+                    "- When mentioning return, volatility, Sharpe, max_weight, or effective_n, explain what each means for the user in simple language.\n"
+                    "- Explain whether the portfolio looks more aggressive, more defensive, more concentrated, or more diversified.\n"
+                    "- If base vs refine information exists, explain what changed in practice.\n"
+                    "- If no meaningful base-vs-refine comparison exists, focus only on the final portfolio.\n"
+                    "\n"
+                    "News overlay rule:\n"
+                    f"- Meaningful news overlay present: {'yes' if has_news else 'no'}.\n"
+                    "- If meaningful news overlay is present, add only a short final note about it.\n"
+                    "- If news signals are empty or all risk flags are none, do NOT force a news paragraph.\n"
+                    "\n"
+                    "Style rules:\n"
+                    "- Write in natural, user-friendly language.\n"
+                    "- Do not sound academic.\n"
+                    "- Do not just repeat numbers; interpret them.\n"
+                    "- Keep it around 8 to 14 sentences.\n"
+                )
+
+                user = (
+                    "Here is the final portfolio insight payload as JSON.\n"
+                    "Write the final user-facing portfolio insight now.\n\n"
+                    + json.dumps(payload, ensure_ascii=False)
+                )
+
+                return {"system": system, "developer": developer, "user": user}
+
+            system = (
+                "You are the final Portfolio Insight writer for a portfolio decision product.\n"
+                "Return ONLY valid JSON. No markdown. No extra text.\n"
+                "Use ONLY the provided payload. Do NOT invent numbers, facts, or tickers.\n"
+            )
+
+            developer = (
+                "Create a structured final portfolio insight for a non-expert user.\n"
+                "The JSON must explain the FINAL selected portfolio.\n"
+                "\n"
+                "Output schema:\n"
+                "{\n"
+                '  "headline": string,\n'
+                '  "portfolio_story": [string, ...],\n'
+                '  "risk_drivers": [{"ticker": string, "reason": string, "rc_pct": number|null}],\n'
+                '  "diversification_read": {"max_weight": number|null, "effective_n": number|null, "comment": string},\n'
+                '  "base_vs_refine": {"key_changes": [string, ...], "metric_deltas": object},\n'
+                '  "news_overlay": [string, ...],\n'
+                '  "action_suggestions_optional": [string, ...]\n'
+                "}\n"
+                "\n"
+                "Rules:\n"
+                "- All 7 keys must be present.\n"
+                "- risk_drivers.ticker must come only from payload.base.top_risk_drivers or payload.refine.top_risk_drivers.\n"
+                "- portfolio_story should explain the final portfolio in user-friendly language.\n"
+                "- diversification_read must interpret concentration/diversification.\n"
+                "- base_vs_refine should explain practical change if available.\n"
+                "- news_overlay should be empty if there is no meaningful news signal.\n"
+                "- action_suggestions_optional may stay empty.\n"
+            )
+
+            user = (
+                "Here is the final portfolio insight payload as JSON.\n"
+                "Return the structured insight JSON now.\n\n"
+                + json.dumps(payload, ensure_ascii=False)
+            )
+
+            return {"system": system, "developer": developer, "user": user}
     def _interpret_feedback(self, pain_points: List[str], extra_notes: str) -> Dict[str, Any]:
         system = (
             "You interpret portfolio feedback into a tiny structured intent.\n"
@@ -730,57 +850,139 @@ class LLMClient:
     def generate_portfolio_insights(
         self,
         *,
-        prompts: Dict[str, Any],
         payload: Dict[str, Any],
-        mode: str = "json",  # "narrative" | "json"
+        mode: str = "narrative",  # "narrative" | "json"
         max_chars: int = 8000,
     ) -> Dict[str, Any]:
-        pack = prompts
-        if isinstance(prompts, dict) and ("narrative" in prompts or "json" in prompts):
-            pack = prompts.get(mode, {}) if isinstance(prompts.get(mode, {}), dict) else {}
+        """
+        Final Portfolio Insight (LLM)
+        Purpose:
+        - Explain the FINAL selected portfolio to the user
+        - Works for both base and refine outputs
+        - News is only an optional overlay, not the main content
 
-        system = (pack or {}).get("system", "")
-        developer = (pack or {}).get("developer", "")
-        user = (pack or {}).get("user", "")
+        Returns:
+        narrative mode:
+            { ok, text, issues, raw_text, parse_mode }
 
-        system_full = (system.rstrip() + "\n\n" + developer.strip()).strip()
-        user_text = (user or "").strip()
+        json mode:
+            { ok, insight, issues, raw_text, parse_mode }
+        """
+        mode = str(mode or "narrative").strip().lower()
+        if mode not in ("narrative", "json"):
+            mode = "narrative"
+
+        pack = self._build_portfolio_insight_prompt_pack(payload=payload, mode=mode)
+
+        system = (pack.get("system") or "").strip()
+        developer = (pack.get("developer") or "").strip()
+        user_text = (pack.get("user") or "").strip()
+
+        system_full = (system + "\n\n" + developer).strip()
+
         if len(user_text) > max_chars:
             user_text = user_text[:max_chars] + "\n\n[TRUNCATED]\n"
 
-        raw = self.chat(system=system_full, user=user_text)
-        raw = (raw or "").strip()
+        raw = (self.chat(system=system_full, user=user_text) or "").strip()
 
+        # -------------------------------------------------
+        # narrative mode
+        # -------------------------------------------------
         if mode == "narrative":
             if not raw:
-                raw = "Insights not available (empty LLM response)."
-            return {"ok": True, "text": raw, "issues": [], "raw_text": raw, "parse_mode": "text"}
+                fallback = "Portfolio insight unavailable (empty LLM response)."
+                return {
+                    "ok": False,
+                    "text": fallback,
+                    "issues": ["empty_llm_response"],
+                    "raw_text": raw,
+                    "parse_mode": "text",
+                }
 
+            return {
+                "ok": True,
+                "text": raw,
+                "issues": [],
+                "raw_text": raw,
+                "parse_mode": "text",
+            }
+
+        # -------------------------------------------------
+        # json mode
+        # -------------------------------------------------
         j, parse_mode = self._parse_json_best_effort(raw)
 
         if j is None:
-            fallback = {
-                "headline": "Insights not available (LLM returned non-JSON).",
-                "portfolio_story": [],
-                "risk_drivers": [],
-                "diversification_read": {"max_weight": None, "effective_n": None, "comment": "not provided"},
-                "base_vs_refine": {
-                    "key_changes": [],
-                    "metric_deltas": ((payload.get("delta") or {}).get("metrics") or {}),
-                },
-                "news_overlay": [],
-                "action_suggestions_optional": [],
-            }
-            issues = [f"json_parse_failed(mode={parse_mode})"]
-            return {"ok": False, "insight": fallback, "issues": issues, "raw_text": raw, "parse_mode": parse_mode}
+            repair_system = (
+                "You are a JSON repair tool.\n"
+                "Convert the given text into VALID JSON that matches the schema.\n"
+                "Return ONLY JSON. No markdown. No extra text.\n"
+                "The output MUST start with '{' and end with '}'.\n"
+            )
+
+            schema_hint = (
+                '{'
+                '"headline":"string",'
+                '"portfolio_story":["string"],'
+                '"risk_drivers":[{"ticker":"string","reason":"string","rc_pct":null}],'
+                '"diversification_read":{"max_weight":null,"effective_n":null,"comment":"string"},'
+                '"base_vs_refine":{"key_changes":["string"],"metric_deltas":{}},'
+                '"news_overlay":["string"],'
+                '"action_suggestions_optional":["string"]'
+                '}'
+            )
+
+            repair_user = json.dumps(
+                {"schema": schema_hint, "text": raw},
+                ensure_ascii=False,
+            )
+
+            repaired = (self.chat(system=repair_system, user=repair_user) or "").strip()
+            j2, parse_mode2 = self._parse_json_best_effort(repaired)
+
+            if j2 is not None:
+                j = j2
+                parse_mode = f"repair:{parse_mode2}"
+            else:
+                fallback = {
+                    "headline": "Insights not available (LLM returned non-JSON).",
+                    "portfolio_story": [],
+                    "risk_drivers": [],
+                    "diversification_read": {
+                        "max_weight": None,
+                        "effective_n": None,
+                        "comment": "not provided",
+                    },
+                    "base_vs_refine": {
+                        "key_changes": [],
+                        "metric_deltas": ((payload.get("delta") or {}).get("metrics") or {}),
+                    },
+                    "news_overlay": [],
+                    "action_suggestions_optional": [],
+                }
+                return {
+                    "ok": False,
+                    "insight": fallback,
+                    "issues": [
+                        f"json_parse_failed(mode={parse_mode})",
+                        f"json_repair_failed(mode={parse_mode2})",
+                    ],
+                    "raw_text": raw,
+                    "parse_mode": parse_mode2,
+                }
 
         verified = self._verify_insight_output_light(j, payload)
         ok = bool(verified.get("ok"))
         issues = list(verified.get("issues") or [])
         cleaned = verified.get("cleaned") or j
 
-        return {"ok": ok, "insight": cleaned, "issues": issues, "raw_text": raw, "parse_mode": parse_mode}
-    
+        return {
+            "ok": ok,
+            "insight": cleaned,
+            "issues": issues,
+            "raw_text": raw,
+            "parse_mode": parse_mode,
+        }
 
 
     def _clean_evidence_list(self, ev: Any) -> List[Dict[str, Any]]:

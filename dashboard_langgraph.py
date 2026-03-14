@@ -758,7 +758,7 @@ if run_base and selected_tickers:
         current_weights=current_weights_dict,
         clarification_answers=None,
         mode="base",
-        use_llm=False,
+        use_llm=True,
         use_news=False,  # ✅ explicit
     )
 
