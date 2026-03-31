@@ -34,7 +34,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-# ✅ IMPORTANT: backend runner
+
 from portfolio_langgraph_withllm import run_graph
 
 DATA_DIR = Path("data/processed_yahoo")
@@ -90,7 +90,7 @@ def _safe_diff(a: Optional[float], b: Optional[float]) -> Optional[float]:
 
 def _extract_weights_and_metrics(state: Dict[str, Any]):
     """
-    ✅ Option A compatible extraction.
+     Option A compatible extraction.
     Prefer FINAL outputs:
       - optimized_weights (final selection)
       - optimized_metrics (final selection risk metrics)
@@ -163,7 +163,7 @@ def _extract_weights_and_metrics(state: Dict[str, Any]):
 
     return optimization_result, chosen, weights_series, portfolio_metrics
 
-
+# not used function 
 def _active_portfolio_label(is_refined: bool) -> str:
     return "Refined Portfolio" if is_refined else "Base Portfolio"
 
@@ -350,10 +350,9 @@ def _extract_news_snapshot_and_risk(state: Dict[str, Any]) -> tuple[Optional[str
     elif isinstance(state.get("news_snapshot"), str) and state["news_snapshot"].strip():  # future-proof
         snapshot_text = state["news_snapshot"].strip()
 
-    # ✅ NEW: prefer explicit risk json
+   
     risk_json = state.get("news_risk_json") if isinstance(state.get("news_risk_json"), dict) else None
     if risk_json is None:
-        # fallback legacy
         risk_json = state.get("news_signals") if isinstance(state.get("news_signals"), dict) else None
 
     # If risk_json has summary, use it as snapshot if snapshot_text missing
@@ -455,7 +454,7 @@ def _get_news_items_by_id(state: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
             eid = it.get("evidence_id")
             rid = it.get("id")
 
-            # ✅ Prefer evidence_id key
+            
             if eid is not None and str(eid).strip():
                 out[str(eid)] = it
 
@@ -470,7 +469,7 @@ def _render_action_evidence(
     news_items_by_id: Dict[str, Dict[str, Any]],
     universe_tickers: List[str],
 ):
-    # ✅ 1) Prefer structured evidence list (your backend output)
+    #  1) Prefer structured evidence list (your backend output)
     ev_list = action.get("evidence")
     eids: List[str] = []
 
@@ -482,7 +481,7 @@ def _render_action_evidence(
             if eid:
                 eids.append(eid)
 
-    # ✅ 2) Fallback legacy field if present
+    #  2) Fallback legacy field if present
     if not eids:
         raw_eids = action.get("evidence_ids") or []
         if isinstance(raw_eids, list):
@@ -508,7 +507,7 @@ def _render_action_evidence(
         summary = str(item.get("summary") or "").strip()
         url = str(item.get("url") or "").strip()
 
-        # ✅ Cross-mention detection (headline + summary)
+        #  Cross-mention detection (headline + summary)
         mentioned = _detect_mentioned_tickers(f"{headline} {summary}", universe_tickers)
         # item’in kendi ticker’ını “mentions”tan çıkar
         also_mentions = [t for t in mentioned if t != ticker.upper()]
@@ -530,7 +529,7 @@ def _render_action_evidence(
     st.markdown("\n".join(lines))
 
 
-# ✅ NEW: Insight rendering helpers (supports narrative raw_text)
+#  NEW: Insight rendering helpers (supports narrative raw_text)
 def _insight_section(state: Dict[str, Any]):
     insight = state.get("insight")
     ok = state.get("insight_ok")
@@ -557,7 +556,7 @@ def _insight_section(state: Dict[str, Any]):
             for it in issues:
                 st.write(f"- {it}")
 
-    # ✅ Prefer narrative text if present
+    #  Prefer narrative text if present
     if isinstance(raw_text, str) and raw_text.strip():
         st.markdown(raw_text)
         return
@@ -615,7 +614,7 @@ def _insight_section(state: Dict[str, Any]):
                 st.write(f"- {a.strip()}")
 
 
-# ---------------- PAGE ----------------
+# ---------------- Streamlit Page ----------------
 st.set_page_config(page_title="Financial Risk & Portfolio Optimizer", layout="wide")
 
 st.markdown(
@@ -653,7 +652,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Session state placeholders
+
 if "base_state" not in st.session_state:
     st.session_state["base_state"] = None
 if "refined_state" not in st.session_state:
@@ -677,7 +676,7 @@ col_left, col_mid, col_right = st.columns([1.25, 1.05, 1.05])
 # ---------------- LEFT: CONTROLS ----------------
 with col_left:
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown('<div class="section-title">🎛 Setup</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title"> Setup</div>', unsafe_allow_html=True)
 
     all_tickers = load_available_tickers()
 
@@ -688,7 +687,7 @@ with col_left:
     )
 
     st.markdown(
-        '<div class="section-title" style="margin-top:0.8rem;">🧾 Current Portfolio (optional)</div>',
+        '<div class="section-title" style="margin-top:0.8rem;"> Current Portfolio (optional)</div>',
         unsafe_allow_html=True,
     )
     use_current = st.checkbox("I have an existing portfolio (compare vs optimized)", value=False)
@@ -731,7 +730,7 @@ with col_left:
         current_weights_dict = _safe_normalize_current_inputs(st.session_state["current_input_df"], current_mode)
 
     st.markdown(
-        '<div class="section-title" style="margin-top:0.8rem;">⚙️ Optimization settings</div>',
+        '<div class="section-title" style="margin-top:0.8rem;"> Optimization settings</div>',
         unsafe_allow_html=True,
     )
 
@@ -745,7 +744,7 @@ with col_left:
     )
     w_max = st.slider("Max weight per asset (hard cap)", min_value=0.05, max_value=1.00, value=0.30, step=0.05)
 
-    run_base = st.button("🧱 Run Base Portfolio", use_container_width=True)
+    run_base = st.button(" Run Base Portfolio", use_container_width=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
 # ---------------- RUN BASE ----------------
@@ -759,7 +758,7 @@ if run_base and selected_tickers:
         clarification_answers=None,
         mode="base",
         use_llm=True,
-        use_news=False,  # ✅ explicit
+        use_news=False,  
     )
 
     st.session_state["base_state"] = base_state
@@ -776,7 +775,7 @@ st.markdown(
     <div class="card" style="margin-bottom: 1rem;">
       <div style="display:flex; justify-content:space-between; align-items:center;">
         <div>
-          <div class="header-title">📈 Financial Risk & Portfolio Optimizer</div>
+          <div class="header-title"> Financial Risk & Portfolio Optimizer</div>
           <div class="header-sub">Two-step UX: Run Base → then Refine with candidate selection + insights</div>
           <div class="header-sub" style="margin-top:0.35rem;">Currently showing: <b>{active_label}</b></div>
         </div>
@@ -925,14 +924,14 @@ if st.session_state["base_state"] is None:
 else:
     happy_ui = st.radio(
         "Are you happy with this portfolio?",
-        ["✅ Yes, this looks good", "❌ No, I’d like to adjust it"],
+        ["Yes, this looks good", "❌ No, I’d like to adjust it"],
         index=0,
         horizontal=True,
     )
     is_happy = happy_ui.startswith("✅")
 
     use_llm_refine = st.checkbox(
-        "🤖 Use LLM (choose candidate + generate insights)",
+        " Use LLM (choose candidate + generate insights)",
         value=True,
         disabled=is_happy,
         help="When enabled, the model selects the best candidate (Max-Sharpe vs Min-Variance) AND generates portfolio insights.",
@@ -941,7 +940,7 @@ else:
 
     
     st.markdown("---")
-    st.markdown('<div class="section-title">📰 News Overview (snapshot + risk)</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title"> News Overview (snapshot + risk)</div>', unsafe_allow_html=True)
 
     run_news_overview = st.button(
         "📰 Run News Overview (does not change portfolio)",
@@ -968,7 +967,7 @@ else:
             use_llm=True,
             use_news=True,
 
-            # ✅ kritik: portfolio seçimi / refine akışı değişmesin diye satisfaction=yes
+            #  kritik: portfolio seçimi / refine akışı değişmesin diye satisfaction=yes
             clarification_answers={"satisfaction": "yes", "use_news": "yes"},
 
             # insight için base/ref ilişkisi bozulmasın
@@ -982,10 +981,10 @@ else:
     
 
     st.markdown("---")
-    st.markdown('<div class="section-title">🧠 News → LLM Action List</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title"> News → LLM Action List</div>', unsafe_allow_html=True)
 
     generate_news_actions = st.button(
-        "📰 Generate Actions from News",
+        " Generate Actions from News",
         use_container_width=True,
         disabled=(st.session_state["base_state"] is None),
     )
@@ -999,7 +998,7 @@ else:
             preferences={},
             current_weights=current_weights_dict,
 
-            # ✅ IMPORTANT: news_actions is a STAGE, not a mode
+            #  IMPORTANT: news_actions is a STAGE, not a mode
             mode="refine",
             stage="news_actions",
 
@@ -1023,7 +1022,7 @@ else:
         actions = nas.get("news_actions") or []
         verifier = nas.get("news_actions_verifier")
 
-        # ✅ DEBUG: show what the news_actions run actually produced
+        #  DEBUG: show what the news_actions run actually produced
         with st.expander("🔍 Debug notes (News Actions run)"):
             for n in (nas.get("debug_notes") or []):
                 st.write(f"- {n}")
@@ -1035,7 +1034,7 @@ else:
             st.json(nas.get("news_risk_json") or {})
         
         if verifier:
-            with st.expander("✅ Verifier output"):
+            with st.expander(" Verifier output"):
                 st.json(verifier)
 
         if not actions:
@@ -1070,7 +1069,7 @@ else:
 
                 action_labels.append(label)
 
-            # ✅ 1) Selection UI (aynı kalsın)
+            #  1) Selection UI (aynı kalsın)
             picked = st.multiselect(
                 "Select actions to apply in Refine",
                 options=action_labels,
@@ -1096,7 +1095,7 @@ else:
                     else:
                         st.write(a)
                         
-            # ✅ 3) Evidence Snapshot (only evidence referenced by actions)
+            #  3) Evidence Snapshot (only evidence referenced by actions)
             st.markdown("---")
             st.markdown("#### 🧾 Evidence Snapshot (linked to actions)")
 
@@ -1117,7 +1116,7 @@ else:
                 st.caption("No evidence snapshot available (missing `news_evidence_snapshot_text`).")
 
             if ev_issues:
-                with st.expander("⚠️ Evidence snapshot issues"):
+                with st.expander(" Evidence snapshot issues"):
                     for it in ev_issues:
                         st.write(f"- {it}")
 
@@ -1190,7 +1189,7 @@ else:
                 "Do you want to exclude them?"
             )
             confirm_exclude_from_notes = st.checkbox(
-                "✅ Exclude tickers mentioned in notes",
+                " Exclude tickers mentioned in notes",
                 value=False,
                 help="This adds them to excluded assets only with explicit confirmation.",
             )
@@ -1202,7 +1201,7 @@ else:
                     if t not in excluded_assets:
                         excluded_assets.append(t)
 
-        apply_refine = st.button("✅ Run Candidate Selection (Refine)", use_container_width=True)
+        apply_refine = st.button(" Run Candidate Selection (Refine)", use_container_width=True)
 
         if apply_refine and selected_tickers:
             refined_answers = {
