@@ -48,6 +48,16 @@ _ALLOWED_NEWS_ACTION_TYPES = {
     "reduce_exposure",
     "hedge",
 }
+# =========================================================
+# CHATBOT command intents (dashboard action layer)
+# =========================================================
+_ALLOWED_CHAT_INTENTS = {
+    "run_base_portfolio",
+    "run_news_overview",
+    "generate_news_actions",
+    "run_refine_candidate_selection",
+}
+
 
 # =========================================================
 # Small helpers
@@ -264,6 +274,134 @@ def _extract_metric_table(ctx: Dict[str, Any], available: List[str]) -> Dict[str
     cand_map = (ctx.get("candidates") or {})
     return {k: ((cand_map.get(k) or {}).get("metrics") or {}) for k in available}
 
+def _extract_excluded_assets_from_text(message: str, selected_tickers: List[str]) -> List[str]:
+    if not message:
+        return []
+    text_u = str(message).upper()
+    found = []
+    for t in selected_tickers or []:
+        tt = str(t).upper().strip()
+        if tt and tt in text_u and tt not in found:
+            found.append(tt)
+    return found
+
+
+def _infer_chat_pain_points(message: str) -> List[str]:
+    s = str(message or "").lower()
+    out: List[str] = []
+
+    risk_words = [
+        "too risky", "risky", "safer", "more safe", "lower risk",
+        "less risk", "smoother", "smooth", "avoid drawdown",
+        "avoid drawdowns", "drawdown", "drawdowns", "defensive",
+    ]
+    conservative_words = [
+        "too conservative", "more return", "higher return",
+        "more aggressive", "aggressive", "higher risk",
+    ]
+    concentrated_words = [
+        "too concentrated", "concentrated", "more diversified",
+        "diversified", "better diversified", "spread out",
+    ]
+    dislike_words = [
+        "exclude", "remove", "do not include", "don't include",
+        "i don't like", "i do not like",
+    ]
+    unsure_words = [
+        "not sure", "unsure", "something safer", "something smoother",
+    ]
+
+    if any(w in s for w in risk_words):
+        out.append(PP_TOO_RISKY)
+    if any(w in s for w in conservative_words):
+        out.append(PP_TOO_CONSERVATIVE)
+    if any(w in s for w in concentrated_words):
+        out.append(PP_TOO_CONCENTRATED)
+    if any(w in s for w in dislike_words):
+        out.append(PP_DISLIKE_ASSETS)
+    if any(w in s for w in unsure_words):
+        out.append(PP_NOT_SURE)
+
+    # de-dup preserve order
+    seen = set()
+    clean = []
+    for x in out:
+        if x not in seen:
+            seen.add(x)
+            clean.append(x)
+    return clean
+
+
+def _sanitize_chat_command_result(
+    result: Dict[str, Any],
+    *,
+    selected_tickers: List[str],
+    original_message: str,
+) -> Dict[str, Any]:
+    supported = bool(result.get("supported"))
+    intent = str(result.get("intent") or "").strip()
+    params = result.get("parameters") if isinstance(result.get("parameters"), dict) else {}
+
+    if intent == "unsupported" or (not supported):
+        return {
+            "supported": False,
+            "intent": "unsupported",
+            "parameters": {},
+            "reply": (
+                "This assistant is limited to portfolio optimization, news-based analysis, "
+                "and refinement tasks inside this dashboard."
+            ),
+        }
+
+    if intent not in _ALLOWED_CHAT_INTENTS:
+        return {
+            "supported": False,
+            "intent": "unsupported",
+            "parameters": {},
+            "reply": (
+                "This assistant is limited to portfolio optimization, news-based analysis, "
+                "and refinement tasks inside this dashboard."
+            ),
+        }
+
+    if intent == "run_refine_candidate_selection":
+        pain_points = params.get("pain_points")
+        if not isinstance(pain_points, list):
+            pain_points = []
+        pain_points = [str(x) for x in pain_points if str(x).strip()]
+
+        inferred_pp = _infer_chat_pain_points(original_message)
+        for pp in inferred_pp:
+            if pp not in pain_points:
+                pain_points.append(pp)
+
+        excluded_assets = params.get("excluded_assets")
+        if not isinstance(excluded_assets, list):
+            excluded_assets = []
+        excluded_assets = [str(x).upper().strip() for x in excluded_assets if str(x).strip()]
+
+        inferred_excluded = _extract_excluded_assets_from_text(original_message, selected_tickers)
+        for t in inferred_excluded:
+            if t not in excluded_assets:
+                excluded_assets.append(t)
+
+        extra_notes = str(params.get("extra_notes") or "").strip()
+        if not extra_notes:
+            extra_notes = str(original_message or "").strip()
+
+        params = {
+            "satisfaction": "no",
+            "pain_points": pain_points,
+            "excluded_assets": excluded_assets,
+            "extra_notes": extra_notes,
+        }
+
+    return {
+        "supported": True,
+        "intent": intent,
+        "parameters": params,
+        "reply": str(result.get("reply") or "").strip(),
+    }
 
 # =========================================================
 # Configs
@@ -385,11 +523,135 @@ class LLMClient:
         if self.provider == "hf":
             return self._chat_hf(system, user)
         return self._chat_ollama(system, user)
+    
+    # =========================================================
+    # NEW: Dashboard chat command interpreter
+    # =========================================================
+    def interpret_dashboard_chat_command(
+            self,
+            *,
+            message: str,
+            selected_tickers: Optional[List[str]] = None,
+        ) -> Dict[str, Any]:
+            """
+            Interprets a dashboard chat message into a supported dashboard action.
+
+            Output schema:
+            {
+            "supported": bool,
+            "intent": "run_base_portfolio" | "run_news_overview" | "generate_news_actions" | "run_refine_candidate_selection" | "unsupported",
+            "parameters": {...},
+            "reply": "optional assistant reply"
+            }
+            """
+            selected_tickers = selected_tickers or []
+            msg = str(message or "").strip()
+
+            if not msg:
+                return {
+                    "supported": False,
+                    "intent": "unsupported",
+                    "parameters": {},
+                    "reply": "Please enter a portfolio-related command.",
+                }
+
+            system = (
+                "You are a command interpreter for a portfolio dashboard chatbot.\n"
+                "You are NOT a general assistant.\n"
+                "Your job is to map the user's message into ONE supported dashboard intent.\n"
+                "\n"
+                "Supported intents:\n"
+                "- run_base_portfolio\n"
+                "- run_news_overview\n"
+                "- generate_news_actions\n"
+                "- run_refine_candidate_selection\n"
+                "- unsupported\n"
+                "\n"
+                "Rules:\n"
+                "- If the message is not about portfolio optimization, portfolio refinement, news overview, or news-based actions, return unsupported.\n"
+                "- Do NOT answer the user's question directly.\n"
+                "- Return ONLY valid JSON.\n"
+                "- No markdown.\n"
+                "- No extra text.\n"
+                "\n"
+                "Critical mapping rules:\n"
+                "- If the user says exclude, remove, drop, without, do not include, or don't include, "
+                "and mentions one or more tickers from selected_tickers, you MUST return intent='run_refine_candidate_selection'.\n"
+                "- In that case, parameters.excluded_assets MUST include the mentioned ticker symbols.\n"
+                "- In that case, parameters.pain_points SHOULD include 'I don’t like some of the assets'.\n"
+                "- Do NOT map explicit asset exclusion requests to run_news_overview.\n"
+                "- Do NOT map explicit asset exclusion requests to generate_news_actions.\n"
+                "- Do NOT map explicit asset exclusion requests to run_base_portfolio.\n"
+                "- If the user asks to make the portfolio safer, smoother, less risky, more defensive, or lower risk, "
+                "return intent='run_refine_candidate_selection'.\n"
+                "- If the user asks for a news snapshot, news risk check, or news overview without asking to change the portfolio, "
+                "return intent='run_news_overview'.\n"
+                "- If the user asks to generate actions or proposals from news, return intent='generate_news_actions'.\n"
+                "- If the user asks to create or run the first portfolio, return intent='run_base_portfolio'.\n"
+                "Schema:\n"
+                "{\n"
+                '  "supported": true|false,\n'
+                '  "intent": "run_base_portfolio"|"run_news_overview"|"generate_news_actions"|"run_refine_candidate_selection"|"unsupported",\n'
+                '  "parameters": {\n'
+                '     "pain_points": [string],\n'
+                '     "excluded_assets": [string],\n'
+                '     "extra_notes": string\n'
+                "  },\n"
+                '  "reply": string\n'
+                "}\n"
+                "\n"
+                "Intent guidance:\n"
+                "- run_base_portfolio: user wants to create/run/generate the initial/base portfolio.\n"
+                "- run_news_overview: user wants a news snapshot, news risk check, or news overview without changing the portfolio.\n"
+                "- generate_news_actions: user wants actions/proposals generated from the news.\n"
+                "- run_refine_candidate_selection: user is unhappy with the portfolio and wants refinement, adjustments, safer/smoother portfolio, exclusions, or changes.\n"
+                "- unsupported: anything outside this dashboard scope.\n"
+            )
+
+            user = json.dumps(
+                {
+                    "message": msg,
+                    "selected_tickers": [str(t) for t in selected_tickers],
+                },
+                ensure_ascii=False,
+            )
+
+            raw = (self.chat(system=system, user=user) or "").strip()
+            j, parse_mode = self._parse_json_best_effort(raw)
+
+            if not isinstance(j, dict):
+                # deterministic fallback
+                s = msg.lower()
+
+                if any(x in s for x in ["refine", "adjust", "change this portfolio", "make it safer", "make it smoother", "exclude"]):
+                    j = {"supported": True, "intent": "run_refine_candidate_selection", "parameters": {}, "reply": ""}
+                elif any(x in s for x in ["news action", "actions from news", "generate actions"]):
+                    j = {"supported": True, "intent": "generate_news_actions", "parameters": {}, "reply": ""}
+                elif any(x in s for x in ["news overview", "news snapshot", "news risk", "analyze news", "show news"]):
+                    j = {"supported": True, "intent": "run_news_overview", "parameters": {}, "reply": ""}
+                elif any(x in s for x in ["run base", "base portfolio", "initial portfolio", "create portfolio", "generate portfolio"]):
+                    j = {"supported": True, "intent": "run_base_portfolio", "parameters": {}, "reply": ""}
+                else:
+                    j = {"supported": False, "intent": "unsupported", "parameters": {}, "reply": ""}
+
+            out = _sanitize_chat_command_result(
+                j,
+                selected_tickers=selected_tickers,
+                original_message=msg,
+            )
+
+            if os.getenv("LLM_DEBUG_CHAT_INTENT", "0") == "1":
+                print("\n===== LLM DEBUG: CHAT COMMAND =====")
+                print("raw:", raw)
+                print("parse_mode:", parse_mode)
+                print(json.dumps(out, indent=2))
+                print("===================================\n")
+
+            return out
 
     # =========================================================
     # NEW: Interpret user feedback (LLM) -> tiny intent JSON
     # =========================================================
-
     def _has_meaningful_news_overlay(self, payload: Dict[str, Any]) -> bool:
         news = payload.get("news_signals") or {}
         if not isinstance(news, dict):

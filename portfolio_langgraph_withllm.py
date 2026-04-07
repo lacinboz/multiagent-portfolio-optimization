@@ -1242,17 +1242,17 @@ def node_news_snapshot_and_risk(state: PortfolioState) -> PortfolioState:
             per_ticker=per_ticker,
             max_total=max_total,
         )
-        # ✅ LLM snapshot + actions için aynı balanced listeyi state'e koy
+        
         state["news_items_llm"] = selected_raw
 
-        # ✅ evidence_map agents tarafından node_news_fetch'te hazırlandı, burada tekrar üretme
+       
         evidence_map = state.get("evidence_map") or {}
         state["debug_notes"].append(f"EvidenceMap(from_agents): items={len(evidence_map)}")
 
-        # ✅ DEBUG: show what the LLM actually saw (top K items)
+       
         try:
             cnt = Counter([str(it.get("ticker") or "").upper().strip() for it in (selected_raw or [])])
-            # remove empty ticker key if any
+           
             if "" in cnt:
                 del cnt[""]
             state["debug_notes"].append("NewsItemsPassedToLLM(counts): " + str(dict(cnt)))
@@ -1276,11 +1276,11 @@ def node_news_snapshot_and_risk(state: PortfolioState) -> PortfolioState:
         client = LLMClient()
         out = client.generate_news_snapshot(
             tickers=tickers,
-            news_raw=selected_raw,  # ✅ IMPORTANT: balanced subset
+            news_raw=selected_raw, 
             lookback_days=int((_merged_prefs(state).get("lookback_days") or 7)),
-            max_items_total=len(selected_raw),  # keep consistent with what we pass
+            max_items_total=len(selected_raw), 
         )
-        # ✅ DEBUG: formatter / snapshot quality check (step 1)
+       
         try:
             state["debug_notes"].append(f"NewsSnapshotOut: ok={out.get('ok')} parse={out.get('parse_mode')}")
             st_preview = (str(out.get("snapshot_text") or "")[:220]).replace("\n", " ")
@@ -1289,21 +1289,19 @@ def node_news_snapshot_and_risk(state: PortfolioState) -> PortfolioState:
             bt = rj.get("by_ticker") if isinstance(rj.get("by_ticker"), dict) else {}
             state["debug_notes"].append(f"NewsSnapshotOut(risk_by_ticker_keys): {sorted(list(bt.keys()))}")
 
-            # how many evidence_ids appear in snapshot_text?
+            
             import re
             ids = re.findall(r"\(\[([^\]]+)\]", str(out.get("snapshot_text") or ""))
             state["debug_notes"].append(f"NewsSnapshotOut(evidence_ids_in_snapshot): {len(ids)}")
         except Exception as e:
             state["debug_notes"].append(f"NewsSnapshotOut(debug_failed): {e}")
 
-        # ✅ 1) RAW snapshotı state’e koy (formatter kapalı gibi)
         raw_txt = str(out.get("raw_text") or out.get("text") or "").strip()
         snap_txt = str(out.get("snapshot_text") or "").strip()
 
-        # UI’da raw göstereceğiz (varsa raw, yoksa snapshot_text)
         state["news_snapshot_text"] = (raw_txt or snap_txt) or None
 
-        # İstersen ayrı field’e de koy:
+       
         state["news_snapshot_text_raw"] = raw_txt or None
         state["debug_notes"].append(
             f"NewsSnapshotDebug: snapshot_len={len(state.get('news_snapshot_text') or '')} "
@@ -1335,7 +1333,7 @@ def node_news_snapshot_and_risk(state: PortfolioState) -> PortfolioState:
 
             logs.append(f"SnapshotCheck: evidence_tags_found={len(ids)}")
             if not ids:
-                logs.append("SnapshotCheck: ❌ No '([EVIDENCE_ID] DATE | SOURCE)' tags found.")
+                logs.append("SnapshotCheck:  No '([EVIDENCE_ID] DATE | SOURCE)' tags found.")
                 return logs
 
             # 2) evidence_map’te var mı?

@@ -36,6 +36,7 @@ import streamlit as st
 
 
 from portfolio_langgraph_withllm import run_graph
+from llm_client import LLMClient
 
 DATA_DIR = Path("data/processed_yahoo")
 
@@ -668,6 +669,12 @@ if "selected_news_actions" not in st.session_state:
 if "news_overview_state" not in st.session_state:
     st.session_state["news_overview_state"] = None
 
+if "chat_history" not in st.session_state:
+    st.session_state["chat_history"] = []
+
+if "chat_last_command" not in st.session_state:
+    st.session_state["chat_last_command"] = None
+
 
 
 # ---------------- LAYOUT ----------------
@@ -747,8 +754,13 @@ with col_left:
     run_base = st.button(" Run Base Portfolio", use_container_width=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
-# ---------------- RUN BASE ----------------
-if run_base and selected_tickers:
+def _run_base_flow(
+    *,
+    selected_tickers: List[str],
+    rf: float,
+    w_max: float,
+    current_weights_dict: Optional[Dict[str, float]],
+):
     base_state = run_graph(
         selected_tickers=selected_tickers,
         rf=float(rf),
@@ -758,14 +770,214 @@ if run_base and selected_tickers:
         clarification_answers=None,
         mode="base",
         use_llm=True,
-        use_news=False,  
+        use_news=False,
     )
-
     st.session_state["base_state"] = base_state
     st.session_state["refined_state"] = None
     st.session_state["pain_points"] = []
+    return base_state
+
+
+def _run_news_overview_flow(
+    *,
+    selected_tickers: List[str],
+    rf: float,
+    w_max: float,
+    current_weights_dict: Optional[Dict[str, float]],
+):
+    base_state = st.session_state.get("base_state") or {}
+
+    news_overview_state = run_graph(
+        selected_tickers=selected_tickers,
+        rf=float(rf),
+        w_max=float(w_max),
+        preferences={},
+        current_weights=current_weights_dict,
+        mode="refine",
+        stage="news_overview",
+        use_llm=True,
+        use_news=True,
+        clarification_answers={"satisfaction": "yes", "use_news": "yes"},
+        base_portfolio_metrics=base_state.get("optimized_metrics"),
+        base_portfolio_weights=base_state.get("optimized_weights"),
+        base_portfolio_objective=base_state.get("objective_key"),
+    )
+
+    st.session_state["news_overview_state"] = news_overview_state
+    return news_overview_state
+
+
+def _run_news_actions_flow(
+    *,
+    selected_tickers: List[str],
+    rf: float,
+    w_max: float,
+    current_weights_dict: Optional[Dict[str, float]],
+):
+    base_state = st.session_state.get("base_state") or {}
+
+    news_actions_state = run_graph(
+        selected_tickers=selected_tickers,
+        rf=float(rf),
+        w_max=float(w_max),
+        preferences={},
+        current_weights=current_weights_dict,
+        mode="refine",
+        stage="news_actions",
+        use_llm=True,
+        use_news=True,
+        clarification_answers={"satisfaction": "yes"},
+        base_portfolio_metrics=base_state.get("optimized_metrics"),
+        base_portfolio_weights=base_state.get("optimized_weights"),
+        base_portfolio_objective=base_state.get("objective_key"),
+    )
+
+    st.session_state["news_actions_state"] = news_actions_state
+    st.session_state["selected_news_actions"] = []
+    return news_actions_state
+
+
+def _run_refine_flow(
+    *,
+    selected_tickers: List[str],
+    rf: float,
+    w_max: float,
+    current_weights_dict: Optional[Dict[str, float]],
+    pain_points: List[str],
+    excluded_assets: List[str],
+    extra_notes: str,
+    use_llm_refine: bool,
+):
+    base_state = st.session_state.get("base_state") or {}
+
+    refined_answers = {
+        "satisfaction": "no",
+        "pain_points": pain_points,
+        "excluded_assets": excluded_assets,
+        "use_news": "no",
+        "extra_notes": extra_notes,
+        "notes_tickers": _extract_tickers_from_notes(extra_notes, selected_tickers),
+        "selected_news_actions": st.session_state.get("selected_news_actions", []),
+    }
+
+    refined_state = run_graph(
+        selected_tickers=selected_tickers,
+        rf=float(rf),
+        w_max=float(w_max),
+        preferences={},
+        current_weights=current_weights_dict,
+        clarification_answers=refined_answers,
+        mode="refine",
+        use_llm=bool(use_llm_refine),
+        use_news=False,
+        base_portfolio_metrics=base_state.get("optimized_metrics"),
+        base_portfolio_weights=base_state.get("optimized_weights"),
+        base_portfolio_objective=base_state.get("objective_key"),
+    )
+
+    st.session_state["refined_state"] = refined_state
+    return refined_state
+# ---------------- RUN BASE ----------------
+if run_base and selected_tickers:
+    _run_base_flow(
+        selected_tickers=selected_tickers,
+        rf=float(rf),
+        w_max=float(w_max),
+        current_weights_dict=current_weights_dict,
+    )
     st.rerun()
 
+
+def _append_chat_message(role: str, content: str):
+    st.session_state["chat_history"].append({"role": role, "content": content})
+
+
+def _handle_chat_command(
+    *,
+    user_msg: str,
+    selected_tickers: List[str],
+    rf: float,
+    w_max: float,
+    current_weights_dict: Optional[Dict[str, float]],
+):
+    if not selected_tickers:
+        _append_chat_message("assistant", "Please select at least one ticker in the universe first.")
+        return
+
+    client = LLMClient()
+    cmd = client.interpret_dashboard_chat_command(
+        message=user_msg,
+        selected_tickers=selected_tickers,
+    )
+    st.session_state["chat_last_command"] = cmd
+
+    intent = str(cmd.get("intent") or "unsupported").strip()
+    params = cmd.get("parameters") if isinstance(cmd.get("parameters"), dict) else {}
+
+    if intent == "run_base_portfolio":
+        _run_base_flow(
+            selected_tickers=selected_tickers,
+            rf=rf,
+            w_max=w_max,
+            current_weights_dict=current_weights_dict,
+        )
+        _append_chat_message("assistant", "Base portfolio generated.")
+
+    elif intent == "run_news_overview":
+        if st.session_state.get("base_state") is None:
+            _append_chat_message("assistant", "Please run the base portfolio first, then I can generate a news overview.")
+            return
+
+        _run_news_overview_flow(
+            selected_tickers=selected_tickers,
+            rf=rf,
+            w_max=w_max,
+            current_weights_dict=current_weights_dict,
+        )
+        _append_chat_message("assistant", "News overview generated.")
+
+    elif intent == "generate_news_actions":
+        if st.session_state.get("base_state") is None:
+            _append_chat_message("assistant", "Please run the base portfolio first, then I can generate actions from the news.")
+            return
+
+        out = _run_news_actions_flow(
+            selected_tickers=selected_tickers,
+            rf=rf,
+            w_max=w_max,
+            current_weights_dict=current_weights_dict,
+        )
+        n_actions = len((out or {}).get("news_actions") or [])
+        _append_chat_message("assistant", f"I generated {n_actions} news-based action(s). You can review and select them below.")
+
+    elif intent == "run_refine_candidate_selection":
+        if st.session_state.get("base_state") is None:
+            _append_chat_message("assistant", "Please run the base portfolio first, then I can refine it.")
+            return
+
+        pain_points = params.get("pain_points") if isinstance(params.get("pain_points"), list) else []
+        pain_points = [str(x) for x in pain_points if str(x).strip()]
+        excluded_assets = params.get("excluded_assets") if isinstance(params.get("excluded_assets"), list) else []
+        excluded_assets = [str(x).upper().strip() for x in excluded_assets if str(x).strip()]
+        extra_notes = str(params.get("extra_notes") or user_msg).strip()
+
+        _run_refine_flow(
+            selected_tickers=selected_tickers,
+            rf=rf,
+            w_max=w_max,
+            current_weights_dict=current_weights_dict,
+            pain_points=pain_points,
+            excluded_assets=excluded_assets,
+            extra_notes=extra_notes,
+            use_llm_refine=True
+        )
+        _append_chat_message("assistant", "Portfolio refined based on your message.")
+
+    else:
+        reply = str(cmd.get("reply") or "").strip()
+        if not reply:
+            reply = "This chatbot can help with base portfolio generation, news overview, news actions, and portfolio refinement."
+        _append_chat_message("assistant", reply)
 # ---------------- HEADER ----------------
 is_refined_active = st.session_state["refined_state"] is not None
 active_label = "Refined Portfolio" if is_refined_active else "Base Portfolio"
@@ -922,99 +1134,30 @@ if st.session_state["base_state"] is None:
     st.info("Run **Base Portfolio** first. Then you can refine using candidate selection + insights.")
     st.markdown("</div>", unsafe_allow_html=True)  # close card
 else:
-    happy_ui = st.radio(
-        "Are you happy with this portfolio?",
-        ["Yes, this looks good", "❌ No, I’d like to adjust it"],
-        index=0,
-        horizontal=True,
-    )
-    is_happy = happy_ui.startswith("✅")
+    st.caption("News snapshot & risk check is optional. Chat-based refine does not use news unless explicitly requested.")
 
-    use_llm_refine = st.checkbox(
-        " Use LLM (choose candidate + generate insights)",
-        value=True,
-        disabled=is_happy,
-        help="When enabled, the model selects the best candidate (Max-Sharpe vs Min-Variance) AND generates portfolio insights.",
-    )
-    st.caption("News snapshot & risk check is enabled by default.")
-
-    
     st.markdown("---")
-    st.markdown('<div class="section-title"> News Overview (snapshot + risk)</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">💬 Portfolio Chatbot</div>', unsafe_allow_html=True)
 
-    run_news_overview = st.button(
-        "📰 Run News Overview (does not change portfolio)",
-        use_container_width=True,
-        disabled=(st.session_state["base_state"] is None),
+    for msg in st.session_state.get("chat_history", []):
+        with st.chat_message(msg["role"]):
+            st.write(msg["content"])
+
+    chat_msg = st.chat_input(
+        "Ask something like: build the base portfolio, show news overview, generate actions from news, make it safer, exclude NVDA"
     )
 
-    if run_news_overview and selected_tickers:
-        # Hangi portfolio “aktif” ise (refined varsa refined, yoksa base) onu referans al
-        active_state = st.session_state.get("refined_state") or st.session_state.get("base_state") or {}
-        base_state = st.session_state.get("base_state") or {}
-
-        news_overview_state = run_graph(
+    if chat_msg:
+        _append_chat_message("user", chat_msg)
+        _handle_chat_command(
+            user_msg=chat_msg,
             selected_tickers=selected_tickers,
             rf=float(rf),
             w_max=float(w_max),
-            preferences={},
-            current_weights=current_weights_dict,
-
-            mode="refine",
-            stage="news_overview",
-
-            # backend zaten stage=news_overview’da force ediyor ama açık yazmak iyi
-            use_llm=True,
-            use_news=True,
-
-            #  kritik: portfolio seçimi / refine akışı değişmesin diye satisfaction=yes
-            clarification_answers={"satisfaction": "yes", "use_news": "yes"},
-
-            # insight için base/ref ilişkisi bozulmasın
-            base_portfolio_metrics=(base_state.get("optimized_metrics")),
-            base_portfolio_weights=(base_state.get("optimized_weights")),
-            base_portfolio_objective=(base_state.get("objective_key")),
+            current_weights_dict=current_weights_dict,
         )
-
-        st.session_state["news_overview_state"] = news_overview_state
         st.rerun()
-    
 
-    st.markdown("---")
-    st.markdown('<div class="section-title"> News → LLM Action List</div>', unsafe_allow_html=True)
-
-    generate_news_actions = st.button(
-        " Generate Actions from News",
-        use_container_width=True,
-        disabled=(st.session_state["base_state"] is None),
-    )
-
-    if generate_news_actions and selected_tickers:
-        base_state = st.session_state.get("base_state") or {}
-        news_actions_state = run_graph(
-            selected_tickers=selected_tickers,
-            rf=float(rf),
-            w_max=float(w_max),
-            preferences={},
-            current_weights=current_weights_dict,
-
-            #  IMPORTANT: news_actions is a STAGE, not a mode
-            mode="refine",
-            stage="news_actions",
-
-            use_llm=True,
-            use_news=True,
-
-            # (opsiyonel ama iyi) UI stop olmasın diye
-            clarification_answers={"satisfaction": "yes"},
-
-            base_portfolio_metrics=base_state.get("optimized_metrics"),
-            base_portfolio_weights=base_state.get("optimized_weights"),
-            base_portfolio_objective=base_state.get("objective_key"),
-        )
-        st.session_state["news_actions_state"] = news_actions_state
-        st.session_state["selected_news_actions"] = []
-        st.rerun()
 
 
     nas = st.session_state.get("news_actions_state")
@@ -1069,13 +1212,7 @@ else:
 
                 action_labels.append(label)
 
-            #  1) Selection UI (aynı kalsın)
-            picked = st.multiselect(
-                "Select actions to apply in Refine",
-                options=action_labels,
-                default=st.session_state.get("selected_news_actions", []),
-            )
-            st.session_state["selected_news_actions"] = picked
+            
 
             # ✅ 2) Evidence rendering (seçimden bağımsız olarak her action altında göster)
             st.markdown("---")
@@ -1130,136 +1267,7 @@ else:
 
     st.markdown("---")
 
-    if is_happy:
-        st.success("Keeping the current portfolio as-is (ACCEPT).")
-        st.caption("If you change your mind, select “No” above to compare alternatives.")
-    else:
-        st.markdown(
-            '<div class="section-title" style="margin-top:0.6rem;">What doesn’t feel right?</div>',
-            unsafe_allow_html=True,
-        )
 
-        current_pp = list(st.session_state.get("pain_points", []))
-        base_options = [PP_TOO_RISKY, PP_TOO_CONSERVATIVE, PP_TOO_CONCENTRATED, PP_DISLIKE_ASSETS, PP_NOT_SURE]
-
-        if PP_NOT_SURE in current_pp:
-            pain_points = st.multiselect(
-                "Select all that apply",
-                options=[PP_NOT_SURE],
-                default=[PP_NOT_SURE],
-                help="If you’re not sure, we’ll prioritize safer / smoother candidates.",
-            )
-            pain_points = [PP_NOT_SURE]
-        else:
-            options = list(base_options)
-            if PP_TOO_RISKY in current_pp:
-                options = [o for o in options if o != PP_TOO_CONSERVATIVE]
-            if PP_TOO_CONSERVATIVE in current_pp:
-                options = [o for o in options if o != PP_TOO_RISKY]
-
-            pain_points = st.multiselect(
-                "Select all that apply (optional)",
-                options=options,
-                default=[p for p in current_pp if p in options],
-                help="Optional. If empty, your notes still help the LLM choose a candidate.",
-            )
-
-        pain_points = _sanitize_pain_points(pain_points)
-        st.session_state["pain_points"] = pain_points
-
-        excluded_assets: list[str] = []
-        if PP_DISLIKE_ASSETS in pain_points:
-            excluded_assets = st.multiselect(
-                "Which assets would you like to exclude?",
-                options=selected_tickers,
-                default=[],
-            )
-
-        extra_notes = st.text_area(
-            "Extra notes (optional, free text)",
-            placeholder="e.g. I don't want big drawdowns, keep it smoother.",
-            height=90,
-        ).strip()
-
-        notes_tickers = _extract_tickers_from_notes(extra_notes, selected_tickers)
-
-        if notes_tickers and (PP_DISLIKE_ASSETS not in pain_points):
-            st.warning(
-                f"Your notes mention these tickers: {', '.join(notes_tickers)}. "
-                "Do you want to exclude them?"
-            )
-            confirm_exclude_from_notes = st.checkbox(
-                " Exclude tickers mentioned in notes",
-                value=False,
-                help="This adds them to excluded assets only with explicit confirmation.",
-            )
-            if confirm_exclude_from_notes:
-                if PP_DISLIKE_ASSETS not in pain_points:
-                    pain_points = list(set(pain_points + [PP_DISLIKE_ASSETS]))
-                    st.session_state["pain_points"] = pain_points
-                for t in notes_tickers:
-                    if t not in excluded_assets:
-                        excluded_assets.append(t)
-
-        apply_refine = st.button(" Run Candidate Selection (Refine)", use_container_width=True)
-
-        if apply_refine and selected_tickers:
-            refined_answers = {
-                "satisfaction": "no",
-                "pain_points": pain_points,
-                "excluded_assets": excluded_assets,
-                "use_news": "yes",
-                "extra_notes": extra_notes,
-                "notes_tickers": notes_tickers,
-                "selected_news_actions": st.session_state.get("selected_news_actions", []),
-            }
-
-            base_state = st.session_state.get("base_state") or {}
-            refined_state = run_graph(
-                selected_tickers=selected_tickers,
-                rf=float(rf),
-                w_max=float(w_max),
-                preferences={},
-                current_weights=current_weights_dict,
-                clarification_answers=refined_answers,
-                mode="refine",
-                use_llm=bool(use_llm_refine),
-                use_news=True,
-                base_portfolio_metrics=base_state.get("optimized_metrics"),
-                base_portfolio_weights=base_state.get("optimized_weights"),
-                base_portfolio_objective=base_state.get("objective_key"),
-            )
-
-            st.session_state["refined_state"] = refined_state
-            st.success("Refinement applied. Scroll up to see the selected candidate portfolio.")
-            st.rerun()
-
-        st.markdown("</div>", unsafe_allow_html=True)  # close card
-
-        if st.session_state.get("refined_state") is not None:
-            rs = st.session_state["refined_state"]
-            with st.expander("🔧 Selection summary (what was chosen?)"):
-                chosen = _get_chosen_candidate(rs)
-                st.write(f"Chosen candidate: **`{chosen}`**")
-
-                llm_decision = rs.get("llm_decision") or {}
-                if llm_decision:
-                    st.write("LLM decision payload:")
-                    st.json(llm_decision)
-
-                cand_keys = list((rs.get("optimization_result") or {}).keys())
-                st.write(f"Available candidates: {cand_keys}")
-
-                st.write("Insight status:")
-                st.write("Base portfolio objective passed to refine:", rs.get("base_portfolio_objective"))
-                st.write("Base portfolio metrics present:", rs.get("base_portfolio_metrics") is not None)
-                st.write(
-                    {
-                        "insight_ok": rs.get("insight_ok"),
-                        "insight_parse_mode": rs.get("insight_parse_mode"),
-                        "insight_issues_n": len(rs.get("insight_issues") or []),
-                    }
-                )
 
 st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1340,6 +1348,31 @@ with st.expander("📦 Export run logs (JSON)"):
             mime="application/json",
             use_container_width=True,
         )
+if st.session_state.get("refined_state") is not None:
+    rs = st.session_state["refined_state"]
+    with st.expander("🔧 Selection summary (what was chosen?)"):
+        chosen = _get_chosen_candidate(rs)
+        st.write(f"Chosen candidate: **`{chosen}`**")
+
+        llm_decision = rs.get("llm_decision") or {}
+        if llm_decision:
+            st.write("LLM decision payload:")
+            st.json(llm_decision)
+
+        cand_keys = list((rs.get("optimization_result") or {}).keys())
+        st.write(f"Available candidates: {cand_keys}")
+
+        st.write("Insight status:")
+        st.write("Base portfolio objective passed to refine:", rs.get("base_portfolio_objective"))
+        st.write("Base portfolio metrics present:", rs.get("base_portfolio_metrics") is not None)
+        st.write(
+            {
+                "insight_ok": rs.get("insight_ok"),
+                "insight_parse_mode": rs.get("insight_parse_mode"),
+                "insight_issues_n": len(rs.get("insight_issues") or []),
+            }
+        )
+
 
 st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1512,6 +1545,8 @@ with bottom_right:
 
         with st.expander("🧠 LLM decision (candidate selection)"):
             st.json(graph_state.get("llm_decision", {}))
+        with st.expander("💬 Chat last command"):
+            st.json(st.session_state.get("chat_last_command") or {})
 
         with st.expander("📰 News risk (raw JSON)"):
             st.json(graph_state.get("news_risk_json") or graph_state.get("news_signals") or {})

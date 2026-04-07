@@ -58,6 +58,20 @@ def run_portfolio_optimization(mu, cov, rf=0.02, w_max=0.30, lambda_l2=1e-3,
     n = len(tickers)
     print("Tickers used:", tickers)
 
+    # --- Feasibility guard for max weight constraint ---
+    min_feasible_wmax = (1.0 / n) if n > 0 else 1.0
+    effective_w_max = float(w_max)
+
+    if n * effective_w_max < 1.0:
+        effective_w_max = min_feasible_wmax + 1e-6
+        print(
+            f"[AUTO-ADJUST] Infeasible cap detected: "
+            f"n={n}, requested w_max={w_max:.4f}, "
+            f"minimum feasible={min_feasible_wmax:.4f}. "
+            f"Using effective_w_max={effective_w_max:.4f}."
+        )
+    print(f"Requested w_max: {w_max:.4f} | Effective w_max: {effective_w_max:.4f}")
+
     # --- Kovaryans PSD mi kontrol et ---
     eigvals = np.linalg.eigvalsh(cov.values)
     print("Smallest eigenvalue:", eigvals.min())
@@ -68,7 +82,7 @@ def run_portfolio_optimization(mu, cov, rf=0.02, w_max=0.30, lambda_l2=1e-3,
         cov = pd.DataFrame(cov_np, index=tickers, columns=tickers)
 
     # --- Optimizasyon ayarları ---
-    bounds = [(0.0, w_max)] * n
+    bounds = [(0.0, effective_w_max)] * n
     w0 = np.full(n, 1/n)
     constraints = [{'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0}]
 
@@ -190,6 +204,7 @@ def run_portfolio_optimization(mu, cov, rf=0.02, w_max=0.30, lambda_l2=1e-3,
         "tickers": tickers,
         "rf": rf,
         "w_max": w_max,
+        "effective_w_max": effective_w_max,
         "lambda_l2": lambda_l2,
         "minvar": {
             "success": bool(res_minvar.success),
