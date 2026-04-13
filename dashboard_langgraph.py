@@ -888,8 +888,15 @@ if run_base and selected_tickers:
     st.rerun()
 
 
-def _append_chat_message(role: str, content: str):
-    st.session_state["chat_history"].append({"role": role, "content": content})
+def _append_chat_message(role: str, content: str, kind: str = "text", payload: Optional[Dict[str, Any]] = None):
+    st.session_state["chat_history"].append(
+        {
+            "role": role,
+            "content": content,
+            "kind": kind,
+            "payload": payload or {},
+        }
+    )
 
 
 def _handle_chat_command(
@@ -928,13 +935,23 @@ def _handle_chat_command(
             _append_chat_message("assistant", "Please run the base portfolio first, then I can generate a news overview.")
             return
 
-        _run_news_overview_flow(
+        out = _run_news_overview_flow(
             selected_tickers=selected_tickers,
             rf=rf,
             w_max=w_max,
             current_weights_dict=current_weights_dict,
         )
-        _append_chat_message("assistant", "News overview generated.")
+
+        snapshot_text, risk_json = _extract_news_snapshot_and_risk(out or {})
+        _append_chat_message(
+            "assistant",
+            "News overview generated.",
+            kind="news_overview",
+            payload={
+                "snapshot_text": snapshot_text,
+                "risk_json": risk_json,
+            },
+        )
 
     elif intent == "generate_news_actions":
         if st.session_state.get("base_state") is None:
@@ -947,9 +964,19 @@ def _handle_chat_command(
             w_max=w_max,
             current_weights_dict=current_weights_dict,
         )
-        n_actions = len((out or {}).get("news_actions") or [])
-        _append_chat_message("assistant", f"I generated {n_actions} news-based action(s). You can review and select them below.")
+        actions = (out or {}).get("news_actions") or []
+        n_actions = len(actions)
 
+        _append_chat_message(
+            "assistant",
+            f"I generated {n_actions} news-based action(s).",
+            kind="news_actions",
+            payload={
+                "state": out,
+                "actions": actions,
+                "evidence_snapshot": (out or {}).get("news_evidence_snapshot_text"),
+            },
+        )
     elif intent == "run_refine_candidate_selection":
         if st.session_state.get("base_state") is None:
             _append_chat_message("assistant", "Please run the base portfolio first, then I can refine it.")
@@ -961,7 +988,7 @@ def _handle_chat_command(
         excluded_assets = [str(x).upper().strip() for x in excluded_assets if str(x).strip()]
         extra_notes = str(params.get("extra_notes") or user_msg).strip()
 
-        _run_refine_flow(
+        out = _run_refine_flow(
             selected_tickers=selected_tickers,
             rf=rf,
             w_max=w_max,
@@ -971,8 +998,58 @@ def _handle_chat_command(
             extra_notes=extra_notes,
             use_llm_refine=True
         )
-        _append_chat_message("assistant", "Portfolio refined based on your message.")
 
+        _append_chat_message(
+            "assistant",
+            "Portfolio refined based on your message.",
+            kind="refine_result",
+            payload={
+                "chosen_candidate": _get_chosen_candidate(out or {}),
+                "explanation": (out or {}).get("explanation"),
+                "insight_raw_text": (out or {}).get("insight_raw_text"),
+            },
+        )
+    elif intent == "show_final_portfolio_insight":
+        active_state = st.session_state.get("refined_state") or st.session_state.get("base_state")
+
+        if active_state is None:
+            _append_chat_message(
+                "assistant",
+                "Please run the base portfolio first, then I can explain the active portfolio."
+            )
+            return
+
+        insight_text = (active_state.get("insight_raw_text") or "").strip()
+        explanation_text = str(active_state.get("explanation") or "").strip()
+        chosen_candidate = _get_chosen_candidate(active_state)
+
+        # Prefer insight if available, otherwise fallback to explanation
+        final_text = insight_text 
+
+        if not final_text and not explanation_text:
+            _append_chat_message(
+                "assistant",
+                "No final portfolio insight is available yet.",
+                kind="final_portfolio_insight",
+                payload={
+                    "chosen_candidate": chosen_candidate,
+                    "insight_text": "",
+                    "explanation_text": "",
+                },
+            )
+            return
+
+        _append_chat_message(
+            "assistant",
+            "Here is the insight for the active portfolio.",
+            kind="final_portfolio_insight",
+            payload={
+                "chosen_candidate": chosen_candidate,
+                "insight_text": final_text,
+                "explanation_text": explanation_text,
+            },
+        )
+            
     else:
         reply = str(cmd.get("reply") or "").strip()
         if not reply:
@@ -1143,6 +1220,111 @@ else:
         with st.chat_message(msg["role"]):
             st.write(msg["content"])
 
+            kind = msg.get("kind", "text")
+            payload = msg.get("payload", {})
+
+            if kind == "news_overview":
+                snapshot = payload.get("snapshot_text")
+                risk_json = payload.get("risk_json")
+
+                if snapshot:
+                    st.markdown("**News overview**")
+                    st.write(snapshot)
+
+                if isinstance(risk_json, dict) and risk_json:
+                    glob = risk_json.get("global", {})
+                    by_ticker = risk_json.get("by_ticker", {})
+
+                    if isinstance(glob, dict) and glob:
+                        vol_regime = str(glob.get("vol_regime") or "normal")
+                        st.caption(f"Global regime: **{vol_regime}**")
+
+                    if isinstance(by_ticker, dict) and by_ticker:
+                        rows = []
+                        for t, v in by_ticker.items():
+                            if not isinstance(v, dict):
+                                continue
+                            rows.append(
+                                {
+                                    "Ticker": str(t),
+                                    "Risk flag": str(v.get("risk_flag") or "none"),
+                                    "Confidence": v.get("confidence"),
+                                }
+                            )
+                        if rows:
+                            df = pd.DataFrame(rows)
+                            df["Confidence"] = pd.to_numeric(df["Confidence"], errors="coerce")
+                            df = df.sort_values(by="Confidence", ascending=False, na_position="last")
+                            st.dataframe(df, use_container_width=True, height=220)
+
+            elif kind == "news_actions":
+                nas = payload.get("state") or {}
+                actions = payload.get("actions") or []
+                evidence_snapshot = payload.get("evidence_snapshot")
+
+                if actions:
+                    news_items_by_id = _get_news_items_by_id(nas)
+
+                    st.markdown("**Proposed actions**")
+
+                    for i, a in enumerate(actions, start=1):
+                        if isinstance(a, dict):
+                            t = str(a.get("type") or a.get("action") or "").strip()
+                            ticker = str(a.get("ticker") or "").strip()
+                            intensity = str(a.get("intensity") or "").strip()
+                            reason = str(a.get("reason") or "").strip()
+
+                            label_parts = [x for x in [t, ticker, intensity] if x]
+                            label = " | ".join(label_parts) if label_parts else f"Action #{i}"
+
+                            with st.expander(label, expanded=False):
+                                if reason:
+                                    st.write(reason)
+
+                                _render_action_evidence(
+                                    action=a,
+                                    news_items_by_id=news_items_by_id,
+                                    universe_tickers=selected_tickers,
+                                )
+                        else:
+                            st.write(f"- {a}")
+
+                if evidence_snapshot:
+                    st.markdown("**Evidence snapshot**")
+                    st.markdown(evidence_snapshot)
+
+            elif kind == "refine_result":
+                chosen = payload.get("chosen_candidate")
+                explanation = payload.get("explanation")
+                insight_text = payload.get("insight_raw_text")
+
+                st.markdown("**Refine result**")
+                if chosen:
+                    st.write(f"Chosen candidate: `{chosen}`")
+                if explanation:
+                    st.write(explanation)
+                if insight_text:
+                    st.markdown("**Insight**")
+                    st.markdown(insight_text)
+
+            elif kind == "final_portfolio_insight":
+                chosen = payload.get("chosen_candidate")
+                insight_text = payload.get("insight_text")
+                explanation_text = payload.get("explanation_text")
+
+                st.markdown("**Final portfolio insight**")
+                if chosen:
+                    st.write(f"Active candidate: `{chosen}`")
+
+                if insight_text:
+                    st.markdown(insight_text)
+                else:
+                    st.write("No insight text available.")
+
+                if explanation_text:
+                    with st.expander("Show technical explanation"):
+                        st.write(explanation_text)
+
     chat_msg = st.chat_input(
         "Ask something like: build the base portfolio, show news overview, generate actions from news, make it safer, exclude NVDA"
     )
@@ -1157,112 +1339,6 @@ else:
             current_weights_dict=current_weights_dict,
         )
         st.rerun()
-
-
-
-    nas = st.session_state.get("news_actions_state")
-    if nas is not None:
-        actions = nas.get("news_actions") or []
-        verifier = nas.get("news_actions_verifier")
-
-        #  DEBUG: show what the news_actions run actually produced
-        with st.expander("🔍 Debug notes (News Actions run)"):
-            for n in (nas.get("debug_notes") or []):
-                st.write(f"- {n}")
-
-        with st.expander("🧾 News snapshot text (debug)"):
-            st.write(nas.get("news_snapshot_text"))
-
-        with st.expander("🧾 News risk json (debug)"):
-            st.json(nas.get("news_risk_json") or {})
-        
-        if verifier:
-            with st.expander(" Verifier output"):
-                st.json(verifier)
-
-        if not actions:
-            st.info("No news actions found. (Backend should return state['news_actions'] list.)")
-        else:
-            news_items_by_id = _get_news_items_by_id(nas)
-
-            action_labels = []
-            for i, a in enumerate(actions):
-                if isinstance(a, dict):
-                    t = str(a.get("type") or a.get("action") or "").strip()
-                    ticker = str(a.get("ticker") or "").strip()
-                    value = a.get("value", None)
-                    intensity = str(a.get("intensity") or "").strip()
-                    reason = str(a.get("reason") or "").strip()
-
-                    parts = []
-                    if t:
-                        parts.append(t)
-                    if ticker:
-                        parts.append(ticker)
-                    if value is not None:
-                        parts.append(f"value={value}")
-                    if intensity:
-                        parts.append(f"intensity={intensity}")
-                    label = " | ".join(parts) if parts else f"Action #{i+1}"
-
-                    if reason:
-                        label += f" — {reason}"
-                else:
-                    label = str(a)
-
-                action_labels.append(label)
-
-            
-
-            # ✅ 2) Evidence rendering (seçimden bağımsız olarak her action altında göster)
-            st.markdown("---")
-            st.markdown("#### Proposed actions (with evidence)")
-
-            for i, a in enumerate(actions):
-                label = action_labels[i] if i < len(action_labels) else f"Action #{i+1}"
-                with st.expander(label, expanded=False):
-                    if isinstance(a, dict):
-                        st.write(a.get("reason", ""))
-                        _render_action_evidence(
-                            action=a,
-                            news_items_by_id=news_items_by_id,
-                            universe_tickers=selected_tickers,  # veya all_tickers
-                        )
-
-                    else:
-                        st.write(a)
-                        
-            #  3) Evidence Snapshot (only evidence referenced by actions)
-            st.markdown("---")
-            st.markdown("#### 🧾 Evidence Snapshot (linked to actions)")
-
-            ev_text = nas.get("news_evidence_snapshot_text")
-            ev_ok = nas.get("news_evidence_snapshot_ok")
-            ev_issues = nas.get("news_evidence_snapshot_issues") or []
-
-            if isinstance(ev_ok, bool):
-                if ev_ok:
-                    st.success("Evidence snapshot generated.")
-                else:
-                    st.warning("Evidence snapshot had issues (showing best-effort output).")
-
-            if isinstance(ev_text, str) and ev_text.strip():
-                # text is already formatted by backend (usually multi-line)
-                st.markdown(ev_text)
-            else:
-                st.caption("No evidence snapshot available (missing `news_evidence_snapshot_text`).")
-
-            if ev_issues:
-                with st.expander(" Evidence snapshot issues"):
-                    for it in ev_issues:
-                        st.write(f"- {it}")
-
-            with st.expander("Raw proposed actions (debug)"):
-                st.json(actions)
-
-            with st.expander("News items by id (debug)"):
-                st.write(f"items: {len(news_items_by_id)}")
-                st.json(dict(list(news_items_by_id.items())[:5]))
 
 
     st.markdown("---")
@@ -1530,29 +1606,16 @@ with bottom_right:
     if graph_state is None:
         st.info("News, insight & explanation will appear after base/refine.")
     else:
-        # ✅ News panel
-        news_state = st.session_state.get("news_overview_state") or graph_state
-        _news_section(news_state)
-
-        st.markdown("---")
-
-        # ✅ Insight panel
-        _insight_section(graph_state)
-
-        st.markdown("---")
-        st.markdown(f'<div class="section-title">💬 Explanation — {active_label}</div>', unsafe_allow_html=True)
-        st.write(graph_state.get("explanation", "No explanation generated."))
-
-        with st.expander("🧠 LLM decision (candidate selection)"):
+        with st.expander(" LLM decision (candidate selection)"):
             st.json(graph_state.get("llm_decision", {}))
-        with st.expander("💬 Chat last command"):
+        with st.expander(" Chat last command"):
             st.json(st.session_state.get("chat_last_command") or {})
 
-        with st.expander("📰 News risk (raw JSON)"):
+        with st.expander(" News risk (raw JSON)"):
             st.json(graph_state.get("news_risk_json") or graph_state.get("news_signals") or {})
 
 
-        with st.expander("🔍 Debug notes (graph trace)"):
+        with st.expander(" Debug notes (graph trace)"):
             notes = graph_state.get("debug_notes", [])
             if not notes:
                 st.write("No debug notes.")

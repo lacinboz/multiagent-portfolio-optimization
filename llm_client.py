@@ -56,6 +56,8 @@ _ALLOWED_CHAT_INTENTS = {
     "run_news_overview",
     "generate_news_actions",
     "run_refine_candidate_selection",
+    "show_final_portfolio_insight",
+
 }
 
 
@@ -348,8 +350,8 @@ def _sanitize_chat_command_result(
             "intent": "unsupported",
             "parameters": {},
             "reply": (
-                "This assistant is limited to portfolio optimization, news-based analysis, "
-                "and refinement tasks inside this dashboard."
+                "This assistant is limited to portfolio optimization, portfolio insights, "
+                "news-based analysis, and refinement tasks inside this dashboard."
             ),
         }
 
@@ -533,13 +535,14 @@ class LLMClient:
             message: str,
             selected_tickers: Optional[List[str]] = None,
         ) -> Dict[str, Any]:
+
             """
             Interprets a dashboard chat message into a supported dashboard action.
 
             Output schema:
             {
             "supported": bool,
-            "intent": "run_base_portfolio" | "run_news_overview" | "generate_news_actions" | "run_refine_candidate_selection" | "unsupported",
+            "intent": "run_base_portfolio" | "run_news_overview" | "generate_news_actions" | "run_refine_candidate_selection" | "show_final_portfolio_insight" | "unsupported",
             "parameters": {...},
             "reply": "optional assistant reply"
             }
@@ -565,10 +568,10 @@ class LLMClient:
                 "- run_news_overview\n"
                 "- generate_news_actions\n"
                 "- run_refine_candidate_selection\n"
+                "- show_final_portfolio_insight\n"
                 "- unsupported\n"
-                "\n"
                 "Rules:\n"
-                "- If the message is not about portfolio optimization, portfolio refinement, news overview, or news-based actions, return unsupported.\n"
+                "- If the message is not about portfolio optimization, portfolio refinement, final portfolio insight, news overview, or news-based actions, return unsupported.\n"
                 "- Do NOT answer the user's question directly.\n"
                 "- Return ONLY valid JSON.\n"
                 "- No markdown.\n"
@@ -587,11 +590,13 @@ class LLMClient:
                 "- If the user asks for a news snapshot, news risk check, or news overview without asking to change the portfolio, "
                 "return intent='run_news_overview'.\n"
                 "- If the user asks to generate actions or proposals from news, return intent='generate_news_actions'.\n"
+                "- If the user asks for insight, explanation, interpretation, or a description of the current/final/active portfolio without asking to change it, "
+                "return intent='show_final_portfolio_insight'.\n"
                 "- If the user asks to create or run the first portfolio, return intent='run_base_portfolio'.\n"
                 "Schema:\n"
                 "{\n"
                 '  "supported": true|false,\n'
-                '  "intent": "run_base_portfolio"|"run_news_overview"|"generate_news_actions"|"run_refine_candidate_selection"|"unsupported",\n'
+                '  "intent": "run_base_portfolio"|"run_news_overview"|"generate_news_actions"|"run_refine_candidate_selection"|"show_final_portfolio_insight"|"unsupported",\n'
                 '  "parameters": {\n'
                 '     "pain_points": [string],\n'
                 '     "excluded_assets": [string],\n'
@@ -605,6 +610,7 @@ class LLMClient:
                 "- run_news_overview: user wants a news snapshot, news risk check, or news overview without changing the portfolio.\n"
                 "- generate_news_actions: user wants actions/proposals generated from the news.\n"
                 "- run_refine_candidate_selection: user is unhappy with the portfolio and wants refinement, adjustments, safer/smoother portfolio, exclusions, or changes.\n"
+                "- show_final_portfolio_insight: user wants the current/final/active portfolio to be explained, interpreted, or summarized without changing it.\n"
                 "- unsupported: anything outside this dashboard scope.\n"
             )
 
@@ -629,6 +635,13 @@ class LLMClient:
                     j = {"supported": True, "intent": "generate_news_actions", "parameters": {}, "reply": ""}
                 elif any(x in s for x in ["news overview", "news snapshot", "news risk", "analyze news", "show news"]):
                     j = {"supported": True, "intent": "run_news_overview", "parameters": {}, "reply": ""}
+
+                elif any(x in s for x in [
+                    "insight", "show insight", "portfolio insight", "final portfolio insight",
+                    "explain this portfolio", "explain the portfolio", "describe this portfolio",
+                    "describe the portfolio", "summarize this portfolio", "summarise this portfolio",  "current portfolio explanation", "active portfolio explanation"
+                ]):
+                     j = {"supported": True, "intent": "show_final_portfolio_insight", "parameters": {}, "reply": ""}
                 elif any(x in s for x in ["run base", "base portfolio", "initial portfolio", "create portfolio", "generate portfolio"]):
                     j = {"supported": True, "intent": "run_base_portfolio", "parameters": {}, "reply": ""}
                 else:
