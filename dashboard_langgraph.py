@@ -666,6 +666,8 @@ if "news_actions_state" not in st.session_state:
     st.session_state["news_actions_state"] = None
 if "selected_news_actions" not in st.session_state:
     st.session_state["selected_news_actions"] = []
+if "temp_selected_actions" not in st.session_state:
+    st.session_state["temp_selected_actions"] = []
 if "news_overview_state" not in st.session_state:
     st.session_state["news_overview_state"] = None
 
@@ -859,6 +861,9 @@ def _run_refine_flow(
         "notes_tickers": _extract_tickers_from_notes(extra_notes, selected_tickers),
         "selected_news_actions": st.session_state.get("selected_news_actions", []),
     }
+    print("\n===== FRONTEND DEBUG: refined_answers sent to run_graph =====")
+    print(json.dumps(refined_answers, indent=2, default=str))
+    print("=============================================================\n")
 
     refined_state = run_graph(
         selected_tickers=selected_tickers,
@@ -1024,7 +1029,7 @@ def _handle_chat_command(
         chosen_candidate = _get_chosen_candidate(active_state)
 
         # Prefer insight if available, otherwise fallback to explanation
-        final_text = insight_text 
+        final_text = insight_text or explanation_text
 
         if not final_text and not explanation_text:
             _append_chat_message(
@@ -1216,7 +1221,7 @@ else:
     st.markdown("---")
     st.markdown('<div class="section-title">💬 Portfolio Chatbot</div>', unsafe_allow_html=True)
 
-    for msg in st.session_state.get("chat_history", []):
+    for msg_idx, msg in enumerate(st.session_state.get("chat_history", [])):
         with st.chat_message(msg["role"]):
             st.write(msg["content"])
 
@@ -1257,6 +1262,7 @@ else:
                             df = df.sort_values(by="Confidence", ascending=False, na_position="last")
                             st.dataframe(df, use_container_width=True, height=220)
 
+
             elif kind == "news_actions":
                 nas = payload.get("state") or {}
                 actions = payload.get("actions") or []
@@ -1267,6 +1273,8 @@ else:
 
                     st.markdown("**Proposed actions**")
 
+                    selected_action_indices = []
+
                     for i, a in enumerate(actions, start=1):
                         if isinstance(a, dict):
                             t = str(a.get("type") or a.get("action") or "").strip()
@@ -1276,6 +1284,14 @@ else:
 
                             label_parts = [x for x in [t, ticker, intensity] if x]
                             label = " | ".join(label_parts) if label_parts else f"Action #{i}"
+
+                            checked = st.checkbox(
+                                f"Select: {label}",
+                                key=f"news_action_checkbox_{msg_idx}_{i}",
+                            )
+
+                            if checked:
+                                selected_action_indices.append(i - 1)
 
                             with st.expander(label, expanded=False):
                                 if reason:
@@ -1288,6 +1304,61 @@ else:
                                 )
                         else:
                             st.write(f"- {a}")
+
+                    st.session_state["temp_selected_actions"] = selected_action_indices
+
+
+                    if st.button("Apply selected actions", key=f"apply_news_actions_{msg_idx}"):
+                            selected_actions = [actions[idx] for idx in selected_action_indices]
+
+                            print("\n===== FRONTEND DEBUG: selected_actions from checkboxes =====")
+                            print(json.dumps(selected_actions, indent=2, default=str))
+                            print("===========================================================\n")
+
+                            # refine backend'e gönderilecek gerçek selection
+                            st.session_state["selected_news_actions"] = selected_actions
+
+                            print("\n===== FRONTEND DEBUG: selected_news_actions saved to session =====")
+                            print(json.dumps(st.session_state["selected_news_actions"], indent=2, default=str))
+                            print("=================================================================\n")
+
+                            _append_chat_message(
+                                "assistant",
+                                f"Applying {len(selected_actions)} selected action(s) to refine the portfolio..."
+                            )
+
+                            out = _run_refine_flow(
+                                selected_tickers=selected_tickers,
+                                rf=float(rf),
+                                w_max=float(w_max),
+                                current_weights_dict=current_weights_dict,
+                                pain_points=[],
+                                excluded_assets=[],
+                                extra_notes="Applying selected news actions",
+                                use_llm_refine=True,
+                            )
+
+                            _append_chat_message(
+                                "assistant",
+                                "Portfolio refined using selected actions.",
+                                kind="refine_result",
+                                payload={
+                                    "chosen_candidate": _get_chosen_candidate(out or {}),
+                                    "explanation": (out or {}).get("explanation"),
+                                    "insight_raw_text": (out or {}).get("insight_raw_text"),
+                                },
+                            )
+
+                            # artık eski seçim state'te kalmasın
+                            st.session_state["selected_news_actions"] = []
+                            st.session_state["temp_selected_actions"] = []
+
+                            for i in range(1, len(actions) + 1):
+                                checkbox_key = f"news_action_checkbox_{msg_idx}_{i}"
+                                if checkbox_key in st.session_state:
+                                    del st.session_state[checkbox_key]
+
+                            st.rerun()
 
                 if evidence_snapshot:
                     st.markdown("**Evidence snapshot**")
