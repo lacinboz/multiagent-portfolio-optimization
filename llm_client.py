@@ -57,6 +57,7 @@ _ALLOWED_CHAT_INTENTS = {
     "generate_news_actions",
     "run_refine_candidate_selection",
     "show_final_portfolio_insight",
+    "clarify_news_usage_mode",
 
 }
 
@@ -542,11 +543,12 @@ class LLMClient:
             Output schema:
             {
             "supported": bool,
-            "intent": "run_base_portfolio" | "run_news_overview" | "generate_news_actions" | "run_refine_candidate_selection" | "show_final_portfolio_insight" | "unsupported",
+            "intent": "run_base_portfolio" | "run_news_overview" | "generate_news_actions" | "clarify_news_usage_mode" | "run_refine_candidate_selection" | "show_final_portfolio_insight" | "unsupported",
             "parameters": {...},
             "reply": "optional assistant reply"
             }
             """
+            
             selected_tickers = selected_tickers or []
             msg = str(message or "").strip()
 
@@ -567,6 +569,7 @@ class LLMClient:
                 "- run_base_portfolio\n"
                 "- run_news_overview\n"
                 "- generate_news_actions\n"
+                "- clarify_news_usage_mode\n"
                 "- run_refine_candidate_selection\n"
                 "- show_final_portfolio_insight\n"
                 "- unsupported\n"
@@ -585,18 +588,22 @@ class LLMClient:
                 "- Do NOT map explicit asset exclusion requests to run_news_overview.\n"
                 "- Do NOT map explicit asset exclusion requests to generate_news_actions.\n"
                 "- Do NOT map explicit asset exclusion requests to run_base_portfolio.\n"
+                "- If the user asks for a news snapshot, news risk check, news summary, or news overview without asking to change the portfolio, "
+                "return intent='run_news_overview'.\n"
+                "- If the user explicitly asks to generate actions, proposals, or suggestions from news, "
+                "return intent='generate_news_actions'.\n"
+                "- If the user asks to use, include, apply, or consider news in the portfolio, refinement, or decision, "
+                "but does NOT clearly ask for a news overview and does NOT clearly ask to generate actions from news, "
+                "return intent='clarify_news_usage_mode'.\n"
                 "- If the user asks to make the portfolio safer, smoother, less risky, more defensive, or lower risk, "
                 "return intent='run_refine_candidate_selection'.\n"
-                "- If the user asks for a news snapshot, news risk check, or news overview without asking to change the portfolio, "
-                "return intent='run_news_overview'.\n"
-                "- If the user asks to generate actions or proposals from news, return intent='generate_news_actions'.\n"
-                "- If the user asks for insight, explanation, interpretation, or a description of the current/final/active portfolio without asking to change it, "
+                "- If the user asks for insight, explanation, interpretation, or a description of the current, final, or active portfolio without asking to change it, "
                 "return intent='show_final_portfolio_insight'.\n"
                 "- If the user asks to create or run the first portfolio, return intent='run_base_portfolio'.\n"
                 "Schema:\n"
                 "{\n"
                 '  "supported": true|false,\n'
-                '  "intent": "run_base_portfolio"|"run_news_overview"|"generate_news_actions"|"run_refine_candidate_selection"|"show_final_portfolio_insight"|"unsupported",\n'
+                '  "intent": "run_base_portfolio"|"run_news_overview"|"generate_news_actions"|"clarify_news_usage_mode"|"run_refine_candidate_selection"|"show_final_portfolio_insight"|"unsupported",\n'
                 '  "parameters": {\n'
                 '     "pain_points": [string],\n'
                 '     "excluded_assets": [string],\n'
@@ -607,9 +614,10 @@ class LLMClient:
                 "\n"
                 "Intent guidance:\n"
                 "- run_base_portfolio: user wants to create/run/generate the initial/base portfolio.\n"
-                "- run_news_overview: user wants a news snapshot, news risk check, or news overview without changing the portfolio.\n"
-                "- generate_news_actions: user wants actions/proposals generated from the news.\n"
+                "- run_news_overview: user wants a news snapshot, news risk check, news summary, or news overview without changing the portfolio.\n"
+                "- generate_news_actions: user explicitly wants actions/proposals/suggestions generated from the news.\n"
                 "- run_refine_candidate_selection: user is unhappy with the portfolio and wants refinement, adjustments, safer/smoother portfolio, exclusions, or changes.\n"
+                "- clarify_news_usage_mode: user wants news to be used in the portfolio/refinement/decision, but it is unclear whether they want mathematical integration or LLM-generated news actions.\n"
                 "- show_final_portfolio_insight: user wants the current/final/active portfolio to be explained, interpreted, or summarized without changing it.\n"
                 "- unsupported: anything outside this dashboard scope.\n"
             )
@@ -642,6 +650,17 @@ class LLMClient:
                     "describe the portfolio", "summarize this portfolio", "summarise this portfolio",  "current portfolio explanation", "active portfolio explanation"
                 ]):
                      j = {"supported": True, "intent": "show_final_portfolio_insight", "parameters": {}, "reply": ""}
+                elif any(x in s for x in [
+                    "use news",
+                    "include news",
+                    "apply news",
+                    "consider news",
+                    "use recent news",
+                    "include recent news",
+                    "consider recent news",
+                    "apply recent news",
+                ]):
+                    j = {"supported": True, "intent": "clarify_news_usage_mode", "parameters": {}, "reply": ""}
                 elif any(x in s for x in ["run base", "base portfolio", "initial portfolio", "create portfolio", "generate portfolio"]):
                     j = {"supported": True, "intent": "run_base_portfolio", "parameters": {}, "reply": ""}
                 else:
@@ -712,6 +731,11 @@ class LLMClient:
                     "\n"
                     "Core purpose:\n"
                     "- Explain the FINAL selected portfolio.\n"
+                    "- The selected final objective is provided in the payload. You MUST describe only that final selected objective.\n"
+                    "- Do NOT describe Max Sharpe unless the final selected objective is maxsharpe.\n"
+                    "- Do NOT describe Min Variance unless the final selected objective is minvar.\n"
+                    "- Do NOT use metrics from a non-selected candidate as if they belong to the final portfolio.\n"
+                    "- If base and refine are compared, keep the comparison separate from the final selected portfolio description.\n"
                     "- This is NOT a news snapshot.\n"
                     "- This is NOT an evidence snapshot.\n"
                     "- This is the final user-facing explanation of the selected portfolio.\n"
@@ -738,11 +762,19 @@ class LLMClient:
                     "- Keep it around 8 to 14 sentences.\n"
                 )
 
+                refine_obj = str(((payload.get("refine") or {}).get("objective")) or "").strip()
+                base_obj = str(((payload.get("base") or {}).get("objective")) or "").strip()
+
                 user = (
+                    f"Final selected portfolio objective: {refine_obj}\n"
+                    f"Base portfolio objective: {base_obj}\n"
+                    "Important: the FINAL selected portfolio must be described using the FINAL selected objective, not the base objective.\n"
+                    "If the final selected objective is minvar, describe the portfolio as focused on reducing volatility / smoother risk.\n"
+                    "If the final selected objective is maxsharpe, describe the portfolio as focused on maximizing return per unit of risk.\n"
                     "Here is the final portfolio insight payload as JSON.\n"
                     "Write the final user-facing portfolio insight now.\n\n"
                     + json.dumps(payload, ensure_ascii=False)
-                )
+)
 
                 return {"system": system, "developer": developer, "user": user}
 
@@ -1174,14 +1206,32 @@ class LLMClient:
                     "parse_mode": "text",
                 }
 
+            issues = []
+            refine_obj = str(((payload.get("refine") or {}).get("objective")) or "").lower().strip()
+            raw_lower = raw.lower()
+
+            if refine_obj == "minvar":
+                if (
+                    "maximize return per unit of risk" in raw_lower
+                    or "max sharpe" in raw_lower
+                ):
+                    issues.append("objective_mismatch_minvar_written_as_maxsharpe")
+
+            elif refine_obj == "maxsharpe":
+                if (
+                    "min variance" in raw_lower
+                    or "reducing volatility" in raw_lower
+                    or "reduce ups and downs" in raw_lower
+                ):
+                    issues.append("objective_mismatch_maxsharpe_written_as_minvar")
+
             return {
-                "ok": True,
+                "ok": len(issues) == 0,
                 "text": raw,
-                "issues": [],
+                "issues": issues,
                 "raw_text": raw,
                 "parse_mode": "text",
             }
-
         # -------------------------------------------------
         # json mode
         # -------------------------------------------------

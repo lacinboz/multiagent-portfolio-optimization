@@ -35,7 +35,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 
-from portfolio_langgraph_withllm import run_graph
+from portfolio_langgraph_withllm import run_graph, run_graph_prob_news
 from llm_client import LLMClient
 
 DATA_DIR = Path("data/processed_yahoo")
@@ -168,7 +168,108 @@ def _extract_weights_and_metrics(state: Dict[str, Any]):
 def _active_portfolio_label(is_refined: bool) -> str:
     return "Refined Portfolio" if is_refined else "Base Portfolio"
 
+def _render_prob_news_trace(trace: Optional[Dict[str, Any]]):
+    if not isinstance(trace, dict) or not trace:
+        st.info("No mathematical news trace available.")
+        return
 
+    ticker_signals = trace.get("ticker_signals") or {}
+    prediction_signals = trace.get("prediction_signals") or {}
+    mu_before = trace.get("mu_before") or {}
+    mu_after = trace.get("mu_after") or {}
+    mu_delta = trace.get("mu_delta") or {}
+    var_before = trace.get("variance_before") or {}
+    var_after = trace.get("variance_after") or {}
+    var_delta = trace.get("variance_delta") or {}
+
+    rows = []
+
+    for ticker, sig in ticker_signals.items():
+        if not isinstance(sig, dict):
+            continue
+
+        pred = prediction_signals.get(ticker) or {}
+
+        rows.append(
+            {
+                "Ticker": ticker,
+                "FinBERT sentiment": sig.get("sentiment_score"),
+                "Confidence": sig.get("confidence_score"),
+                "Articles": sig.get("raw_article_count"),
+                "Weighted articles": sig.get("weighted_article_count"),
+                "Sentiment variance": sig.get("sentiment_variance"),
+                "Predicted direction": pred.get("predicted_direction"),
+                "Prediction confidence": pred.get("prediction_confidence"),
+                "Expected return adjustment": pred.get("expected_return_adjustment"),
+                "Risk adjustment": pred.get("risk_adjustment"),
+                "μ before": mu_before.get(ticker),
+                "μ after": mu_after.get(ticker),
+                "Δ μ": mu_delta.get(ticker),
+                "Variance before": var_before.get(ticker),
+                "Variance after": var_after.get(ticker),
+                "Δ variance": var_delta.get(ticker),
+            }
+        )
+        
+
+    if rows:
+        df = pd.DataFrame(rows)
+
+
+
+        numeric_cols = [
+            "FinBERT sentiment",
+            "Confidence",
+            "Weighted articles",
+            "Sentiment variance",
+            "Prediction confidence",
+            "Expected return adjustment",
+            "Risk adjustment",
+            "μ before",
+            "μ after",
+            "Δ μ",
+            "Variance before",
+            "Variance after",
+            "Δ variance",
+        ]
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        st.markdown("**Predictive news signals and their effect on the optimization inputs**")
+        st.dataframe(df, use_container_width=True)
+
+
+    params = trace.get("parameters") or {}
+    if params:
+        with st.expander("Model parameters"):
+            st.json(params)
+
+    article_signals = trace.get("article_signals") or []
+    if isinstance(article_signals, list) and article_signals:
+        with st.expander("Article-level FinBERT signals"):
+            article_rows = []
+            for a in article_signals:
+                if not isinstance(a, dict):
+                    continue
+                probs = a.get("probs") or {}
+                article_rows.append(
+                    {
+                        "Ticker": a.get("ticker"),
+                        "Headline": a.get("headline"),
+                        "Source": a.get("source"),
+                        "Positive": probs.get("positive"),
+                        "Negative": probs.get("negative"),
+                        "Neutral": probs.get("neutral"),
+                        "Article sentiment": a.get("article_sentiment"),
+                        "Confidence": a.get("article_confidence"),
+                        "Recency weight": a.get("recency_weight"),
+                        "Combined weight": a.get("combined_weight"),
+                    }
+                )
+
+            if article_rows:
+                st.dataframe(pd.DataFrame(article_rows), use_container_width=True, height=320)
 def _portfolio_summary_from_state(state: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """
     ✅ For Evaluation section.
@@ -677,6 +778,12 @@ if "chat_history" not in st.session_state:
 if "chat_last_command" not in st.session_state:
     st.session_state["chat_last_command"] = None
 
+if "chat_pending_clarification" not in st.session_state:
+    st.session_state["chat_pending_clarification"] = None
+
+if "chat_selected_news_mode" not in st.session_state:
+    st.session_state["chat_selected_news_mode"] = None
+
 
 
 # ---------------- LAYOUT ----------------
@@ -882,6 +989,54 @@ def _run_refine_flow(
 
     st.session_state["refined_state"] = refined_state
     return refined_state
+
+def _run_prob_news_refine_flow(
+    *,
+    selected_tickers: List[str],
+    rf: float,
+    w_max: float,
+    current_weights_dict: Optional[Dict[str, float]],
+    pain_points: List[str],
+    excluded_assets: List[str],
+    extra_notes: str,
+    use_llm_refine: bool,
+):
+    base_state = st.session_state.get("base_state") or {}
+
+    refined_answers = {
+        "satisfaction": "no",
+        "pain_points": pain_points,
+        "excluded_assets": excluded_assets,
+        "use_news": "yes",
+        "extra_notes": extra_notes,
+        "notes_tickers": _extract_tickers_from_notes(extra_notes, selected_tickers),
+        "selected_news_actions": [],
+    }
+
+    print("\n===== FRONTEND DEBUG: refined_answers sent to run_graph_prob_news =====")
+    print(json.dumps(refined_answers, indent=2, default=str))
+    print("========================================================================\n")
+
+    refined_state = run_graph_prob_news(
+        selected_tickers=selected_tickers,
+        rf=float(rf),
+        w_max=float(w_max),
+        preferences={},
+        current_weights=current_weights_dict,
+        clarification_answers=refined_answers,
+        mode="refine",
+        stage="main",
+        use_llm=bool(use_llm_refine),
+        use_news=True,
+        base_portfolio_metrics=base_state.get("optimized_metrics"),
+        base_portfolio_weights=base_state.get("optimized_weights"),
+        base_portfolio_objective=base_state.get("objective_key"),
+        prob_alpha=0.12,
+        prob_beta=0.35,
+    )
+
+    st.session_state["refined_state"] = refined_state
+    return refined_state
 # ---------------- RUN BASE ----------------
 if run_base and selected_tickers:
     _run_base_flow(
@@ -915,6 +1070,7 @@ def _handle_chat_command(
     if not selected_tickers:
         _append_chat_message("assistant", "Please select at least one ticker in the universe first.")
         return
+    
 
     client = LLMClient()
     cmd = client.interpret_dashboard_chat_command(
@@ -957,6 +1113,34 @@ def _handle_chat_command(
                 "risk_json": risk_json,
             },
         )
+
+    elif intent == "clarify_news_usage_mode":
+        st.session_state["chat_pending_clarification"] = {
+            "type": "news_mode_selection",
+            "original_user_msg": user_msg,
+        }
+
+        _append_chat_message(
+            "assistant",
+            "I can use news in two different ways. Please choose one option below.",
+            kind="news_mode_selection",
+            payload={
+                "question": "Which one do you want?",
+                "options": [
+                    {
+                        "label": "Mathematical news integration",
+                        "value": "probabilistic",
+                        "description": "Use news signals to adjust return/risk inputs before optimization."
+                    },
+                    {
+                        "label": "LLM news actions",
+                        "value": "llm_actions",
+                        "description": "Use news to generate qualitative actions, explanations, and suggestions."
+                    },
+                ],
+            },
+        )
+
 
     elif intent == "generate_news_actions":
         if st.session_state.get("base_state") is None:
@@ -1228,7 +1412,106 @@ else:
             kind = msg.get("kind", "text")
             payload = msg.get("payload", {})
 
-            if kind == "news_overview":
+            if kind == "news_mode_selection":
+                question = payload.get("question") or "Which one do you want?"
+                options = payload.get("options") or []
+
+                st.markdown(f"**{question}**")
+
+                option_labels = []
+                value_by_label = {}
+
+                for opt in options:
+                    if not isinstance(opt, dict):
+                        continue
+                    label = str(opt.get("label") or "").strip()
+                    value = str(opt.get("value") or "").strip()
+                    desc = str(opt.get("description") or "").strip()
+
+                    if not label or not value:
+                        continue
+
+                    full_label = f"{label} — {desc}" if desc else label
+                    option_labels.append(full_label)
+                    value_by_label[full_label] = value
+
+                if option_labels:
+                    radio_key = f"news_mode_radio_{msg_idx}"
+                    selected_label = st.radio(
+                        "Choose one option",
+                        option_labels,
+                        key=radio_key,
+                    )
+
+                    if st.button("Confirm selection", key=f"confirm_news_mode_{msg_idx}"):
+                        selected_value = value_by_label[selected_label]
+
+                        st.session_state["chat_pending_clarification"] = None
+                        st.session_state["chat_selected_news_mode"] = selected_value
+
+                        if st.session_state.get("base_state") is None:
+                            _append_chat_message(
+                                "assistant",
+                                "Please run the base portfolio first, then I can use news in the selected mode."
+                            )
+                            st.rerun()
+
+                        if selected_value == "probabilistic":
+                            out = _run_prob_news_refine_flow(
+                                selected_tickers=selected_tickers,
+                                rf=float(rf),
+                                w_max=float(w_max),
+                                current_weights_dict=current_weights_dict,
+                                pain_points=[],
+                                excluded_assets=[],
+                                extra_notes="Use news with mathematical integration into the optimization model.",
+                                use_llm_refine=True,
+                            )
+
+                            base_state = st.session_state.get("base_state") or {}
+
+                            _append_chat_message(
+                                "assistant",
+                                "Portfolio refined using mathematical news integration.",
+                                kind="prob_news_refine_result",
+                                payload={
+                                    "chosen_candidate": _get_chosen_candidate(out or {}),
+                                    "objective_key": (out or {}).get("objective_key"),
+                                    "base_objective": base_state.get("objective_key"),
+                                    "optimized_metrics": (out or {}).get("optimized_metrics") or {},
+                                    "base_metrics": base_state.get("optimized_metrics") or {},
+                                    "explanation": (out or {}).get("explanation"),
+                                    "insight_raw_text": (out or {}).get("insight_raw_text"),
+                                    "prob_news_trace": (out or {}).get("prob_news_trace"),
+
+                                },
+                            )
+                            st.rerun()
+
+                        elif selected_value == "llm_actions":
+                            out = _run_news_actions_flow(
+                                selected_tickers=selected_tickers,
+                                rf=float(rf),
+                                w_max=float(w_max),
+                                current_weights_dict=current_weights_dict,
+                            )
+
+                            actions = (out or {}).get("news_actions") or []
+                            n_actions = len(actions)
+
+                            _append_chat_message(
+                                "assistant",
+                                f"I generated {n_actions} news-based action(s).",
+                                kind="news_actions",
+                                payload={
+                                    "state": out,
+                                    "actions": actions,
+                                    "evidence_snapshot": (out or {}).get("news_evidence_snapshot_text"),
+                                },
+                            )
+                            st.rerun()
+
+            elif kind == "news_overview":
                 snapshot = payload.get("snapshot_text")
                 risk_json = payload.get("risk_json")
 
@@ -1374,6 +1657,54 @@ else:
                     st.write(f"Chosen candidate: `{chosen}`")
                 if explanation:
                     st.write(explanation)
+                if insight_text:
+                    st.markdown("**Insight**")
+                    st.markdown(insight_text)
+
+            elif kind == "prob_news_refine_result":
+                chosen = payload.get("chosen_candidate")
+                explanation = payload.get("explanation")
+                insight_text = payload.get("insight_raw_text")
+                optimized_metrics = payload.get("optimized_metrics") or {}
+                base_metrics = payload.get("base_metrics") or {}
+                objective_key = payload.get("objective_key")
+                base_objective = payload.get("base_objective")
+                prob_news_trace = payload.get("prob_news_trace")
+
+                st.markdown("**News-integrated refine result**")
+                st.write("Recent news was incorporated into the optimization inputs before re-optimizing the portfolio.")
+
+                if base_objective or objective_key:
+                    st.write(f"Base objective: `{base_objective}` → News-adjusted result: `{objective_key}`")
+
+                if chosen:
+                    st.write(f"Chosen candidate: `{chosen}`")
+
+                if optimized_metrics:
+                    ret_str = _fmt_pct_from_decimal(_safe_float(optimized_metrics.get("return")))
+                    vol_str = _fmt_pct_from_decimal(_safe_float(optimized_metrics.get("vol")))
+                    sharpe_str = _fmt_num(_safe_float(optimized_metrics.get("sharpe")))
+                    st.write(f"Return: {ret_str} | Volatility: {vol_str} | Sharpe: {sharpe_str}")
+
+                if base_metrics and optimized_metrics:
+                    d_ret = _safe_diff(optimized_metrics.get("return"), base_metrics.get("return"))
+                    d_vol = _safe_diff(optimized_metrics.get("vol"), base_metrics.get("vol"))
+                    d_sharpe = _safe_diff(optimized_metrics.get("sharpe"), base_metrics.get("sharpe"))
+
+                    st.markdown("**Change vs base portfolio**")
+                    st.write(f"Δ Return: {_fmt_pct_from_decimal(d_ret)}")
+                    st.write(f"Δ Volatility: {_fmt_pct_from_decimal(d_vol)}")
+                    st.write(f"Δ Sharpe: {_fmt_num(d_sharpe)}")
+
+                
+                if prob_news_trace:
+                        with st.expander("Show how news changed the mathematical model"):
+                            _render_prob_news_trace(prob_news_trace)
+
+                if explanation:
+                    with st.expander("Show decision explanation"):
+                        st.write(explanation)
+
                 if insight_text:
                     st.markdown("**Insight**")
                     st.markdown(insight_text)

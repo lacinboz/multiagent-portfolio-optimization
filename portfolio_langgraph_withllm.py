@@ -13,12 +13,15 @@ from collections import Counter
 import pandas as pd
 from langgraph.graph import StateGraph, END
 
-
+from probabilistic_news_integration import (
+    build_adjusted_inputs_from_existing_news_state,
+)
 from agents_langgraph import (
     data_agent_get_mu_cov,
     optimization_agent_from_mu_cov,
     risk_agent,
     recommendation_agent,
+    apply_news_actions_to_params,
 )
 
 # ✅ News fetch (real)
@@ -112,6 +115,14 @@ class PortfolioState(TypedDict, total=False):
     insight_raw_text: Optional[str]
     insight_parse_mode: Optional[str]
 
+    prob_news_signals: Optional[Dict[str, Any]]
+    prob_adjusted_mu: Optional[pd.Series]
+    prob_adjusted_cov: Optional[pd.DataFrame]
+    prob_alpha: Optional[float]
+    prob_beta: Optional[float]
+
+    prob_news_trace: Optional[Dict[str, Any]]
+
     # ✅ carry the user's previous portfolio (Run Base output) into refine run
     base_portfolio_weights: Optional[Dict[str, float]]
     base_portfolio_metrics: Optional[Dict[str, Any]]
@@ -165,6 +176,8 @@ def _init_defaults(state: PortfolioState) -> PortfolioState:
     state.setdefault("news_evidence_snapshot_text", None)
     state.setdefault("news_evidence_snapshot_ok", None)
     state.setdefault("news_evidence_snapshot_issues", [])
+
+    state.setdefault("prob_news_trace", None)
     
 
 
@@ -186,6 +199,12 @@ def _init_defaults(state: PortfolioState) -> PortfolioState:
     state.setdefault("base_portfolio_weights", None)
     state.setdefault("base_portfolio_metrics", None)
     state.setdefault("base_portfolio_objective", None)
+
+    state.setdefault("prob_news_signals", None)
+    state.setdefault("prob_adjusted_mu", None)
+    state.setdefault("prob_adjusted_cov", None)
+    state.setdefault("prob_alpha", 0.08)
+    state.setdefault("prob_beta", 0.35)
 
     return state
 
@@ -884,10 +903,39 @@ def node_perception(state: PortfolioState) -> PortfolioState:
     satisfaction = str(prefs.get("satisfaction") or "").lower().strip()
 
     excluded_assets = prefs.get("excluded_assets") or []
+    selected_news_actions = prefs.get("selected_news_actions") or []
     if excluded_assets:
         excluded = set(map(str, excluded_assets))
         state["selected_tickers"] = [t for t in list(state.get("selected_tickers", [])) if t not in excluded]
         state["debug_notes"].append(f"Perception: excluded={sorted(excluded)}")
+
+
+
+    if isinstance(selected_news_actions, list) and selected_news_actions:
+        try:
+            applied = apply_news_actions_to_params(
+                selected_tickers=list(state.get("selected_tickers", []) or []),
+                w_max=float(state.get("w_max", 0.30)),
+                lambda_l2=float(state.get("lambda_l2", 1e-3)),
+                objective_key=str(state.get("objective_key", "maxsharpe")),
+                actions=selected_news_actions,
+            )
+
+            state["selected_tickers"] = applied.get("selected_tickers", state.get("selected_tickers", []))
+            state["w_max"] = float(applied.get("w_max", state.get("w_max", 0.30)))
+            state["lambda_l2"] = float(applied.get("lambda_l2", state.get("lambda_l2", 1e-3)))
+            state["objective_key"] = str(applied.get("objective_key", state.get("objective_key", "maxsharpe")))
+
+            state["debug_notes"].append(
+                f"Perception: applied selected_news_actions n={len(selected_news_actions)} "
+                f"-> selected_tickers={state['selected_tickers']} "
+                f"w_max={state['w_max']:.4f} "
+                f"lambda_l2={state['lambda_l2']:.6f} "
+                f"objective={state['objective_key']}"
+            )
+
+        except Exception as e:
+            state["debug_notes"].append(f"Perception: failed to apply selected_news_actions -> {e}")
 
     if state.get("stage") not in ("news_actions", "news_overview"):
         if "use_news" in prefs:
@@ -970,6 +1018,102 @@ def node_optimize(state: PortfolioState) -> PortfolioState:
     state["debug_notes"].append("Optimization: done (mu/cov).")
     return state
 
+def node_optimize_prob_news(state: PortfolioState) -> PortfolioState:
+    if state.get("mu") is None or state.get("cov") is None:
+        state["optimization_result"] = {}
+        state["debug_notes"].append("OptimizationProbNews: skipped (missing mu/cov).")
+        return state
+
+    mu_to_use = state["mu"]
+    cov_to_use = state["cov"]
+
+    if (
+        state.get("mode") != "base"
+        and bool(state.get("use_news", False))
+        and state.get("news_raw")
+    ):
+        try:
+            news_out = build_adjusted_inputs_from_existing_news_state(
+                mu=state["mu"],
+                cov=state["cov"],
+                tickers=state.get("selected_tickers", []),
+                news_raw=state.get("news_raw", []),
+                alpha=float(state.get("prob_alpha", 0.08)),
+                beta=float(state.get("prob_beta", 0.35)),
+            )
+
+            mu_to_use = news_out["adjusted_mu"]
+            cov_to_use = news_out["adjusted_cov"]
+
+            state["prob_news_signals"] = news_out.get("ticker_signals", {})
+            state["prob_adjusted_mu"] = mu_to_use
+            state["prob_adjusted_cov"] = cov_to_use
+
+            mu_before = state["mu"].copy()
+            cov_before = state["cov"].copy()
+
+            
+            state["prob_news_trace"] = {
+                "parameters": news_out.get("parameters", {}),
+                "ticker_signals": news_out.get("ticker_signals", {}),
+                "prediction_signals": news_out.get("prediction_signals", {}),
+                "article_signals": news_out.get("article_signals", []),
+                "mu_before": mu_before.to_dict(),
+                "mu_after": mu_to_use.to_dict(),
+                "mu_delta": (mu_to_use - mu_before).to_dict(),
+                "variance_before": {
+                    t: float(cov_before.loc[t, t]) for t in cov_before.index
+                },
+                "variance_after": {
+                    t: float(cov_to_use.loc[t, t]) for t in cov_to_use.index
+                },
+                "variance_delta": {
+                    t: float(cov_to_use.loc[t, t] - cov_before.loc[t, t])
+                    for t in cov_before.index
+                },
+            }
+            state["debug_notes"].append(
+                f"[DEBUG MU BEFORE] {mu_before.to_dict()}"
+            )
+            state["debug_notes"].append(
+                f"[DEBUG MU AFTER] {mu_to_use.to_dict()}"
+            )
+            state["debug_notes"].append(
+                f"[DEBUG MU DELTA] {(mu_to_use - mu_before).to_dict()}"
+            )
+            state["debug_notes"].append(
+                f"[DEBUG VAR DELTA] {state['prob_news_trace'].get('variance_delta')}"
+            )
+
+            state["debug_notes"].append(
+                f"OptimizationProbNews: prediction_signals={list((news_out.get('prediction_signals') or {}).keys())}"
+            )
+
+            state["debug_notes"].append(
+                "OptimizationProbNews: probabilistic news adjustment applied before MVO."
+            )
+
+        except Exception as e:
+            state["debug_notes"].append(
+                f"OptimizationProbNews: news adjustment failed -> fallback to original mu/cov: {e}"
+            )
+
+    res = optimization_agent_from_mu_cov(
+        mu=mu_to_use,
+        cov=cov_to_use,
+        rf=float(state["rf"]),
+        w_max=float(state["w_max"]),
+        lambda_l2=float(state["lambda_l2"]),
+    )
+
+    state["optimization_result"] = res
+    state["debug_notes"].append("OptimizationProbNews: done.")
+    return state
+
+def route_after_data_prob_news(state: PortfolioState) -> str:
+    if state.get("mode") == "base":
+        return "skip_news"
+    return "do_news" if bool(state.get("use_news", False)) else "skip_news"
 
 def node_extract_candidates(state: PortfolioState) -> PortfolioState:
     state["candidates"] = {}
@@ -1296,13 +1440,11 @@ def node_news_snapshot_and_risk(state: PortfolioState) -> PortfolioState:
         except Exception as e:
             state["debug_notes"].append(f"NewsSnapshotOut(debug_failed): {e}")
 
-        raw_txt = str(out.get("raw_text") or out.get("text") or "").strip()
-        snap_txt = str(out.get("snapshot_text") or "").strip()
+        snapshot_text_canonical = str(out.get("snapshot_text") or "").strip()
+        snapshot_text_ui = str(out.get("snapshot_text_raw") or "").strip()
 
-        state["news_snapshot_text"] = (raw_txt or snap_txt) or None
-
-       
-        state["news_snapshot_text_raw"] = raw_txt or None
+        state["news_snapshot_text"] = snapshot_text_canonical or None
+        state["news_snapshot_text_raw"] = snapshot_text_ui or snapshot_text_canonical or None
         state["debug_notes"].append(
             f"NewsSnapshotDebug: snapshot_len={len(state.get('news_snapshot_text') or '')} "
             f"raw_len={len(state.get('news_snapshot_text_raw') or '')}"
@@ -1816,7 +1958,11 @@ def node_finalize_selection(state: PortfolioState) -> PortfolioState:
 
 def node_insight_generator(state: PortfolioState) -> PortfolioState:
         state = _init_defaults(state)
-
+        state["debug_notes"].append(
+        f"[INSIGHT DEBUG] objective_key={state.get('objective_key')} "
+        f"optimized_metrics={state.get('optimized_metrics')} "
+        f"optimized_weights_keys={list((state.get('optimized_weights') or {}).keys())}"
+)
         # ✅ In news_actions stage we do not generate portfolio insights
         if state.get("stage") == "news_actions":
             state["debug_notes"].append("Insight: skipped (stage=news_actions).")
@@ -1874,6 +2020,17 @@ def node_insight_generator(state: PortfolioState) -> PortfolioState:
             )
 
             payload = prep.get("payload") or {}
+            state["debug_notes"].append(
+                f"[INSIGHT PAYLOAD CHECK] "
+                f"base_obj={base_obj} refine_obj={refine_obj} "
+                f"base_return={base_metrics.get('return_pct') if isinstance(base_metrics, dict) else None} "
+                f"base_vol={base_metrics.get('vol_pct') if isinstance(base_metrics, dict) else None} "
+                f"refine_return={refine_metrics.get('return_pct') if isinstance(refine_metrics, dict) else None} "
+                f"refine_vol={refine_metrics.get('vol_pct') if isinstance(refine_metrics, dict) else None}"
+            )
+            state["debug_notes"].append(
+                "[INSIGHT PAYLOAD RAW] " + str(payload)[:3000]
+            )
 
             client = LLMClient()
             out = client.generate_portfolio_insights(
@@ -2023,6 +2180,78 @@ def build_portfolio_graph():
 
     return g.compile()
 
+def build_portfolio_graph_prob_news():
+    g = StateGraph(PortfolioState)
+
+    g.add_node("ask_clarifications", node_ask_clarifications)
+    g.add_node("perception", node_perception)
+    g.add_node("baselines", node_compute_baselines)
+
+    g.add_node("data", node_data)
+    g.add_node("news_fetch", node_news_fetch)
+    g.add_node("optimize_prob_news", node_optimize_prob_news)
+
+    g.add_node("extract_candidates", node_extract_candidates)
+    g.add_node("risk_candidates", node_risk_candidates)
+
+    g.add_node("news_snapshot", node_news_snapshot_and_risk)
+    g.add_node("news_actions_generate", node_news_actions_generate)
+    g.add_node("news_evidence_snapshot", node_news_evidence_snapshot)
+    g.add_node("news_actions_verify", node_news_actions_verify)
+
+    g.add_node("llm_select", node_llm_select_candidate)
+    g.add_node("finalize", node_finalize_selection)
+    g.add_node("insight", node_insight_generator)
+    g.add_node("explain", node_explain)
+
+    g.set_entry_point("ask_clarifications")
+
+    g.add_conditional_edges(
+        "ask_clarifications",
+        route_after_clarifications,
+        {"end": END, "perception": "perception"},
+    )
+
+    g.add_edge("perception", "baselines")
+    g.add_edge("baselines", "data")
+
+    g.add_conditional_edges(
+        "data",
+        route_after_data_prob_news,
+        {"do_news": "news_fetch", "skip_news": "optimize_prob_news"},
+    )
+
+    g.add_edge("news_fetch", "optimize_prob_news")
+    g.add_edge("optimize_prob_news", "extract_candidates")
+    g.add_edge("extract_candidates", "risk_candidates")
+
+    # optional news overview / actions stays after candidate risk computation
+    g.add_conditional_edges(
+        "risk_candidates",
+        route_after_risk_candidates,
+        {"do_news": "news_snapshot", "skip_news": "llm_select"},
+    )
+
+    g.add_conditional_edges(
+        "news_snapshot",
+        route_after_news_snapshot,
+        {
+            "news_actions": "news_actions_generate",
+            "main": "llm_select",
+        },
+    )
+
+    g.add_edge("news_actions_generate", "news_evidence_snapshot")
+    g.add_edge("news_evidence_snapshot", "news_actions_verify")
+    g.add_edge("news_actions_verify", END)
+
+    g.add_edge("llm_select", "finalize")
+    g.add_edge("finalize", "insight")
+    g.add_edge("insight", "explain")
+    g.add_edge("explain", END)
+
+    return g.compile()
+
 
 def run_graph(
     selected_tickers: List[str],
@@ -2075,6 +2304,9 @@ def run_graph(
         "news_items_llm": None,
         "evidence_map": None,
 
+        "prob_news_trace": None,
+
+
         "insight": None,
         "insight_ok": None,
         "insight_issues": [],
@@ -2094,4 +2326,79 @@ def run_graph(
         f"{list(((out.get('news_risk_json') or {}).get('by_ticker') or {}).keys())}"
     )
 
+    return out
+
+
+def run_graph_prob_news(
+    selected_tickers: List[str],
+    rf: float,
+    w_max: float,
+    preferences: Optional[Dict[str, Any]] = None,
+    current_weights: Optional[Dict[str, float]] = None,
+    max_iterations: int = 0,
+    clarification_answers: Optional[Dict[str, Any]] = None,
+    mode: Mode = "refine",
+    stage: Stage = "main",
+    use_llm: bool = False,
+    use_news: bool = False,
+    base_portfolio_metrics: Optional[Dict[str, Any]] = None,
+    base_portfolio_weights: Optional[Dict[str, float]] = None,
+    base_portfolio_objective: Optional[str] = None,
+    prob_alpha: float = 0.08,
+    prob_beta: float = 0.35,
+) -> PortfolioState:
+    app = build_portfolio_graph_prob_news()
+
+
+
+    init: PortfolioState = {
+        "mode": mode,
+        "stage": stage,
+        "selected_tickers": selected_tickers,
+        "rf": float(rf),
+        "w_max": float(w_max),
+        "lambda_l2": 1e-3,
+        "preferences": preferences or {},
+        "use_llm": bool(use_llm),
+        "use_news": bool(use_news) if mode != "base" else False,
+        "current_weights": current_weights,
+        "debug_notes": [],
+        "clarification_answers": clarification_answers,
+        "objective_key": "maxsharpe",
+        "chosen_candidate": None,
+        "candidates": {},
+        "llm_decision": None,
+        "optimized_weights": {},
+        "optimized_metrics": {},
+        "news_raw": None,
+        "news_signals": None,
+        "news_snapshot_text": None,
+        "news_risk_json": None,
+        "news_actions": None,
+        "news_actions_verifier": None,
+        "news_items_llm": None,
+        "evidence_map": None,
+        "prob_news_signals": None,
+        "prob_adjusted_mu": None,
+        "prob_adjusted_cov": None,
+        "insight": None,
+        "insight_ok": None,
+        "insight_issues": [],
+        "insight_raw_text": None,
+        "insight_parse_mode": None,
+        "base_portfolio_metrics": base_portfolio_metrics,
+        "base_portfolio_weights": base_portfolio_weights,
+        "base_portfolio_objective": base_portfolio_objective,
+        "prob_alpha": float(prob_alpha),
+        "prob_beta": float(prob_beta),
+
+        "prob_news_trace": None,
+    }
+
+    out = app.invoke(init, config={"recursion_limit": 200})
+
+    out["debug_notes"].append(
+        f"[DEBUG FINAL STATE PROB] "
+        f"prob_news_signals_keys={list((out.get('prob_news_signals') or {}).keys())}"
+    )
     return out
