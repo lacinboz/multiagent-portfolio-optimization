@@ -1714,23 +1714,6 @@ else:
                         vol_regime = str(glob.get("vol_regime") or "normal")
                         st.caption(f"Global regime: **{vol_regime}**")
 
-                    if isinstance(by_ticker, dict) and by_ticker:
-                        rows = []
-                        for t, v in by_ticker.items():
-                            if not isinstance(v, dict):
-                                continue
-                            rows.append(
-                                {
-                                    "Ticker": str(t),
-                                    "Risk flag": str(v.get("risk_flag") or "none"),
-                                    "Confidence": v.get("confidence"),
-                                }
-                            )
-                        if rows:
-                            df = pd.DataFrame(rows)
-                            df["Confidence"] = pd.to_numeric(df["Confidence"], errors="coerce")
-                            df = df.sort_values(by="Confidence", ascending=False, na_position="last")
-                            st.dataframe(df, use_container_width=True, height=220)
 
 
             elif kind == "news_actions":
