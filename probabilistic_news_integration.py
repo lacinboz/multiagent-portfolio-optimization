@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
-
+from pathlib import Path
 import math
 import numpy as np
 import pandas as pd
@@ -11,8 +11,7 @@ import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 # Reuse your existing fetcher
-from agents_langgraph import news_agent_fetch_for_tickers
-
+from agents_langgraph import news_agent_fetch_for_tickers, historical_news_agent_fetch_for_tickers
 
 # =========================================================
 # CONFIG
@@ -107,8 +106,6 @@ def _to_datetime(value: Any) -> Optional[datetime]:
     except Exception:
         return None
 
-
-# =========================================================
 # REUSE EXISTING NEWS FETCH
 # =========================================================
 
@@ -539,7 +536,410 @@ def adjust_covariance_matrix(
     adjusted = 0.5 * (adjusted + adjusted.T)
     return adjusted
 
+# =========================================================
+# NEWS ADJUSTMENT EVALUATION
+# =========================================================
 
+def _safe_float_eval(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        v = float(x)
+        if not np.isfinite(v):
+            return None
+        return v
+    except Exception:
+        return None
+
+
+def _effective_number_of_holdings(weights: Dict[str, Any]) -> float:
+    vals = np.array([float(v) for v in (weights or {}).values() if abs(float(v)) > 1e-8], dtype=float)
+    if vals.size == 0:
+        return 0.0
+    denom = float(np.sum(vals ** 2))
+    return float(1.0 / denom) if denom > 0 else 0.0
+
+
+def _max_weight(weights: Dict[str, Any]) -> float:
+    vals = [abs(float(v)) for v in (weights or {}).values()]
+    return float(max(vals)) if vals else 0.0
+
+
+def _turnover(base_weights: Dict[str, Any], news_weights: Dict[str, Any]) -> float:
+    tickers = sorted(set((base_weights or {}).keys()) | set((news_weights or {}).keys()))
+    return float(
+        0.5 * sum(
+            abs(float(news_weights.get(t, 0.0)) - float(base_weights.get(t, 0.0)))
+            for t in tickers
+        )
+    )
+
+
+def evaluate_news_adjustment_effect(
+    *,
+    base_weights: Dict[str, Any],
+    base_metrics: Dict[str, Any],
+    news_weights: Dict[str, Any],
+    news_metrics: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Evaluates the portfolio-level impact of the news/FinBERT adjustment.
+
+    Important thesis framing:
+    This does NOT evaluate news as a standalone price-direction predictor.
+    It evaluates whether news-adjusted inputs changed the optimized portfolio
+    in terms of return, risk, efficiency, concentration, and allocation.
+    """
+
+    base_weights = base_weights or {}
+    news_weights = news_weights or {}
+    base_metrics = base_metrics or {}
+    news_metrics = news_metrics or {}
+
+    base_return = _safe_float_eval(base_metrics.get("return"))
+    news_return = _safe_float_eval(news_metrics.get("return"))
+
+    base_vol = _safe_float_eval(base_metrics.get("vol"))
+    news_vol = _safe_float_eval(news_metrics.get("vol"))
+
+    base_sharpe = _safe_float_eval(base_metrics.get("sharpe"))
+    news_sharpe = _safe_float_eval(news_metrics.get("sharpe"))
+
+    base_max_w = _max_weight(base_weights)
+    news_max_w = _max_weight(news_weights)
+
+    base_eff_n = _effective_number_of_holdings(base_weights)
+    news_eff_n = _effective_number_of_holdings(news_weights)
+
+    tickers = sorted(set(base_weights.keys()) | set(news_weights.keys()))
+
+    weight_changes = {
+        t: {
+            "base_weight": float(base_weights.get(t, 0.0)),
+            "news_weight": float(news_weights.get(t, 0.0)),
+            "delta_weight": float(news_weights.get(t, 0.0) - base_weights.get(t, 0.0)),
+        }
+        for t in tickers
+    }
+
+    delta_return = None if base_return is None or news_return is None else news_return - base_return
+    delta_vol = None if base_vol is None or news_vol is None else news_vol - base_vol
+    delta_sharpe = None if base_sharpe is None or news_sharpe is None else news_sharpe - base_sharpe
+
+    delta_max_weight = news_max_w - base_max_w
+    delta_effective_n = news_eff_n - base_eff_n
+    turnover = _turnover(base_weights, news_weights)
+
+    risk_effect = "unchanged"
+    if delta_vol is not None:
+        if delta_vol > 1.0:
+            "increased_risk"
+        elif delta_vol > 0:
+            "slightly_increased_risk"
+        else:
+            "reduced_risk"
+
+    efficiency_effect = "unchanged"
+    if delta_sharpe is not None:
+        if delta_sharpe > 1e-6:
+            efficiency_effect = "improved_efficiency"
+        elif delta_sharpe < -1e-6:
+            efficiency_effect = "reduced_efficiency"
+
+    concentration_effect = "unchanged"
+    if delta_effective_n > 1e-6 and delta_max_weight < 1e-6:
+        concentration_effect = "more_diversified"
+    elif delta_effective_n < -1e-6 or delta_max_weight > 1e-6:
+        concentration_effect = "more_concentrated"
+
+    return {
+        "thesis_framing": (
+            "The news module is evaluated as a portfolio-level adjustment mechanism, "
+            "not as a standalone short-term price-direction predictor."
+        ),
+        "base": {
+            "return": base_return,
+            "vol": base_vol,
+            "sharpe": base_sharpe,
+            "max_weight": base_max_w,
+            "effective_n": base_eff_n,
+        },
+        "news_adjusted": {
+            "return": news_return,
+            "vol": news_vol,
+            "sharpe": news_sharpe,
+            "max_weight": news_max_w,
+            "effective_n": news_eff_n,
+        },
+        "deltas": {
+            "return": delta_return,
+            "vol": delta_vol,
+            "sharpe": delta_sharpe,
+            "max_weight": delta_max_weight,
+            "effective_n": delta_effective_n,
+            "turnover": turnover,
+        },
+        "effects": {
+            "risk_effect": risk_effect,
+            "efficiency_effect": efficiency_effect,
+            "concentration_effect": concentration_effect,
+        },
+        "weight_changes": weight_changes,
+    }
+
+def evaluate_news_prediction_against_future_returns(
+    *,
+    article_signals: List[Dict[str, Any]],
+    price_dir: str = "data/raw/daily_yahoo",
+    horizons: List[int] = [1, 3, 7],
+    sentiment_threshold: float = 0.05,
+) -> Dict[str, Any]:
+    """
+    Evaluates whether FinBERT news sentiment predicts future price direction.
+
+    For each news article:
+    - get ticker
+    - get article date
+    - get close price at/after news date
+    - get close price after h trading days
+    - compare predicted direction with realized future return direction
+    """
+
+    rows = []
+
+    for art in article_signals or []:
+        if not isinstance(art, dict):
+            continue
+
+        ticker = _normalize_ticker(art.get("ticker"))
+        if not ticker:
+            continue
+
+        sentiment = _safe_float_eval(art.get("article_sentiment"))
+        confidence = _safe_float_eval(art.get("article_confidence"))
+        news_dt = _to_datetime(art.get("datetime"))
+
+        if sentiment is None or news_dt is None:
+            continue
+
+        if sentiment > sentiment_threshold:
+            predicted_direction = "positive"
+            predicted_sign = 1
+        elif sentiment < -sentiment_threshold:
+            predicted_direction = "negative"
+            predicted_sign = -1
+        else:
+            predicted_direction = "neutral"
+            predicted_sign = 0
+
+        if predicted_sign == 0:
+            continue
+
+        price_path = Path(price_dir) / f"{ticker}_daily.csv"
+        if not price_path.exists():
+            continue
+
+        try:
+            prices = pd.read_csv(price_path)
+        except Exception:
+            continue
+
+        if prices.empty or "timestamp" not in prices.columns or "close" not in prices.columns:
+            continue
+
+        prices["timestamp"] = pd.to_datetime(prices["timestamp"], errors="coerce")
+        prices["close"] = pd.to_numeric(prices["close"], errors="coerce")
+        prices = prices.dropna(subset=["timestamp", "close"]).sort_values("timestamp").reset_index(drop=True)
+
+        if prices.empty:
+            continue
+
+        news_date = pd.Timestamp(news_dt.date())
+
+        # first trading day on or after news date
+        # leakage-safe: first trading day strictly AFTER news date
+        candidates = prices[prices["timestamp"] > news_date]
+        if candidates.empty:
+            continue
+
+        start_idx = int(candidates.index[0])
+        start_date = prices.loc[start_idx, "timestamp"]
+        start_close = float(prices.loc[start_idx, "close"])
+        if candidates.empty:
+            continue
+
+        start_idx = int(candidates.index[0])
+        start_close = float(prices.loc[start_idx, "close"])
+
+        for h in horizons:
+            future_idx = start_idx + int(h)
+
+            # future price not available yet
+            if future_idx >= len(prices):
+                continue
+
+            future_close = float(prices.loc[future_idx, "close"])
+            future_date = prices.loc[future_idx, "timestamp"]
+            future_return = (future_close / start_close) - 1.0
+
+            actual_sign = 1 if future_return > 0 else (-1 if future_return < 0 else 0)
+            correct = bool(predicted_sign == actual_sign) if actual_sign != 0 else None
+
+            rows.append(
+                {
+                    "ticker": ticker,
+                    "news_date": str(news_date.date()),
+                    "start_price_date": str(start_date.date()),
+                    "future_price_date": str(future_date.date()),
+                    "start_close": float(start_close),
+                    "future_close": float(future_close),
+                    "horizon_days": int(h),
+                    "headline": art.get("headline"),
+                    "source": art.get("source"),
+                    "sentiment": float(sentiment),
+                    "confidence": float(confidence) if confidence is not None else None,
+                    "predicted_direction": predicted_direction,
+                    "future_return": float(future_return),
+                    "actual_direction": "positive" if actual_sign > 0 else "negative" if actual_sign < 0 else "flat",
+                    "correct": correct,
+                }
+            )
+
+    if not rows:
+        return {
+            "ok": False,
+            "reason": "No evaluable news articles. Future prices may not be available yet.",
+            "rows": [],
+            "summary": {},
+        }
+
+    df = pd.DataFrame(rows)
+
+    summary = {}
+    for h, g in df.groupby("horizon_days"):
+        valid = g[g["correct"].notna()]
+        accuracy = float(valid["correct"].mean()) if len(valid) else None
+
+        corr = None
+        try:
+            corr = float(g[["sentiment", "future_return"]].corr().iloc[0, 1])
+            if not np.isfinite(corr):
+                corr = None
+        except Exception:
+            corr = None
+
+        summary[int(h)] = {
+            "n": int(len(g)),
+            "valid_n": int(len(valid)),
+            "direction_accuracy": accuracy,
+            "avg_future_return": float(g["future_return"].mean()),
+            "sentiment_future_return_corr": corr,
+        }
+
+    return {
+        "ok": True,
+        "rows": rows,
+        "summary": summary,
+    }
+
+def build_historical_news_prediction_evaluation(
+    *,
+    tickers: List[str],
+    lookback_days: int = 365,
+    exclude_recent_days: int = 14,
+    max_items_per_ticker: int = 100,
+    price_dir: str = "data/raw/daily_yahoo",
+    horizons: List[int] = [1, 3, 7],
+    sentiment_threshold: float = 0.05,
+    model_name: str = FINBERT_MODEL_NAME,
+    batch_size: int = 16,
+) -> Dict[str, Any]:
+
+    tickers = [_normalize_ticker(t) for t in tickers if _normalize_ticker(t)]
+
+    fetched = historical_news_agent_fetch_for_tickers(
+        tickers=tickers,
+        include_news=True,
+        lookback_days=lookback_days,
+        exclude_recent_days=exclude_recent_days,
+        max_items_per_ticker=max_items_per_ticker,
+        cache_ttl_s=86400,
+        sleep_s=0.25,
+    )
+
+    raw_news = (fetched or {}).get("flat_items") or []
+    evidence_map = (fetched or {}).get("evidence_map") or {}
+
+    base_payload = {
+        "from_date": (fetched or {}).get("from_date"),
+        "to_date": (fetched or {}).get("to_date"),
+        "lookback_days": lookback_days,
+        "exclude_recent_days": exclude_recent_days,
+        "tickers": tickers,
+        "fetch_stats": (fetched or {}).get("stats") or {},
+        "raw_news_count": len(raw_news),
+        "evidence_map_count": len(evidence_map),
+        "sample_news": raw_news[:10],
+        "thesis_framing": (
+            "This evaluation does not test FinBERT as a general sentiment classifier. "
+            "It tests whether FinBERT-based historical news signals are directionally "
+            "aligned with subsequent stock returns for the selected portfolio tickers."
+        ),
+    }
+
+    if not raw_news:
+        return {
+            "ok": False,
+            "reason": "No historical news could be fetched for the selected tickers.",
+            "rows": [],
+            "summary": {},
+            "article_signal_count": 0,
+            **base_payload,
+        }
+
+    article_signals = build_article_signals_with_finbert(
+        raw_news=raw_news,
+        tickers=tickers,
+        model_name=model_name,
+        batch_size=batch_size,
+    )
+
+    if not article_signals:
+        return {
+            "ok": False,
+            "reason": "Historical news was fetched, but FinBERT produced no usable article signals.",
+            "rows": [],
+            "summary": {},
+            "article_signal_count": 0,
+            "sample_article_signals": [],
+            **base_payload,
+        }
+
+    article_signal_dicts = [asdict(x) for x in article_signals]
+
+    evaluation = evaluate_news_prediction_against_future_returns(
+        article_signals=article_signal_dicts,
+        price_dir=price_dir,
+        horizons=horizons,
+        sentiment_threshold=sentiment_threshold,
+    )
+
+    rows = evaluation.get("rows") or []
+
+    evaluation.update(
+        {
+            **base_payload,
+            "historical_news_count": len(raw_news),
+            "article_signal_count": len(article_signals),
+            "sample_article_signals": article_signal_dicts[:10],
+            "sample_rows": rows[:20],
+            "horizons": horizons,
+            "sentiment_threshold": sentiment_threshold,
+            "price_dir": price_dir,
+        }
+    )
+
+    return evaluation
 # =========================================================
 # MAIN ENTRY
 # =========================================================
@@ -608,6 +1008,22 @@ def build_probabilistic_news_adjusted_inputs(
         variance_weight=0.45,
         variance_scale=3.0,
     )
+    prediction_evaluation = evaluate_news_prediction_against_future_returns(
+        article_signals=[asdict(x) for x in article_signals],
+        price_dir="data/raw/daily_yahoo",
+        horizons=[1, 3, 7],
+    )
+    historical_prediction_evaluation = build_historical_news_prediction_evaluation(
+            tickers=tickers,
+            lookback_days=365,
+            exclude_recent_days=14,
+            max_items_per_ticker=20,
+            price_dir="data/raw/daily_yahoo",
+            horizons=[1, 3, 7],
+            sentiment_threshold=0.05,
+            model_name=model_name,
+            batch_size=batch_size,
+        )
 
     return {
         "raw_news": raw_news,
@@ -625,6 +1041,8 @@ def build_probabilistic_news_adjusted_inputs(
             "batch_size": batch_size,
         },
         "prediction_signals": prediction_signals,
+        "prediction_evaluation": prediction_evaluation,
+        "historical_prediction_evaluation": historical_prediction_evaluation,
     }
 
 

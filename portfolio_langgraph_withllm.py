@@ -13,8 +13,10 @@ from collections import Counter
 import pandas as pd
 from langgraph.graph import StateGraph, END
 
+
 from probabilistic_news_integration import (
     build_adjusted_inputs_from_existing_news_state,
+    evaluate_news_adjustment_effect,  
 )
 from agents_langgraph import (
     data_agent_get_mu_cov,
@@ -104,6 +106,10 @@ class PortfolioState(TypedDict, total=False):
     # ✅ NEW: News action stage outputs
     news_actions: Optional[List[Dict[str, Any]]]
     news_actions_verifier: Optional[Dict[str, Any]]
+    news_adjustment_evaluation: Optional[Dict[str, Any]]
+    prob_prediction_evaluation: Optional[Dict[str, Any]]
+
+
 
     debug_notes: List[str]
     explanation: str
@@ -122,6 +128,7 @@ class PortfolioState(TypedDict, total=False):
     prob_beta: Optional[float]
 
     prob_news_trace: Optional[Dict[str, Any]]
+    historical_prediction_evaluation: Optional[Dict[str, Any]]
 
     # ✅ carry the user's previous portfolio (Run Base output) into refine run
     base_portfolio_weights: Optional[Dict[str, float]]
@@ -177,7 +184,11 @@ def _init_defaults(state: PortfolioState) -> PortfolioState:
     state.setdefault("news_evidence_snapshot_ok", None)
     state.setdefault("news_evidence_snapshot_issues", [])
 
+    state.setdefault("news_adjustment_evaluation", None)
+    state.setdefault("prob_prediction_evaluation", None)
+
     state.setdefault("prob_news_trace", None)
+    state.setdefault("historical_prediction_evaluation", None)
     
 
 
@@ -205,6 +216,8 @@ def _init_defaults(state: PortfolioState) -> PortfolioState:
     state.setdefault("prob_adjusted_cov", None)
     state.setdefault("prob_alpha", 0.08)
     state.setdefault("prob_beta", 0.35)
+
+    state.setdefault("historical_prediction_evaluation", None)
 
     return state
 
@@ -1049,6 +1062,9 @@ def node_optimize_prob_news(state: PortfolioState) -> PortfolioState:
             state["prob_adjusted_mu"] = mu_to_use
             state["prob_adjusted_cov"] = cov_to_use
 
+            state["prob_prediction_evaluation"] = news_out.get("prediction_evaluation")
+            state["historical_prediction_evaluation"] = news_out.get("historical_prediction_evaluation")
+
             mu_before = state["mu"].copy()
             cov_before = state["cov"].copy()
 
@@ -1058,6 +1074,7 @@ def node_optimize_prob_news(state: PortfolioState) -> PortfolioState:
                 "ticker_signals": news_out.get("ticker_signals", {}),
                 "prediction_signals": news_out.get("prediction_signals", {}),
                 "article_signals": news_out.get("article_signals", []),
+                "historical_prediction_evaluation": news_out.get("historical_prediction_evaluation"),
                 "mu_before": mu_before.to_dict(),
                 "mu_after": mu_to_use.to_dict(),
                 "mu_delta": (mu_to_use - mu_before).to_dict(),
@@ -1071,6 +1088,7 @@ def node_optimize_prob_news(state: PortfolioState) -> PortfolioState:
                     t: float(cov_to_use.loc[t, t] - cov_before.loc[t, t])
                     for t in cov_before.index
                 },
+
             }
             state["debug_notes"].append(
                 f"[DEBUG MU BEFORE] {mu_before.to_dict()}"
@@ -1098,6 +1116,14 @@ def node_optimize_prob_news(state: PortfolioState) -> PortfolioState:
                 f"OptimizationProbNews: news adjustment failed -> fallback to original mu/cov: {e}"
             )
 
+    base_res = optimization_agent_from_mu_cov(
+    mu=state["mu"],
+    cov=state["cov"],
+    rf=float(state["rf"]),
+    w_max=float(state["w_max"]),
+    lambda_l2=float(state["lambda_l2"]),
+)
+
     res = optimization_agent_from_mu_cov(
         mu=mu_to_use,
         cov=cov_to_use,
@@ -1105,6 +1131,29 @@ def node_optimize_prob_news(state: PortfolioState) -> PortfolioState:
         w_max=float(state["w_max"]),
         lambda_l2=float(state["lambda_l2"]),
     )
+
+    try:
+        chosen = str(state.get("objective_key") or "maxsharpe").lower().strip()
+        if chosen not in base_res:
+            chosen = "maxsharpe"
+        if chosen not in res:
+            chosen = "maxsharpe"
+
+        evaluation = evaluate_news_adjustment_effect(
+            base_weights=base_res.get(chosen, {}).get("weights", {}),
+            base_metrics=base_res.get(chosen, {}),
+            news_weights=res.get(chosen, {}).get("weights", {}),
+            news_metrics=res.get(chosen, {}),
+        )
+
+        state["news_adjustment_evaluation"] = evaluation
+        state["debug_notes"].append(
+            "NewsEvaluation: computed base vs news-adjusted comparison."
+        )
+
+    except Exception as e:
+        state["news_adjustment_evaluation"] = None
+        state["debug_notes"].append(f"NewsEvaluation failed: {e}")
 
     state["optimization_result"] = res
     state["debug_notes"].append("OptimizationProbNews: done.")
@@ -1152,19 +1201,75 @@ def node_extract_candidates(state: PortfolioState) -> PortfolioState:
 def node_risk_candidates(state: PortfolioState) -> PortfolioState:
     tickers = state.get("selected_tickers", [])
     cands = state.get("candidates") or {}
+
     if not tickers or not cands:
         state["debug_notes"].append("RiskCandidates: skipped (missing tickers or candidates).")
         return state
 
+    use_prob_news_metrics = (
+        state.get("mode") != "base"
+        and bool(state.get("use_news", False))
+        and state.get("prob_adjusted_mu") is not None
+        and state.get("prob_adjusted_cov") is not None
+    )
+
     for k, item in cands.items():
-        w = item.get("weights") or {}
-        if not w:
+        w_dict = item.get("weights") or {}
+
+        if not w_dict:
             item["metrics"] = {}
             continue
+
         try:
-            m = risk_agent(w, tickers, rf=float(state["rf"]))
-            m = _attach_concentration_metrics(m, w)
+            if use_prob_news_metrics:
+                # ✅ Important:
+                # The portfolio was optimized with news-adjusted mu/cov,
+                # so its metrics must also be evaluated with the same adjusted inputs.
+                mu_eval = state["prob_adjusted_mu"]
+                cov_eval = state["prob_adjusted_cov"]
+
+                aligned_tickers = list(mu_eval.index)
+                w = pd.Series(w_dict, dtype=float).reindex(aligned_tickers).fillna(0.0)
+
+                s = float(w.sum())
+                if s <= 0:
+                    raise ValueError("Candidate weights sum to zero after alignment.")
+                w = w / s
+
+                ret = float(w.values @ mu_eval.values)
+                vol = float((w.values @ cov_eval.values @ w.values) ** 0.5)
+                sharpe = float((ret - float(state["rf"])) / vol) if vol > 0 else None
+
+                weights_full = {t: float(w.loc[t]) for t in aligned_tickers}
+                active_weights = _extract_active_weights(weights_full)
+
+                m = {
+                    "tickers": aligned_tickers,
+                    "weights": weights_full,
+                    "return": ret,
+                    "vol": vol,
+                    "sharpe": sharpe,
+                    "max_weight": _safe_max_weight(active_weights),
+                    "effective_n": _effective_n(active_weights),
+                    "active_assets": len(active_weights),
+                    "return_pct": ret * 100.0,
+                    "vol_pct": vol * 100.0,
+                    "max_weight_pct": _safe_max_weight(active_weights) * 100.0,
+                    "rc_abs": [],
+                    "rc_pct": [],
+                }
+
+                state["debug_notes"].append(
+                    f"RiskCandidates(PROB_NEWS): {k} evaluated with adjusted mu/cov."
+                )
+
+            else:
+                # ✅ Normal/base/LLM-action flow stays unchanged
+                m = risk_agent(w_dict, tickers, rf=float(state["rf"]))
+                m = _attach_concentration_metrics(m, w_dict)
+
             item["metrics"] = _normalize_metrics(m, rf=float(state["rf"]))
+
         except Exception as e:
             item["metrics"] = {}
             state["debug_notes"].append(f"RiskCandidates: failed for {k}: {e}")
@@ -1839,7 +1944,35 @@ def node_llm_select_candidate(state: PortfolioState) -> PortfolioState:
         }
         state["debug_notes"].append("LLM_Select(BASE): accept (no selection).")
         return state
+    
+        # ✅ Mathematical news integration:
+    # News already changed mu/cov before optimization.
+    # Do NOT let LLM switch maxsharpe/minvar here.
+    # Keep objective fixed for clean thesis evaluation.
+    if (
+        state.get("mode") != "base"
+        and bool(state.get("use_news", False))
+        and state.get("prob_news_signals") is not None
+    ):
+        chosen = str(state.get("objective_key") or "maxsharpe").lower().strip()
+        candidates = state.get("candidates") or {}
 
+        if chosen not in candidates:
+            chosen = "maxsharpe" if "maxsharpe" in candidates else next(iter(candidates.keys()))
+
+        state["chosen_candidate"] = chosen  # type: ignore
+        state["llm_decision"] = {
+            "decision": "accept",
+            "rationale": (
+                "Mathematical news integration: candidate selection is locked to the base objective. "
+                "News affects the optimization inputs, not the objective choice."
+            ),
+            "chosen_candidate": chosen,
+        }
+        state["debug_notes"].append(
+            f"LLM_Select(PROB_NEWS_LOCK): chosen={chosen}, LLM candidate selection skipped."
+        )
+        return state
     prefs = _merged_prefs(state)
     satisfaction = str(prefs.get("satisfaction") or "").lower().strip()
 
@@ -2364,7 +2497,7 @@ def run_graph_prob_news(
         "current_weights": current_weights,
         "debug_notes": [],
         "clarification_answers": clarification_answers,
-        "objective_key": "maxsharpe",
+        "objective_key": str(base_portfolio_objective or "maxsharpe").lower().strip(),
         "chosen_candidate": None,
         "candidates": {},
         "llm_decision": None,
@@ -2392,7 +2525,10 @@ def run_graph_prob_news(
         "prob_alpha": float(prob_alpha),
         "prob_beta": float(prob_beta),
 
+        "news_adjustment_evaluation": None,
         "prob_news_trace": None,
+        "prob_prediction_evaluation": None,
+        "historical_prediction_evaluation": None,
     }
 
     out = app.invoke(init, config={"recursion_limit": 200})

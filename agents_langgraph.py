@@ -1217,7 +1217,60 @@ def fetch_company_news_for_ticker(
     items = _limit_items(items, max_items=max_items)
     return items
 
+def fetch_company_news_for_ticker_window(
+    ticker: str,
+    *,
+    from_date: str,
+    to_date: str,
+    max_items: int = 40,
+    cache_ttl_s: int = 86400,
+    sleep_s: float = 0.25,
+) -> List[Dict[str, Any]]:
+    """
+    Historical company news fetch for a fixed date window.
+    Uses the same Finnhub endpoint, cache, limit, and sleep logic as current news.
+    """
+    ticker = str(ticker).upper().strip()
 
+    data = _finnhub_get(
+        "/company-news",
+        {"symbol": ticker, "from": from_date, "to": to_date},
+        cache_ttl_s=cache_ttl_s,
+    )
+
+    if sleep_s and sleep_s > 0:
+        time.sleep(float(sleep_s))
+
+    if not isinstance(data, list):
+        return []
+
+    items = []
+    for d in data:
+        if not isinstance(d, dict):
+            continue
+
+        dt_epoch = int(d.get("datetime") or 0)
+        date_str = _fmt_news_date_from_datetime(dt_epoch)
+
+        items.append(
+            {
+                "id": d.get("id"),
+                "ticker": ticker,
+                "provider": "finnhub_company_historical",
+                "date": date_str,
+                "datetime": dt_epoch,
+                "source": str(d.get("source") or "").strip(),
+                "headline": str(d.get("headline") or "").strip(),
+                "summary": str(d.get("summary") or ""),
+                "url": str(d.get("url") or "").strip(),
+                "related": str(d.get("related") or ""),
+                "category": str(d.get("category") or ""),
+            }
+        )
+
+    items = _dedup_news_items(items)
+    items = _limit_items(items, max_items=max_items)
+    return items
 def fetch_market_news(
     *,
     category: str = "general",
@@ -1417,6 +1470,108 @@ def news_agent_fetch_for_tickers(
             "total_items": total_items,
             "company_used": used_company,
             "fallback_used": used_fb,
+            "errors": errors,
+            "skipped": False,
+        },
+    }
+
+def historical_news_agent_fetch_for_tickers(
+    tickers: List[str],
+    *,
+    include_news: bool = True,
+    lookback_days: int = 365,
+    exclude_recent_days: int = 14,
+    max_items_per_ticker: int = 20,
+    cache_ttl_s: int = 86400,
+    sleep_s: float = 0.25,
+) -> Dict[str, Any]:
+    """
+    Historical news fetch for predictive evaluation only.
+
+    It uses the same Finnhub company-news endpoint and the same safety controls
+    as the normal news fetcher, but requests an older date window:
+
+        from = today - lookback_days
+        to   = today - exclude_recent_days
+
+    This avoids evaluating today's news where future prices are unavailable.
+    """
+    tickers = [str(t).upper().strip() for t in (tickers or []) if str(t).strip()]
+    tickers = list(dict.fromkeys(tickers))
+
+    if not include_news:
+        return {
+            "lookback_days": int(lookback_days),
+            "exclude_recent_days": int(exclude_recent_days),
+            "items_by_ticker": {t: [] for t in tickers},
+            "flat_items": [],
+            "evidence_map": {},
+            "items_by_id": {},
+            "stats": {
+                "tickers": len(tickers),
+                "total_items": 0,
+                "errors": {},
+                "skipped": True,
+            },
+        }
+    to_days_ago = int(exclude_recent_days)
+    from_days_ago = int(exclude_recent_days) + int(lookback_days)
+
+    from_date = _utc_date_str(days_ago=from_days_ago)
+    to_date = _utc_date_str(days_ago=to_days_ago)
+
+    items_by_ticker: Dict[str, List[Dict[str, Any]]] = {}
+    errors: Dict[str, str] = {}
+
+    for t in tickers:
+        try:
+            items = fetch_company_news_for_ticker_window(
+                t,
+                from_date=from_date,
+                to_date=to_date,
+                max_items=max_items_per_ticker,
+                cache_ttl_s=cache_ttl_s,
+                sleep_s=sleep_s,
+            )
+            items_by_ticker[t] = items
+        except Exception as e:
+            errors[t] = str(e)
+            items_by_ticker[t] = []
+
+    flat: List[Dict[str, Any]] = []
+    for t in tickers:
+        for it in items_by_ticker.get(t, []):
+            cp = dict(it)
+            cp["ticker"] = str(cp.get("ticker") or t).upper().strip()
+            flat.append(cp)
+
+    flat_with_ids, evidence_map = assign_evidence_ids_and_map(flat)
+
+    new_items_by_ticker: Dict[str, List[Dict[str, Any]]] = {t: [] for t in tickers}
+    for it in flat_with_ids:
+        t = str(it.get("ticker") or "").upper().strip()
+        if t not in new_items_by_ticker:
+            new_items_by_ticker[t] = []
+        new_items_by_ticker[t].append(it)
+
+    news_items_by_id = {
+        str(it.get("evidence_id")): it
+        for it in flat_with_ids
+        if str(it.get("evidence_id") or "").strip()
+    }
+
+    return {
+        "lookback_days": int(lookback_days),
+        "exclude_recent_days": int(exclude_recent_days),
+        "from_date": from_date,
+        "to_date": to_date,
+        "items_by_ticker": new_items_by_ticker,
+        "flat_items": flat_with_ids,
+        "evidence_map": evidence_map,
+        "items_by_id": news_items_by_id,
+        "stats": {
+            "tickers": len(tickers),
+            "total_items": len(flat_with_ids),
             "errors": errors,
             "skipped": False,
         },

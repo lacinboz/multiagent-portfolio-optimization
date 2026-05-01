@@ -167,7 +167,187 @@ def _extract_weights_and_metrics(state: Dict[str, Any]):
 # not used function 
 def _active_portfolio_label(is_refined: bool) -> str:
     return "Refined Portfolio" if is_refined else "Base Portfolio"
+def _render_news_adjustment_evaluation(evaluation: Optional[Dict[str, Any]]):
+    if not isinstance(evaluation, dict) or not evaluation:
+        st.info("No news adjustment evaluation available.")
+        return
 
+    st.markdown("**Portfolio-level News/FinBERT effect**")
+    st.caption(evaluation.get("thesis_framing", ""))
+
+    base = evaluation.get("base") or {}
+    news = evaluation.get("news_adjusted") or {}
+    deltas = evaluation.get("deltas") or {}
+    effects = evaluation.get("effects") or {}
+    weight_changes = evaluation.get("weight_changes") or {}
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        st.markdown("**Base**")
+        st.write(f"Return: {_fmt_pct_from_decimal(_safe_float(base.get('return')))}")
+        st.write(f"Volatility: {_fmt_pct_from_decimal(_safe_float(base.get('vol')))}")
+        st.write(f"Sharpe: {_fmt_num(_safe_float(base.get('sharpe')))}")
+        st.write(f"Max weight: {_fmt_pct_from_decimal(_safe_float(base.get('max_weight')))}")
+        st.write(f"Effective N: {_fmt_num(_safe_float(base.get('effective_n')))}")
+
+    with c2:
+        st.markdown("**News-adjusted**")
+        st.write(f"Return: {_fmt_pct_from_decimal(_safe_float(news.get('return')))}")
+        st.write(f"Volatility: {_fmt_pct_from_decimal(_safe_float(news.get('vol')))}")
+        st.write(f"Sharpe: {_fmt_num(_safe_float(news.get('sharpe')))}")
+        st.write(f"Max weight: {_fmt_pct_from_decimal(_safe_float(news.get('max_weight')))}")
+        st.write(f"Effective N: {_fmt_num(_safe_float(news.get('effective_n')))}")
+
+    with c3:
+        st.markdown("**Delta**")
+        st.write(f"Δ Return: {_fmt_pct_from_decimal(_safe_float(deltas.get('return')))}")
+        st.write(f"Δ Volatility: {_fmt_pct_from_decimal(_safe_float(deltas.get('vol')))}")
+        st.write(f"Δ Sharpe: {_fmt_num(_safe_float(deltas.get('sharpe')))}")
+        st.write(f"Δ Max weight: {_fmt_pct_from_decimal(_safe_float(deltas.get('max_weight')))}")
+        st.write(f"Δ Effective N: {_fmt_num(_safe_float(deltas.get('effective_n')))}")
+        st.write(f"Turnover: {_fmt_pct_from_decimal(_safe_float(deltas.get('turnover')))}")
+
+    st.markdown("**Interpretation labels**")
+    st.write(f"- Risk effect: `{effects.get('risk_effect', 'unknown')}`")
+    st.write(f"- Efficiency effect: `{effects.get('efficiency_effect', 'unknown')}`")
+    st.write(f"- Concentration effect: `{effects.get('concentration_effect', 'unknown')}`")
+
+    if isinstance(weight_changes, dict) and weight_changes:
+        rows = []
+        for ticker, values in weight_changes.items():
+            if not isinstance(values, dict):
+                continue
+            rows.append(
+                {
+                    "Ticker": ticker,
+                    "Base weight": values.get("base_weight"),
+                    "News-adjusted weight": values.get("news_weight"),
+                    "Δ weight": values.get("delta_weight"),
+                }
+            )
+
+        if rows:
+            df = pd.DataFrame(rows)
+            for col in ["Base weight", "News-adjusted weight", "Δ weight"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            df = df.sort_values("Δ weight", key=lambda s: s.abs(), ascending=False)
+
+            with st.expander("Weight changes per ticker"):
+                st.dataframe(
+                    df.style.format(
+                        {
+                            "Base weight": "{:.2%}",
+                            "News-adjusted weight": "{:.2%}",
+                            "Δ weight": "{:+.2%}",
+                        }
+                    ),
+                    use_container_width=True,
+                )
+
+def _render_prediction_evaluation(
+    evaluation: Optional[Dict[str, Any]],
+    *,
+    title: str = "News signal predictive evaluation",
+    caption: Optional[str] = None,
+):
+    if not isinstance(evaluation, dict) or not evaluation:
+        st.info("No prediction evaluation available.")
+        return
+
+    if not evaluation.get("ok"):
+        st.warning(evaluation.get("reason", "Prediction evaluation could not be computed."))
+        return
+
+    st.markdown(f"**{title}**")
+
+    if caption:
+        st.caption(caption)
+    else:
+        st.caption(
+            "This checks whether FinBERT-based news directions matched subsequent realized stock returns."
+        )
+    from_date = evaluation.get("from_date")
+    to_date = evaluation.get("to_date")
+    raw_news_count = evaluation.get("raw_news_count")
+    article_signal_count = evaluation.get("article_signal_count")
+    tickers_used = evaluation.get("tickers") or []
+
+    st.caption(
+        f"Window: {from_date or '–'} → {to_date or '–'} | "
+        f"Tickers: {', '.join(tickers_used) if tickers_used else '–'} | "
+        f"Raw news: {raw_news_count or 0} | "
+        f"FinBERT signals: {article_signal_count or 0}"
+    )
+
+    summary = evaluation.get("summary") or {}
+    rows = evaluation.get("rows") or []
+
+    if summary:
+        summary_rows = []
+        for horizon, vals in summary.items():
+            if not isinstance(vals, dict):
+                continue
+            summary_rows.append(
+                {
+                    "Horizon": f"{horizon} trading day(s)",
+                    "N": vals.get("n"),
+                    "Valid N": vals.get("valid_n"),
+                    "Direction accuracy": vals.get("direction_accuracy"),
+                    "Avg future return": vals.get("avg_future_return"),
+                    "Sentiment-return corr": vals.get("sentiment_future_return_corr"),
+                }
+            )
+
+        if summary_rows:
+            df_sum = pd.DataFrame(summary_rows)
+            st.dataframe(
+                df_sum.style.format(
+                    {
+                        "Direction accuracy": "{:.1%}",
+                        "Avg future return": "{:.2%}",
+                        "Sentiment-return corr": "{:.3f}",
+                    },
+                    na_rep="–",
+                ),
+                use_container_width=True,
+            )
+
+    if rows:
+        df = pd.DataFrame(rows)
+        keep_cols = [
+            "ticker",
+            "news_date",
+            "horizon_days",
+            "predicted_direction",
+            "future_return",
+            "actual_direction",
+            "correct",
+            "sentiment",
+            "confidence",
+            "start_price_date",
+            "future_price_date",
+            "start_close",
+            "future_close",
+            "headline",
+            "source",
+            
+        ]
+        df = df[[c for c in keep_cols if c in df.columns]]
+
+        with st.expander("Article-level prediction checks"):
+            st.dataframe(
+                df.style.format(
+                    {
+                        "future_return": "{:.2%}",
+                        "sentiment": "{:.3f}",
+                        "confidence": "{:.3f}",
+                    },
+                    na_rep="–",
+                ),
+                use_container_width=True,
+                height=350,
+            )
 def _render_prob_news_trace(trace: Optional[Dict[str, Any]]):
     if not isinstance(trace, dict) or not trace:
         st.info("No mathematical news trace available.")
@@ -1031,8 +1211,8 @@ def _run_prob_news_refine_flow(
         base_portfolio_metrics=base_state.get("optimized_metrics"),
         base_portfolio_weights=base_state.get("optimized_weights"),
         base_portfolio_objective=base_state.get("objective_key"),
-        prob_alpha=0.12,
-        prob_beta=0.35,
+        prob_alpha=0.15,
+        prob_beta=0.08,
     )
 
     st.session_state["refined_state"] = refined_state
@@ -1483,6 +1663,12 @@ else:
                                     "explanation": (out or {}).get("explanation"),
                                     "insight_raw_text": (out or {}).get("insight_raw_text"),
                                     "prob_news_trace": (out or {}).get("prob_news_trace"),
+                                    "news_adjustment_evaluation": (out or {}).get("news_adjustment_evaluation"),
+                                    "prob_prediction_evaluation": (out or {}).get("prob_prediction_evaluation"),
+
+                                    "historical_prediction_evaluation": (out or {}).get("historical_prediction_evaluation")
+                                    or ((out or {}).get("prob_news_trace") or {}).get("historical_prediction_evaluation"),
+
 
                                 },
                             )
@@ -1670,6 +1856,11 @@ else:
                 objective_key = payload.get("objective_key")
                 base_objective = payload.get("base_objective")
                 prob_news_trace = payload.get("prob_news_trace")
+                news_adjustment_evaluation = payload.get("news_adjustment_evaluation")
+                prob_prediction_evaluation = payload.get("prob_prediction_evaluation")
+
+                historical_prediction_evaluation = payload.get("historical_prediction_evaluation")
+                
 
                 st.markdown("**News-integrated refine result**")
                 st.write("Recent news was incorporated into the optimization inputs before re-optimizing the portfolio.")
@@ -1696,7 +1887,20 @@ else:
                     st.write(f"Δ Volatility: {_fmt_pct_from_decimal(d_vol)}")
                     st.write(f"Δ Sharpe: {_fmt_num(d_sharpe)}")
 
-                
+                if news_adjustment_evaluation:
+                    with st.expander("Show portfolio-level news adjustment evaluation", expanded=True):
+                        _render_news_adjustment_evaluation(news_adjustment_evaluation)
+                if historical_prediction_evaluation:
+                    with st.expander("Show historical news predictive evaluation", expanded=False):
+                        _render_prediction_evaluation(
+                            historical_prediction_evaluation,
+                            title="Historical news predictive evaluation",
+                            caption=(
+                                "This does not test FinBERT as a general sentiment classifier. "
+                                "It tests whether FinBERT-based historical news signals were directionally aligned "
+                                "with subsequent stock returns for the selected portfolio tickers."
+                            ),
+                        )
                 if prob_news_trace:
                         with st.expander("Show how news changed the mathematical model"):
                             _render_prob_news_trace(prob_news_trace)
