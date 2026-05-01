@@ -58,6 +58,7 @@ _ALLOWED_CHAT_INTENTS = {
     "run_refine_candidate_selection",
     "show_final_portfolio_insight",
     "clarify_news_usage_mode",
+    "compare_base_refined_metrics",
 
 }
 
@@ -572,6 +573,7 @@ class LLMClient:
                 "- clarify_news_usage_mode\n"
                 "- run_refine_candidate_selection\n"
                 "- show_final_portfolio_insight\n"
+                "- compare_base_refined_metrics\n"
                 "- unsupported\n"
                 "Rules:\n"
                 "- If the message is not about portfolio optimization, portfolio refinement, final portfolio insight, news overview, or news-based actions, return unsupported.\n"
@@ -597,13 +599,15 @@ class LLMClient:
                 "return intent='clarify_news_usage_mode'.\n"
                 "- If the user asks to make the portfolio safer, smoother, less risky, more defensive, or lower risk, "
                 "return intent='run_refine_candidate_selection'.\n"
+                "- If the user asks to compare base and refined portfolios, asks what changed after refinement, asks for before/after metrics, or says 'show me what changed', "
+                "return intent='compare_base_refined_metrics'.\n"
                 "- If the user asks for insight, explanation, interpretation, or a description of the current, final, or active portfolio without asking to change it, "
                 "return intent='show_final_portfolio_insight'.\n"
                 "- If the user asks to create or run the first portfolio, return intent='run_base_portfolio'.\n"
                 "Schema:\n"
                 "{\n"
                 '  "supported": true|false,\n'
-                '  "intent": "run_base_portfolio"|"run_news_overview"|"generate_news_actions"|"clarify_news_usage_mode"|"run_refine_candidate_selection"|"show_final_portfolio_insight"|"unsupported",\n'
+                '  "intent": "run_base_portfolio"|"run_news_overview"|"generate_news_actions"|"clarify_news_usage_mode"|"run_refine_candidate_selection"|"show_final_portfolio_insight"|"compare_base_refined_metrics"|"unsupported",\n'
                 '  "parameters": {\n'
                 '     "pain_points": [string],\n'
                 '     "excluded_assets": [string],\n'
@@ -650,6 +654,21 @@ class LLMClient:
                     "describe the portfolio", "summarize this portfolio", "summarise this portfolio",  "current portfolio explanation", "active portfolio explanation"
                 ]):
                      j = {"supported": True, "intent": "show_final_portfolio_insight", "parameters": {}, "reply": ""}
+
+                elif any(x in s for x in [
+                    "compare base and refined",
+                    "compare base vs refined",
+                    "base vs refined",
+                    "before after",
+                    "before/after",
+                    "show me what changed",
+                    "what changed after refine",
+                    "what changed after refinement",
+                    "compare the portfolios",
+                    "metric comparison",
+                    "compare metrics",
+                ]):
+                    j = {"supported": True, "intent": "compare_base_refined_metrics", "parameters": {}, "reply": ""}
                 elif any(x in s for x in [
                     "use news",
                     "include news",

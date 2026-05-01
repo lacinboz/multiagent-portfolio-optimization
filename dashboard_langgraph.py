@@ -521,8 +521,98 @@ def _portfolio_summary_from_state(state: Optional[Dict[str, Any]]) -> Optional[D
         "max_weight": max_w,
         "effective_n": eff_n,
     }
+def _render_base_vs_refined_metric_chart(
+    base_sum: Optional[Dict[str, Any]],
+    ref_sum: Optional[Dict[str, Any]],
+    chart_key: str = "base_vs_refined_metric_chart",
+):
+    if base_sum is None:
+        return
 
+    if ref_sum is None:
+        st.info("Run refinement to see the Before / After metric comparison chart.")
+        return
 
+    rows = [
+        {
+            "Metric": "Return",
+            "Base": _safe_float(base_sum.get("return")),
+            "Refined": _safe_float(ref_sum.get("return")),
+            "Format": "percent",
+        },
+        {
+            "Metric": "Volatility",
+            "Base": _safe_float(base_sum.get("vol")),
+            "Refined": _safe_float(ref_sum.get("vol")),
+            "Format": "percent",
+        },
+        {
+            "Metric": "Sharpe",
+            "Base": _safe_float(base_sum.get("sharpe")),
+            "Refined": _safe_float(ref_sum.get("sharpe")),
+            "Format": "number",
+        },
+        {
+            "Metric": "Effective N",
+            "Base": _safe_float(base_sum.get("effective_n")),
+            "Refined": _safe_float(ref_sum.get("effective_n")),
+            "Format": "number",
+        },
+        {
+            "Metric": "Max Weight",
+            "Base": _safe_float(base_sum.get("max_weight")),
+            "Refined": _safe_float(ref_sum.get("max_weight")),
+            "Format": "percent",
+        },
+    ]
+
+    df = pd.DataFrame(rows)
+    df = df.dropna(subset=["Base", "Refined"], how="all")
+
+    if df.empty:
+        st.info("No comparable metrics available.")
+        return
+
+    df_long = df.melt(
+        id_vars=["Metric", "Format"],
+        value_vars=["Base", "Refined"],
+        var_name="Portfolio",
+        value_name="Value",
+    )
+
+    fig = px.bar(
+        df_long,
+        x="Metric",
+        y="Value",
+        color="Portfolio",
+        barmode="group",
+        text="Value",
+    )
+
+    fig.update_traces(
+        texttemplate="%{text:.2f}",
+        textposition="outside",
+        cliponaxis=False,
+    )
+
+    fig.update_layout(
+        paper_bgcolor="#0b1020",
+        plot_bgcolor="#0b1020",
+        font=dict(color="#E2E6FF"),
+        margin=dict(l=10, r=10, t=30, b=10),
+        yaxis_title="Metric value",
+        xaxis_title="",
+        legend_title="",
+        height=420,
+    )
+
+    st.plotly_chart(fig, use_container_width=True, key=chart_key)
+
+    st.caption(
+        "Before / After comparison of the base portfolio and the refined portfolio. "
+        "Return, volatility, and max weight are shown as decimal values in the chart "
+        "(e.g. 0.30 = 30%)."
+    )
 def _fmt_pct_from_decimal(x: Optional[float]) -> str:
     if x is None or not np.isfinite(x):
         return "–"
@@ -1379,6 +1469,56 @@ def _handle_chat_command(
                 "insight_raw_text": (out or {}).get("insight_raw_text"),
             },
         )
+
+    elif intent == "compare_base_refined_metrics":
+        base_sum = _portfolio_summary_from_state(st.session_state.get("base_state"))
+        ref_sum = _portfolio_summary_from_state(st.session_state.get("refined_state"))
+
+        if base_sum is None:
+            _append_chat_message(
+                "assistant",
+                "Please run the base portfolio first, then I can compare it with the refined portfolio."
+            )
+            return
+
+        if ref_sum is None:
+            _append_chat_message(
+                "assistant",
+                "Base portfolio is available, but no refined portfolio exists yet. Please refine the portfolio first."
+            )
+            return
+
+        _append_chat_message(
+            "assistant",
+            "Here is the Before / After comparison between the base and refined portfolio.",
+            kind="metric_comparison_chart",
+            payload={},
+        )
+
+    elif intent == "compare_base_refined_metrics":
+        base_sum = _portfolio_summary_from_state(st.session_state.get("base_state"))
+        ref_sum = _portfolio_summary_from_state(st.session_state.get("refined_state"))
+
+        if base_sum is None:
+            _append_chat_message(
+                "assistant",
+                "Please run the base portfolio first, then I can compare it with the refined portfolio."
+            )
+            return
+
+        if ref_sum is None:
+            _append_chat_message(
+                "assistant",
+                "Base portfolio is available, but no refined portfolio exists yet. Please refine the portfolio first."
+            )
+            return
+
+        _append_chat_message(
+            "assistant",
+            "Here is the Before / After comparison between the base and refined portfolio.",
+            kind="metric_comparison_chart",
+            payload={},
+        )
     elif intent == "show_final_portfolio_insight":
         active_state = st.session_state.get("refined_state") or st.session_state.get("base_state")
 
@@ -1585,7 +1725,35 @@ else:
 
     st.markdown("---")
     st.markdown('<div class="section-title">💬 Portfolio Chatbot</div>', unsafe_allow_html=True)
+    with st.expander("ℹ️ What can I ask this chatbot?", expanded=False):
+        st.markdown(
+            """
+            You can ask me to:
 
+            - **Build the base portfolio**  
+            Example: `run base portfolio`
+
+            - **Refine the portfolio**  
+            Example: `make it safer`  
+            Example: `exclude NVDA`
+
+            - **Compare base and refined portfolios**  
+            Example: `show me what changed`  
+            Example: `compare base and refined`
+
+            - **Explain the active portfolio**  
+            Example: `explain this portfolio`
+
+            - **Use recent news**  
+            Example: `use news in the portfolio`
+
+            - **Show a news overview**  
+            Example: `show news overview`
+
+            - **Generate actions from news**  
+            Example: `generate actions from news`
+            """
+        )
     for msg_idx, msg in enumerate(st.session_state.get("chat_history", [])):
         with st.chat_message(msg["role"]):
             st.write(msg["content"])
@@ -1817,6 +1985,17 @@ else:
                     st.markdown("**Evidence snapshot**")
                     st.markdown(evidence_snapshot)
 
+            elif kind == "metric_comparison_chart":
+                base_sum = _portfolio_summary_from_state(st.session_state.get("base_state"))
+                ref_sum = _portfolio_summary_from_state(st.session_state.get("refined_state"))
+
+                st.markdown("**Before / After Metric Comparison**")
+                _render_base_vs_refined_metric_chart(
+                    base_sum,
+                    ref_sum,
+                    chart_key=f"chat_metric_comparison_chart_{msg_idx}",
+                )
+
             elif kind == "refine_result":
                 chosen = payload.get("chosen_candidate")
                 explanation = payload.get("explanation")
@@ -1977,6 +2156,14 @@ ref_sum = _portfolio_summary_from_state(st.session_state.get("refined_state"))
 if base_sum is None:
     st.info("Run **Base Portfolio** first to enable evaluation.")
 else:
+    st.markdown("**Before / After Metric Comparison**")
+    _render_base_vs_refined_metric_chart(
+    base_sum,
+    ref_sum,
+    chart_key="evaluation_base_vs_refined_metric_chart",
+)
+
+    st.markdown("---")
     col1, col2, col3 = st.columns([1.0, 1.0, 1.0])
 
     with col1:
