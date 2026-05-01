@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import json
@@ -1890,6 +1891,7 @@ else:
                 if news_adjustment_evaluation:
                     with st.expander("Show portfolio-level news adjustment evaluation", expanded=True):
                         _render_news_adjustment_evaluation(news_adjustment_evaluation)
+
                 if historical_prediction_evaluation:
                     with st.expander("Show historical news predictive evaluation", expanded=False):
                         _render_prediction_evaluation(
@@ -1901,6 +1903,34 @@ else:
                                 "with subsequent stock returns for the selected portfolio tickers."
                             ),
                         )
+
+                with st.expander("Show expected return calculation debug"):
+                    debug_path = "data/processed_yahoo/debug_daily_vs_annual_returns.csv"
+
+                    st.caption(
+                        "Expected returns are annualized from historical daily mean returns: "
+                        "μ_annual = μ_daily × 252. These are model inputs, not guaranteed future returns."
+                    )
+
+                    if os.path.exists(debug_path):
+                        df_debug = pd.read_csv(debug_path, index_col=0)
+
+                        # Optional: sadece seçili tickerları göster
+                        selected_debug_tickers = [t for t in selected_tickers if t in df_debug.index]
+                        if selected_debug_tickers:
+                            df_debug = df_debug.loc[selected_debug_tickers]
+
+                        st.dataframe(
+                            df_debug[
+                                ["mu_daily_pct", "mu_annual_pct", "sigma_daily_pct", "sigma_annual_pct", "sharpe"]
+                            ].round(4),
+                            use_container_width=True,
+                        )
+                    else:
+                        st.info("Debug file not found. Run the Yahoo preprocessing/build script first.")
+
+
+
                 if prob_news_trace:
                         with st.expander("Show how news changed the mathematical model"):
                             _render_prob_news_trace(prob_news_trace)
@@ -2228,5 +2258,7 @@ with bottom_right:
             else:
                 for n in notes:
                     st.write(f"- {n}")
+
+        
 
     st.markdown("</div>", unsafe_allow_html=True)

@@ -54,6 +54,15 @@ sigma_daily = returns.std()
 
 mu_annual = mu_daily * DAYS_PER_YEAR
 sigma_annual = sigma_daily * np.sqrt(DAYS_PER_YEAR)
+debug_mu = pd.DataFrame({
+    "mu_daily": mu_daily,
+    "mu_daily_pct": mu_daily * 100,
+    "mu_annual": mu_annual,
+    "mu_annual_pct": mu_annual * 100,
+})
+
+print("\n=== EXPECTED RETURN DEBUG ===")
+print(debug_mu.round(6))
 
 sharpe = (mu_annual) / sigma_annual
 
@@ -64,6 +73,20 @@ summary = pd.DataFrame({
     "sigma_annual": sigma_annual,
     "sharpe": sharpe
 }).sort_values("sharpe", ascending=False)
+
+debug_returns = summary.copy()
+
+debug_returns["mu_daily_pct"] = debug_returns["mu_daily"] * 100
+debug_returns["mu_annual_pct"] = debug_returns["mu_annual"] * 100
+debug_returns["sigma_daily_pct"] = debug_returns["sigma_daily"] * 100
+debug_returns["sigma_annual_pct"] = debug_returns["sigma_annual"] * 100
+
+print("\n=== DEBUG: Daily vs Annualized Expected Returns ===")
+print(
+    debug_returns[
+        ["mu_daily_pct", "mu_annual_pct", "sigma_daily_pct", "sigma_annual_pct", "sharpe"]
+    ].round(4)
+)
 
 print("\n=== Per-Asset Summary (annualized, daily-based) ===")
 print(summary.round(4))
@@ -78,5 +101,6 @@ returns.to_csv(os.path.join(OUT_DIR, "returns_daily.csv"))
 summary.to_csv(os.path.join(OUT_DIR, "summary_per_asset_annual.csv"))
 cov_daily.to_csv(os.path.join(OUT_DIR, "cov_daily.csv"))
 cov_annual.to_csv(os.path.join(OUT_DIR, "cov_annual.csv"))
+debug_returns.to_csv(os.path.join(OUT_DIR, "debug_daily_vs_annual_returns.csv"))
 
 print("\nSaved processed files under:", OUT_DIR)
