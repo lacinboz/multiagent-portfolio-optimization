@@ -1020,6 +1020,18 @@ def node_optimize(state: PortfolioState) -> PortfolioState:
         state["debug_notes"].append("Optimization: skipped (missing mu/cov).")
         return state
 
+    tickers = list(state.get("selected_tickers", []) or [])
+    n = len(tickers)
+    requested_w_max = float(state["w_max"])
+    effective_w_max = max(requested_w_max, 1.0 / n) if n > 0 else requested_w_max
+
+    state["debug_notes"].append(
+        f"[OPT DEBUG BEFORE] tickers={tickers}, n={n}, "
+        f"requested_w_max={requested_w_max:.4f}, "
+        f"effective_w_max_needed={effective_w_max:.4f}, "
+        f"sum_capacity={n * requested_w_max:.4f}"
+    )
+
     res = optimization_agent_from_mu_cov(
         mu=state["mu"],
         cov=state["cov"],
@@ -1027,8 +1039,26 @@ def node_optimize(state: PortfolioState) -> PortfolioState:
         w_max=float(state["w_max"]),
         lambda_l2=float(state["lambda_l2"]),
     )
+
     state["optimization_result"] = res
-    state["debug_notes"].append("Optimization: done (mu/cov).")
+
+    frontier = res.get("frontier") if isinstance(res, dict) else None
+    state["debug_notes"].append(
+        f"[OPT DEBUG AFTER] result_keys={list(res.keys()) if isinstance(res, dict) else None}, "
+        f"frontier_type={type(frontier).__name__}, "
+        f"frontier_len={len(frontier) if isinstance(frontier, list) else 'not_list'}, "
+        f"has_maxsharpe={'maxsharpe' in res if isinstance(res, dict) else False}, "
+        f"has_minvar={'minvar' in res if isinstance(res, dict) else False}"
+    )
+
+    for k in ["maxsharpe", "minvar"]:
+        if isinstance(res, dict) and k in res:
+            w = (res.get(k) or {}).get("weights", {})
+            state["debug_notes"].append(
+                f"[OPT DEBUG {k}] weights={w}, "
+                f"sum_weights={sum(float(v) for v in w.values()) if isinstance(w, dict) else 'NA'}"
+            )
+
     return state
 
 def node_optimize_prob_news(state: PortfolioState) -> PortfolioState:

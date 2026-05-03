@@ -149,6 +149,18 @@ def run_portfolio_optimization(mu, cov, rf=0.02, w_max=0.30, lambda_l2=1e-3,
     else:
         # fallback (çok nadir)
         r_maxret = float(mu.max())
+    print("[FRONTIER DEBUG]")
+    print("n_assets:", n)
+    print("effective_w_max:", effective_w_max)
+    print("lambda_l2:", lambda_l2)
+    print("r_minvar:", r_minvar)
+    print("r_maxret:", r_maxret)
+
+    print("minvar weights")
+    print(w_minvar.round(4))
+
+    print("maxret weights")
+    print(pd.Series(res_maxret.x, index=tickers).round(4))
 
     lo = float(r_minvar)
     hi = float(r_maxret)

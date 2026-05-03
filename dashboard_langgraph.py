@@ -349,6 +349,66 @@ def _render_prediction_evaluation(
                 use_container_width=True,
                 height=350,
             )
+
+def _render_news_impact_heatmap(
+    df: pd.DataFrame,
+    chart_key: str = "news_impact_heatmap",
+):
+    if df is None or df.empty:
+        st.info("No news impact data available for heatmap.")
+        return
+
+    heatmap_cols = [
+        "FinBERT sentiment",
+        "Confidence",
+        "Expected return adjustment",
+        "Risk adjustment",
+        "Δ μ",
+        "Δ variance",
+    ]
+
+    available_cols = [c for c in heatmap_cols if c in df.columns]
+
+    if not available_cols or "Ticker" not in df.columns:
+        st.info("News impact heatmap cannot be rendered because required columns are missing.")
+        return
+
+    heat_df = df[["Ticker"] + available_cols].copy()
+
+    for col in available_cols:
+        heat_df[col] = pd.to_numeric(heat_df[col], errors="coerce")
+
+    heat_df = heat_df.set_index("Ticker")
+
+    if heat_df.dropna(how="all").empty:
+        st.info("No numeric news impact values available for heatmap.")
+        return
+
+    fig = px.imshow(
+        heat_df,
+        text_auto=".3f",
+        aspect="auto",
+        color_continuous_scale="RdYlGn",
+        origin="lower",
+    )
+
+    fig.update_layout(
+        paper_bgcolor="#0b1020",
+        plot_bgcolor="#0b1020",
+        font=dict(color="#E2E6FF"),
+        margin=dict(l=10, r=10, t=40, b=10),
+        height=max(320, 55 * len(heat_df)),
+        coloraxis_colorbar=dict(title="Value"),
+    )
+
+    fig.update_xaxes(side="top")
+
+    st.plotly_chart(fig, use_container_width=True, key=chart_key)
+
+    st.caption(
+        "This heatmap shows how FinBERT/news signals affected each asset before optimization. "
+        "Positive expected return adjustments increase the return input, while positive risk adjustments or Δ variance increase the risk input."
+    )
 def _render_prob_news_trace(trace: Optional[Dict[str, Any]]):
     if not isinstance(trace, dict) or not trace:
         st.info("No mathematical news trace available.")
@@ -419,6 +479,11 @@ def _render_prob_news_trace(trace: Optional[Dict[str, Any]]):
 
         st.markdown("**Predictive news signals and their effect on the optimization inputs**")
         st.dataframe(df, use_container_width=True)
+        st.markdown("**News Impact Heatmap**")
+        _render_news_impact_heatmap(
+            df,
+            chart_key="news_impact_heatmap_main",
+        )
 
 
     params = trace.get("parameters") or {}
@@ -612,6 +677,222 @@ def _render_base_vs_refined_metric_chart(
         "Before / After comparison of the base portfolio and the refined portfolio. "
         "Return, volatility, and max weight are shown as decimal values in the chart "
         "(e.g. 0.30 = 30%)."
+    )
+def _render_double_frontier_chart(
+    base_state: Optional[Dict[str, Any]],
+    refined_state: Optional[Dict[str, Any]],
+    chart_key: str = "double_frontier_chart",
+):
+    if not base_state or not refined_state:
+        st.info("Run base and news-integrated refinement to compare frontiers.")
+        return
+
+    base_opt = base_state.get("optimization_result") or {}
+    ref_opt = refined_state.get("optimization_result") or {}
+
+    base_frontier = base_opt.get("frontier")
+    ref_frontier = ref_opt.get("frontier")
+
+    if not base_frontier or not ref_frontier:
+        st.info("Frontier data is missing for base or refined portfolio.")
+        return
+
+    base_df = pd.DataFrame(base_frontier)
+    ref_df = pd.DataFrame(ref_frontier)
+
+    def _frontier_y_col(df):
+        if "realized_return" in df.columns:
+            return "realized_return"
+        if "return" in df.columns:
+            return "return"
+        return df.columns[-1]
+
+    base_y = _frontier_y_col(base_df)
+    ref_y = _frontier_y_col(ref_df)
+
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Scatter(
+            x=base_df["vol"],
+            y=base_df[base_y],
+            mode="lines+markers",
+            name="Base frontier",
+            line=dict(dash="dash"),
+            marker=dict(size=5),
+        )
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=ref_df["vol"],
+            y=ref_df[ref_y],
+            mode="lines+markers",
+            name="News-adjusted frontier",
+            marker=dict(size=5),
+        )
+    )
+
+    base_m = base_state.get("optimized_metrics") or {}
+    ref_m = refined_state.get("optimized_metrics") or {}
+
+    base_vol = _safe_float(base_m.get("vol"))
+    base_ret = _safe_float(base_m.get("return"))
+    ref_vol = _safe_float(ref_m.get("vol"))
+    ref_ret = _safe_float(ref_m.get("return"))
+
+    if base_vol is not None and base_ret is not None:
+        fig.add_trace(
+            go.Scatter(
+                x=[base_vol],
+                y=[base_ret],
+                mode="markers+text",
+                name="Base portfolio",
+                text=["Base portfolio"],
+                textposition="bottom right",
+                marker=dict(size=12),
+            )
+        )
+
+    if ref_vol is not None and ref_ret is not None:
+        fig.add_trace(
+            go.Scatter(
+                x=[ref_vol],
+                y=[ref_ret],
+                mode="markers+text",
+                name="News-adjusted portfolio",
+                text=["News-adjusted portfolio"],
+                textposition="top right",
+                marker=dict(size=12),
+            )
+        )
+
+    fig.update_layout(
+        paper_bgcolor="#0b1020",
+        plot_bgcolor="#0b1020",
+        font=dict(color="#E2E6FF"),
+        margin=dict(l=10, r=10, t=30, b=10),
+        xaxis_title="Risk (Volatility, σ)",
+        yaxis_title="Expected Return (µ)",
+        legend_title="",
+        height=520,
+    )
+
+    fig.update_xaxes(tickformat=".0%")
+    fig.update_yaxes(tickformat=".0%")
+
+    st.plotly_chart(fig, use_container_width=True, key=chart_key)
+
+    st.caption(
+        "This chart compares the original base efficient frontier with the news-adjusted frontier. "
+        "If the curves differ, it means the news module changed the optimization inputs before portfolio selection."
+    )
+def _weights_from_state(state: Optional[Dict[str, Any]]) -> Optional[pd.Series]:
+    if not state:
+        return None
+
+    opt_w = state.get("optimized_weights") or {}
+    if opt_w:
+        w = pd.Series(opt_w, dtype=float)
+        return w[w.abs() > 1e-6].sort_values(ascending=False)
+
+    chosen = _get_chosen_candidate(state)
+    opt_res = state.get("optimization_result") or {}
+
+    if chosen in opt_res:
+        w = pd.Series((opt_res[chosen] or {}).get("weights", {}), dtype=float)
+        return w[w.abs() > 1e-6].sort_values(ascending=False)
+
+    return None
+
+
+def _render_weight_change_chart(
+    base_state: Optional[Dict[str, Any]],
+    refined_state: Optional[Dict[str, Any]],
+    chart_key: str = "weight_change_chart",
+):
+    base_w = _weights_from_state(base_state)
+    ref_w = _weights_from_state(refined_state)
+
+    if base_w is None or ref_w is None:
+        st.info("Run refinement to see weight changes.")
+        return
+
+    all_tickers = sorted(set(base_w.index).union(set(ref_w.index)))
+
+    df = pd.DataFrame(
+        {
+            "Ticker": all_tickers,
+            "Base weight": [float(base_w.get(t, 0.0)) for t in all_tickers],
+            "Refined weight": [float(ref_w.get(t, 0.0)) for t in all_tickers],
+        }
+    )
+
+    df["Δ weight"] = df["Refined weight"] - df["Base weight"]
+    df = df.sort_values("Δ weight", key=lambda s: s.abs(), ascending=True)
+    df["Direction"] = np.select(
+    [
+        df["Δ weight"] > 1e-6,
+        df["Δ weight"] < -1e-6,
+    ],
+    [
+        "Increase",
+        "Decrease",
+    ],
+    default="No change",
+    )
+
+    if df["Δ weight"].abs().sum() <= 1e-9:
+        st.info("No meaningful weight changes detected.")
+        return
+
+    fig = px.bar(
+        df,
+        x="Δ weight",
+        y="Ticker",
+        orientation="h",
+        color="Direction",
+        color_discrete_map={
+            "Increase": "#4ade80",   # green
+            "Decrease": "#f87171",   # red
+            "No change": "#9ca3af",  # gray
+        },
+        text="Δ weight",
+        hover_data={
+            "Base weight": ":.2%",
+            "Refined weight": ":.2%",
+            "Δ weight": ":.2%",
+            "Direction": False,
+        },
+    )
+
+    fig.update_traces(
+        texttemplate="%{text:+.2%}",
+        textposition="outside",
+        cliponaxis=False,
+    )
+
+    fig.add_vline(x=0, line_width=1)
+
+    fig.update_layout(
+        paper_bgcolor="#0b1020",
+        plot_bgcolor="#0b1020",
+        font=dict(color="#E2E6FF"),
+        margin=dict(l=10, r=10, t=30, b=10),
+        xaxis_title="Change in portfolio weight",
+        yaxis_title="",
+        height=max(320, 55 * len(df)),
+        showlegend=True,
+        legend_title="",
+    )
+
+    fig.update_xaxes(tickformat=".1%")
+
+    st.plotly_chart(fig, use_container_width=True, key=chart_key)
+
+    st.caption(
+        "Positive values mean the refined portfolio increased exposure to that asset; "
+        "negative values mean exposure was reduced."
     )
 def _fmt_pct_from_decimal(x: Optional[float]) -> str:
     if x is None or not np.isfinite(x):
@@ -986,7 +1267,146 @@ def _insight_section(state: Dict[str, Any]):
             if isinstance(a, str) and a.strip():
                 st.write(f"- {a.strip()}")
 
+def _render_why_this_portfolio_cards(state: Optional[Dict[str, Any]]):
+    if not isinstance(state, dict) or not state:
+        st.info("No portfolio explanation available yet.")
+        return
 
+    is_refined = st.session_state.get("refined_state") is not None
+
+    insight_text = str(state.get("insight_raw_text") or "").strip()
+    explanation_text = str(state.get("explanation") or "").strip()
+    text = insight_text or explanation_text
+
+    opt_m = state.get("optimized_metrics") or {}
+    chosen = _get_chosen_candidate(state)
+
+    ret = _fmt_pct_from_decimal(_safe_float(opt_m.get("return")))
+    vol = _fmt_pct_from_decimal(_safe_float(opt_m.get("vol")))
+    sharpe = _fmt_num(_safe_float(opt_m.get("sharpe")))
+
+    objective_label = "Max Sharpe" if chosen == "maxsharpe" else "Min Variance"
+    news_used = bool(state.get("prob_news_trace") or state.get("news_adjustment_evaluation"))
+    news_label = "News-adjusted" if news_used else "No mathematical news adjustment"
+
+    st.markdown("### 🧠 Why this portfolio?")
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        st.markdown(
+            f"""
+            <div class="metric-card">
+                <div class="metric-label">Main selection logic</div>
+                <div class="metric-value" style="font-size:1.1rem;">{objective_label}</div>
+                <div class="metric-sub">Chosen candidate: {chosen}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with c2:
+        st.markdown(
+            f"""
+            <div class="metric-card">
+                <div class="metric-label">Risk / return profile</div>
+                <div class="metric-value" style="font-size:1.1rem;">Sharpe {sharpe}</div>
+                <div class="metric-sub">Return {ret} | Volatility {vol}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with c3:
+        st.markdown(
+            f"""
+            <div class="metric-card">
+                <div class="metric-label">News effect</div>
+                <div class="metric-value" style="font-size:1.1rem;">{news_label}</div>
+                <div class="metric-sub">Based on available graph state</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    sentences = []
+    if text:
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        sentences = [s.strip() for s in sentences if len(s.strip()) > 20]
+
+    def pick_sentence(keywords: list[str], fallback: str = "") -> str:
+        for s in sentences:
+            low = s.lower()
+            if any(k in low for k in keywords):
+                return s
+        return fallback
+
+    if chosen == "maxsharpe":
+        default_main = (
+            "The optimizer selected the portfolio with the strongest risk-adjusted performance, "
+            "meaning it tries to maximize return per unit of risk."
+        )
+    else:
+        default_main = (
+            "The optimizer selected the lower-risk portfolio, meaning it prioritizes volatility reduction "
+            "over maximum expected return."
+        )
+
+    main_reason = pick_sentence(["chosen", "selected", "portfolio"], default_main)
+
+    risk_driver = pick_sentence(
+        ["risk", "volatility"],
+        f"The selected portfolio has an annualized volatility of {vol}, which summarizes its expected risk level."
+    )
+
+    return_driver = pick_sentence(
+        ["return", "sharpe"],
+        f"The portfolio has an expected annualized return of {ret} and a Sharpe ratio of {sharpe}."
+    )
+
+    if is_refined:
+        change_title = "What changed vs base"
+        change_driver = pick_sentence(
+            ["base", "refined", "changed", "increase", "decrease"],
+            "The refined portfolio updates the base allocation according to the selected preference or news-adjusted optimization."
+        )
+    else:
+        change_title = "Baseline comparison"
+        max_w = _fmt_pct_from_decimal(_safe_float(_portfolio_summary_from_state(state).get("max_weight")))
+        eff_n = _fmt_num(_safe_float(_portfolio_summary_from_state(state).get("effective_n")))
+        change_driver = (
+            f"This is the first optimized base portfolio. It can be compared against an equal-weight baseline "
+            f"or later against a refined portfolio. Current max weight is {max_w}, effective holdings are {eff_n}."
+        )
+
+    card_rows = [
+        ("Main reason", main_reason),
+        ("Risk driver", risk_driver),
+        ("Return / efficiency driver", return_driver),
+        (change_title, change_driver),
+    ]
+
+    seen = set()
+    for title, content in card_rows:
+        content = str(content or "").strip()
+        normalized = content.lower()
+
+        if not content or normalized in seen:
+            continue
+
+        seen.add(normalized)
+
+        st.markdown(
+            f"""
+            <div class="metric-card" style="margin-top:0.6rem;">
+                <div class="metric-label">{title}</div>
+                <div style="color:#f7f9ff; font-size:0.95rem; line-height:1.45;">
+                    {content}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 # ---------------- Streamlit Page ----------------
 st.set_page_config(page_title="Financial Risk & Portfolio Optimizer", layout="wide")
 
@@ -1490,35 +1910,12 @@ def _handle_chat_command(
 
         _append_chat_message(
             "assistant",
-            "Here is the Before / After comparison between the base and refined portfolio.",
-            kind="metric_comparison_chart",
+            "Here is the Before / After comparison between the base and refined portfolio, including weight changes.",
+            kind="base_refined_comparison_bundle",
             payload={},
         )
 
-    elif intent == "compare_base_refined_metrics":
-        base_sum = _portfolio_summary_from_state(st.session_state.get("base_state"))
-        ref_sum = _portfolio_summary_from_state(st.session_state.get("refined_state"))
 
-        if base_sum is None:
-            _append_chat_message(
-                "assistant",
-                "Please run the base portfolio first, then I can compare it with the refined portfolio."
-            )
-            return
-
-        if ref_sum is None:
-            _append_chat_message(
-                "assistant",
-                "Base portfolio is available, but no refined portfolio exists yet. Please refine the portfolio first."
-            )
-            return
-
-        _append_chat_message(
-            "assistant",
-            "Here is the Before / After comparison between the base and refined portfolio.",
-            kind="metric_comparison_chart",
-            payload={},
-        )
     elif intent == "show_final_portfolio_insight":
         active_state = st.session_state.get("refined_state") or st.session_state.get("base_state")
 
@@ -1985,7 +2382,9 @@ else:
                     st.markdown("**Evidence snapshot**")
                     st.markdown(evidence_snapshot)
 
-            elif kind == "metric_comparison_chart":
+            
+
+            elif kind == "base_refined_comparison_bundle":
                 base_sum = _portfolio_summary_from_state(st.session_state.get("base_state"))
                 ref_sum = _portfolio_summary_from_state(st.session_state.get("refined_state"))
 
@@ -1994,6 +2393,13 @@ else:
                     base_sum,
                     ref_sum,
                     chart_key=f"chat_metric_comparison_chart_{msg_idx}",
+                )
+
+                st.markdown("**Weight Changes by Asset**")
+                _render_weight_change_chart(
+                    st.session_state.get("base_state"),
+                    st.session_state.get("refined_state"),
+                    chart_key=f"chat_weight_change_chart_{msg_idx}",
                 )
 
             elif kind == "refine_result":
@@ -2274,12 +2680,34 @@ if (frontier is None) or (portfolio_metrics is None):
     st.info("Run base/refine to visualize the efficient frontier.")
 else:
     frontier_df = pd.DataFrame(frontier)
+    with st.expander("🔧 Frontier debug"):
+        st.write("Active label:", active_label)
+        st.write("Frontier rows:", len(frontier_df))
+        st.write("Frontier columns:", list(frontier_df.columns))
+        st.dataframe(frontier_df.head(20), use_container_width=True)
     y_col = (
         "realized_return"
         if "realized_return" in frontier_df.columns
         else ("return" if "return" in frontier_df.columns else frontier_df.columns[-1])
     )
-    fig_frontier = px.line(frontier_df, x="vol", y=y_col, markers=True)
+    frontier_df["vol"] = pd.to_numeric(frontier_df["vol"], errors="coerce")
+    frontier_df[y_col] = pd.to_numeric(frontier_df[y_col], errors="coerce")
+
+    frontier_unique = (
+        frontier_df
+        .dropna(subset=["vol", y_col])
+        .drop_duplicates(subset=["vol", y_col])
+    )
+
+    if len(frontier_unique) < 2:
+        st.warning(
+            "The efficient frontier collapsed to a single feasible point. "
+            "This can happen when selected actions and constraints leave almost no allocation flexibility. "
+            "For example, if only three assets remain and the max-weight cap is binding, the optimizer may be forced into one equal-weight solution."
+        )
+        fig_frontier = px.scatter(frontier_unique, x="vol", y=y_col)
+    else:
+        fig_frontier = px.line(frontier_unique, x="vol", y=y_col, markers=True)
 
     chosen = portfolio_metrics["candidate"]
     port = optimization_result.get(chosen, {}) if isinstance(optimization_result, dict) else {}
@@ -2303,8 +2731,9 @@ else:
                 mode="markers+text",
                 name=active_label,
                 text=[active_label],
-                textposition="top left",
+                textposition="top right",
                 marker=dict(size=10),
+                cliponaxis=False,
             )
         )
 
@@ -2322,16 +2751,19 @@ else:
                     text=[compare_label],
                     textposition="bottom right",
                     marker=dict(size=10),
+                    cliponaxis=False,
                 )
             )
+                        
 
     fig_frontier.update_layout(
         paper_bgcolor="#0b1020",
         plot_bgcolor="#0b1020",
         font=dict(color="#E2E6FF"),
-        margin=dict(l=10, r=10, t=10, b=10),
+        margin=dict(l=40, r=40, t=20, b=50),
         xaxis_title="Risk (Volatility, σ)",
         yaxis_title="Expected Return (µ)",
+        height=520,
     )
     fig_frontier.update_xaxes(tickformat=".0%")
     fig_frontier.update_yaxes(tickformat=".0%")
@@ -2339,54 +2771,41 @@ else:
 
 st.markdown("</div>", unsafe_allow_html=True)
 
-# ---------------- Risk Contribution by Asset ----------------
+# ---------------- Double Frontier: Base vs News-adjusted ----------------
 st.markdown("")
 st.markdown('<div class="card">', unsafe_allow_html=True)
 st.markdown(
-    f'<div class="section-title">📊 Risk Contribution by Asset — {active_label}</div>',
+    '<div class="section-title">📈 Base vs News-adjusted Efficient Frontier</div>',
     unsafe_allow_html=True,
 )
 
-if optimized_metrics is None or not optimized_metrics:
-    st.info("Risk contributions are available after the graph computes `optimized_metrics` (risk_agent output).")
+refined_state_for_news_chart = st.session_state.get("refined_state") or {}
+
+news_was_used = bool(
+    refined_state_for_news_chart.get("prob_news_trace")
+    or refined_state_for_news_chart.get("news_adjustment_evaluation")
+)
+
+if news_was_used:
+    _render_double_frontier_chart(
+        st.session_state.get("base_state"),
+        st.session_state.get("refined_state"),
+        chart_key="base_vs_news_adjusted_frontier_chart",
+    )
 else:
-    tickers_rc = list(map(str, optimized_metrics.get("tickers", [])))
-    active_rc = np.array(optimized_metrics.get("rc_pct", []), dtype=float)
+    st.info("News-adjusted efficient frontier is shown only when mathematical news integration is used.")
 
-    if len(tickers_rc) == 0 or len(active_rc) == 0 or len(tickers_rc) != len(active_rc):
-        st.info("Risk contribution data is missing or malformed (tickers/rc_pct mismatch).")
-    else:
-        df_rc = pd.DataFrame({"Ticker": tickers_rc, "Active": active_rc})
+st.markdown("</div>", unsafe_allow_html=True)
 
-        compare_metrics, compare_label = _get_compare_state_for_charts()
-        compare_label_used = None
-        if compare_metrics is not None and compare_label:
-            aligned = _rc_series_aligned_to(tickers_rc, compare_metrics)
-            if aligned is not None:
-                df_rc[compare_label] = aligned
-                compare_label_used = compare_label
-            else:
-                st.info(f"{compare_label} RC cannot be aligned (needs 'tickers' + 'rc_pct').")
+# ---------------- Why This Portfolio Cards ----------------
+st.markdown("")
+st.markdown('<div class="card">', unsafe_allow_html=True)
+st.markdown(
+    f'<div class="section-title">🧠 Why this portfolio? — {active_label}</div>',
+    unsafe_allow_html=True,
+)
 
-        df_long = df_rc.melt(id_vars="Ticker", var_name="Portfolio", value_name="Risk Contribution")
-        fig_rc = px.bar(df_long, x="Ticker", y="Risk Contribution", color="Portfolio", barmode="group")
-        fig_rc.update_layout(
-            paper_bgcolor="#0b1020",
-            plot_bgcolor="#0b1020",
-            font=dict(color="#E2E6FF"),
-            margin=dict(l=10, r=10, t=10, b=10),
-            yaxis_title="Risk contribution (share of total σ)",
-            xaxis_title="",
-            legend_title="",
-        )
-        fig_rc.update_yaxes(tickformat=".0%")
-        st.plotly_chart(fig_rc, use_container_width=True)
-
-        if compare_label_used:
-            st.caption(
-                f"Bars show each asset’s share of total portfolio risk (σ). "
-                f"Comparison: **{compare_label_used}** vs **{active_label}**."
-            )
+_render_why_this_portfolio_cards(graph_state)
 
 st.markdown("</div>", unsafe_allow_html=True)
 
