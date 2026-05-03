@@ -29,12 +29,13 @@ from typing import Any, Dict, List, Optional
 import json
 import re
 
+
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-
+import streamlit.components.v1 as components
 
 from portfolio_langgraph_withllm import run_graph, run_graph_prob_news
 from llm_client import LLMClient
@@ -1425,6 +1426,300 @@ def _render_why_this_portfolio_cards(state: Optional[Dict[str, Any]]):
             """,
             unsafe_allow_html=True,
         )
+def _render_portfolio_story_timeline(
+    base_state: Optional[Dict[str, Any]],
+    refined_state: Optional[Dict[str, Any]],
+):
+    if not base_state:
+        st.info("Run the base portfolio first to build the portfolio story.")
+        return
+
+    active_state = refined_state or base_state
+    story_steps = []
+
+    base_obj = _get_chosen_candidate(base_state)
+    base_m = base_state.get("optimized_metrics") or {}
+
+    story_steps.append(
+        {
+            "title": "Base portfolio generated",
+            "subtitle": f"Initial optimized portfolio selected with `{base_obj}` objective.",
+            "detail": (
+                f"Return {_fmt_pct_from_decimal(_safe_float(base_m.get('return')))} | "
+                f"Volatility {_fmt_pct_from_decimal(_safe_float(base_m.get('vol')))} | "
+                f"Sharpe {_fmt_num(_safe_float(base_m.get('sharpe')))}"
+            ),
+            "status": "done",
+        }
+    )
+
+    if refined_state:
+        refined_answers = refined_state.get("clarification_answers") or {}
+        pain_points = refined_answers.get("pain_points") or []
+        excluded_assets = refined_answers.get("excluded_assets") or []
+        extra_notes = str(refined_answers.get("extra_notes") or "").strip()
+
+        preference_parts = []
+
+        if pain_points:
+            preference_parts.append("Pain points: " + ", ".join(map(str, pain_points)))
+        if excluded_assets:
+            preference_parts.append("Excluded assets: " + ", ".join(map(str, excluded_assets)))
+        if extra_notes:
+            preference_parts.append(extra_notes)
+
+        story_steps.append(
+            {
+                "title": "User preference received",
+                "subtitle": "The portfolio was refined based on the user request.",
+                "detail": " | ".join(preference_parts) if preference_parts else "No explicit preference text was stored.",
+                "status": "done",
+            }
+        )
+
+        news_used = bool(
+            refined_state.get("prob_news_trace")
+            or refined_state.get("news_adjustment_evaluation")
+        )
+
+        if news_used:
+            trace = refined_state.get("prob_news_trace") or {}
+            ticker_signals = trace.get("ticker_signals") or {}
+            prediction_signals = trace.get("prediction_signals") or {}
+
+            strongest = None
+            for ticker, sig in ticker_signals.items():
+                pred = prediction_signals.get(ticker) or {}
+                risk_adj = abs(_safe_float(pred.get("risk_adjustment")) or 0.0)
+                ret_adj = abs(_safe_float(pred.get("expected_return_adjustment")) or 0.0)
+                score = risk_adj + ret_adj
+
+                if strongest is None or score > strongest["score"]:
+                    strongest = {
+                        "ticker": ticker,
+                        "score": score,
+                        "sentiment": sig.get("sentiment_score"),
+                        "confidence": sig.get("confidence_score"),
+                        "direction": pred.get("predicted_direction"),
+                        "risk_adj": pred.get("risk_adjustment"),
+                        "ret_adj": pred.get("expected_return_adjustment"),
+                    }
+
+            if strongest:
+                detail = (
+                    f"{strongest['ticker']} had the strongest news-model effect. "
+                    f"Direction: `{strongest.get('direction') or '–'}` | "
+                    f"Return adjustment {_fmt_signed_pct_from_decimal(strongest.get('ret_adj'), 2)} | "
+                    f"Risk adjustment {_fmt_signed_pct_from_decimal(strongest.get('risk_adj'), 2)}"
+                )
+            else:
+                detail = "News signals were used to adjust expected return and risk inputs."
+
+            story_steps.append(
+                {
+                    "title": "News integrated into model",
+                    "subtitle": "FinBERT/news signals adjusted the optimization inputs before re-optimization.",
+                    "detail": detail,
+                    "status": "done",
+                }
+            )
+        else:
+            story_steps.append(
+                {
+                    "title": "No mathematical news integration",
+                    "subtitle": "This refinement did not adjust return/risk inputs using FinBERT signals.",
+                    "detail": "The refined portfolio was driven by user preferences or candidate selection logic.",
+                    "status": "neutral",
+                }
+            )
+
+        base_w = _weights_from_state(base_state)
+        ref_w = _weights_from_state(refined_state)
+
+        if base_w is not None and ref_w is not None:
+            all_tickers = sorted(set(base_w.index).union(set(ref_w.index)))
+            changes = []
+            for t in all_tickers:
+                delta = float(ref_w.get(t, 0.0) - base_w.get(t, 0.0))
+                if abs(delta) > 1e-6:
+                    changes.append((t, delta))
+
+            changes = sorted(changes, key=lambda x: abs(x[1]), reverse=True)
+
+            if changes:
+                top_changes = ", ".join([f"{t} {d:+.1%}" for t, d in changes[:4]])
+                detail = f"Largest allocation changes: {top_changes}."
+            else:
+                detail = "Portfolio weights stayed almost unchanged."
+
+            story_steps.append(
+                {
+                    "title": "Portfolio weights updated",
+                    "subtitle": "The optimizer selected the final allocation after applying the refinement inputs.",
+                    "detail": detail,
+                    "status": "done",
+                }
+            )
+
+        ref_obj = _get_chosen_candidate(refined_state)
+        ref_m = refined_state.get("optimized_metrics") or {}
+
+        story_steps.append(
+            {
+                "title": "Final portfolio selected",
+                "subtitle": f"Final candidate selected with `{ref_obj}` objective.",
+                "detail": (
+                    f"Return {_fmt_pct_from_decimal(_safe_float(ref_m.get('return')))} | "
+                    f"Volatility {_fmt_pct_from_decimal(_safe_float(ref_m.get('vol')))} | "
+                    f"Sharpe {_fmt_num(_safe_float(ref_m.get('sharpe')))}"
+                ),
+                "status": "done",
+            }
+        )
+    else:
+        story_steps.append(
+            {
+                "title": "Waiting for refinement",
+                "subtitle": "Run a refinement step to extend the story.",
+                "detail": "Examples: make it safer, exclude NVDA, use mathematical news integration.",
+                "status": "neutral",
+            }
+        )
+
+    cards_html = ""
+
+    for i, step in enumerate(story_steps, start=1):
+        status = step.get("status", "neutral")
+
+        if status == "done":
+            glow = "#4ade80"
+            border = "rgba(74,222,128,0.35)"
+            bg = "rgba(74,222,128,0.08)"
+        else:
+            glow = "#94a3b8"
+            border = "rgba(148,163,184,0.25)"
+            bg = "rgba(148,163,184,0.05)"
+
+        connector = ""
+        if i < len(story_steps):
+            connector = f"""
+            <div class="connector" style="background:linear-gradient(to bottom, {glow}, rgba(148,163,184,0.05));"></div>
+            """
+
+        cards_html += f"""
+        <div class="timeline-row">
+            <div class="timeline-left">
+                <div class="timeline-dot" style="background:{bg}; border-color:{border}; color:{glow}; box-shadow:0 0 22px {glow};">
+                    {i}
+                </div>
+                {connector}
+            </div>
+
+            <div class="timeline-card" style="border-color:{border};">
+                <div class="step-label" style="color:{glow};">STEP {i}</div>
+                <div class="step-title">{step.get("title", "")}</div>
+                <div class="step-subtitle">{step.get("subtitle", "")}</div>
+                <div class="step-detail">{step.get("detail", "")}</div>
+            </div>
+        </div>
+        """
+
+    timeline_html = f"""
+    <html>
+    <head>
+    <style>
+        body {{
+            margin: 0;
+            background: transparent;
+            font-family: Inter, Arial, sans-serif;
+            color: #e2e8f0;
+        }}
+
+        .timeline-wrap {{
+            width: 100%;
+            padding: 8px 4px 18px 4px;
+        }}
+
+        .timeline-row {{
+            display: flex;
+            align-items: flex-start;
+            gap: 18px;
+        }}
+
+        .timeline-left {{
+            width: 56px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            flex-shrink: 0;
+        }}
+
+        .timeline-dot {{
+            width: 44px;
+            height: 44px;
+            border-radius: 999px;
+            border: 2px solid;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 800;
+            font-size: 1rem;
+        }}
+
+        .connector {{
+            width: 3px;
+            height: 42px;
+            border-radius: 999px;
+            margin: 7px 0;
+        }}
+
+        .timeline-card {{
+            flex: 1;
+            background: linear-gradient(135deg, rgba(11,16,32,0.98), rgba(15,23,42,0.94));
+            border: 1px solid;
+            border-radius: 20px;
+            padding: 18px 20px;
+            margin-bottom: 14px;
+            box-shadow: 0 14px 35px rgba(0,0,0,0.35);
+        }}
+
+        .step-label {{
+            font-size: 0.78rem;
+            font-weight: 700;
+            margin-bottom: 6px;
+            letter-spacing: 0.04em;
+        }}
+
+        .step-title {{
+            color: #f8fafc;
+            font-size: 1.08rem;
+            font-weight: 800;
+            margin-bottom: 8px;
+        }}
+
+        .step-subtitle {{
+            color: #cbd5e1;
+            font-size: 0.94rem;
+            line-height: 1.45;
+            margin-bottom: 9px;
+        }}
+
+        .step-detail {{
+            color: #94a3b8;
+            font-size: 0.84rem;
+            line-height: 1.45;
+        }}
+    </style>
+    </head>
+    <body>
+        <div class="timeline-wrap">
+            {cards_html}
+        </div>
+    </body>
+    </html>
+    """
+
+    components.html(timeline_html, height=170 * len(story_steps), scrolling=False)
 # ---------------- Streamlit Page ----------------
 st.set_page_config(page_title="Financial Risk & Portfolio Optimizer", layout="wide")
 
@@ -2819,11 +3114,26 @@ st.markdown("</div>", unsafe_allow_html=True)
 st.markdown("")
 st.markdown('<div class="card">', unsafe_allow_html=True)
 st.markdown(
-    f'<div class="section-title">🧠 Why this portfolio? — {active_label}</div>',
+    f'<div class="section-title"> Why this portfolio? — {active_label}</div>',
     unsafe_allow_html=True,
 )
 
 _render_why_this_portfolio_cards(graph_state)
+
+st.markdown("</div>", unsafe_allow_html=True)
+
+# ---------------- Portfolio Story Timeline ----------------
+st.markdown("")
+st.markdown('<div class="card">', unsafe_allow_html=True)
+st.markdown(
+    '<div class="section-title"> Portfolio Story Timeline</div>',
+    unsafe_allow_html=True,
+)
+
+_render_portfolio_story_timeline(
+    st.session_state.get("base_state"),
+    st.session_state.get("refined_state"),
+)
 
 st.markdown("</div>", unsafe_allow_html=True)
 
