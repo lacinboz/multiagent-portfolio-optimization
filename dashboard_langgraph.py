@@ -2523,7 +2523,7 @@ else:
                                 current_weights_dict=current_weights_dict,
                                 pain_points=[],
                                 excluded_assets=[],
-                                extra_notes="Use news with mathematical integration into the optimization model.",
+                                extra_notes="User requested mathematical news integration into the optimization process.",
                                 use_llm_refine=True,
                             )
 
