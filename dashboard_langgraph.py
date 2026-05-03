@@ -603,31 +603,31 @@ def _render_base_vs_refined_metric_chart(
             "Metric": "Return",
             "Base": _safe_float(base_sum.get("return")),
             "Refined": _safe_float(ref_sum.get("return")),
-            "Format": "percent",
+            "Display unit": "%",
         },
         {
             "Metric": "Volatility",
             "Base": _safe_float(base_sum.get("vol")),
             "Refined": _safe_float(ref_sum.get("vol")),
-            "Format": "percent",
+            "Display unit": "%",
         },
         {
             "Metric": "Sharpe",
             "Base": _safe_float(base_sum.get("sharpe")),
             "Refined": _safe_float(ref_sum.get("sharpe")),
-            "Format": "number",
+            "Display unit": "number",
         },
         {
             "Metric": "Effective N",
             "Base": _safe_float(base_sum.get("effective_n")),
             "Refined": _safe_float(ref_sum.get("effective_n")),
-            "Format": "number",
+            "Display unit": "number",
         },
         {
             "Metric": "Max Weight",
             "Base": _safe_float(base_sum.get("max_weight")),
             "Refined": _safe_float(ref_sum.get("max_weight")),
-            "Format": "percent",
+            "Display unit": "%",
         },
     ]
 
@@ -638,11 +638,20 @@ def _render_base_vs_refined_metric_chart(
         st.info("No comparable metrics available.")
         return
 
+    # Convert only percent metrics to actual percentage scale for display
+    pct_mask = df["Display unit"] == "%"
+    df.loc[pct_mask, ["Base", "Refined"]] = df.loc[pct_mask, ["Base", "Refined"]] * 100
+
     df_long = df.melt(
-        id_vars=["Metric", "Format"],
+        id_vars=["Metric", "Display unit"],
         value_vars=["Base", "Refined"],
         var_name="Portfolio",
         value_name="Value",
+    )
+
+    df_long["Label"] = df_long.apply(
+        lambda r: f"{r['Value']:.1f}%" if r["Display unit"] == "%" else f"{r['Value']:.2f}",
+        axis=1,
     )
 
     fig = px.bar(
@@ -651,11 +660,10 @@ def _render_base_vs_refined_metric_chart(
         y="Value",
         color="Portfolio",
         barmode="group",
-        text="Value",
+        text="Label",
     )
 
     fig.update_traces(
-        texttemplate="%{text:.2f}",
         textposition="outside",
         cliponaxis=False,
     )
@@ -665,7 +673,7 @@ def _render_base_vs_refined_metric_chart(
         plot_bgcolor="#0b1020",
         font=dict(color="#E2E6FF"),
         margin=dict(l=10, r=10, t=30, b=10),
-        yaxis_title="Metric value",
+        yaxis_title="Value",
         xaxis_title="",
         legend_title="",
         height=420,
@@ -675,8 +683,7 @@ def _render_base_vs_refined_metric_chart(
 
     st.caption(
         "Before / After comparison of the base portfolio and the refined portfolio. "
-        "Return, volatility, and max weight are shown as decimal values in the chart "
-        "(e.g. 0.30 = 30%)."
+        "Return, volatility, and max weight are shown as percentages; Sharpe and Effective N are shown as numeric values."
     )
 def _render_double_frontier_chart(
     base_state: Optional[Dict[str, Any]],
@@ -905,7 +912,18 @@ def _fmt_num(x: Optional[float]) -> str:
         return "–"
     return f"{x:.2f}"
 
+def _fmt_signed_pct_from_decimal(x: Optional[float], digits: int = 2) -> str:
+    v = _safe_float(x)
+    if v is None:
+        return "–"
+    return f"{v * 100:+.{digits}f}%"
 
+
+def _fmt_small_num(x: Optional[float], digits: int = 3) -> str:
+    v = _safe_float(x)
+    if v is None:
+        return "–"
+    return f"{v:.{digits}f}"
 def _fmt_pct_from_pct_field(x_pct: Optional[float]) -> str:
     # for fields already in percent units (e.g., 17.7)
     if x_pct is None or not np.isfinite(x_pct):
@@ -2809,6 +2827,165 @@ _render_why_this_portfolio_cards(graph_state)
 
 st.markdown("</div>", unsafe_allow_html=True)
 
+def _render_asset_detail_drilldown(
+    base_state: Optional[Dict[str, Any]],
+    refined_state: Optional[Dict[str, Any]],
+    selected_tickers: List[str],
+):
+    active_state = refined_state or base_state
+
+    if not active_state:
+        st.info("Run a portfolio first to inspect asset details.")
+        return
+
+    base_w = _weights_from_state(base_state)
+    ref_w = _weights_from_state(refined_state)
+
+    selected_asset = st.selectbox(
+        "Inspect asset",
+        options=selected_tickers,
+        key="asset_detail_selected_ticker",
+    )
+
+    base_weight = float(base_w.get(selected_asset, 0.0)) if base_w is not None else 0.0
+    refined_weight = float(ref_w.get(selected_asset, 0.0)) if ref_w is not None else None
+    delta_weight = None if refined_weight is None else refined_weight - base_weight
+
+    trace = (active_state.get("prob_news_trace") or {})
+    ticker_signals = trace.get("ticker_signals") or {}
+    prediction_signals = trace.get("prediction_signals") or {}
+
+    sig = ticker_signals.get(selected_asset) or {}
+    pred = prediction_signals.get(selected_asset) or {}
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        st.markdown(
+            f"""
+            <div class="metric-card">
+                <div class="metric-label">Base weight</div>
+                <div class="metric-value">{base_weight:.1%}</div>
+                <div class="metric-sub">{selected_asset}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with c2:
+        refined_text = "–" if refined_weight is None else f"{refined_weight:.1%}"
+        st.markdown(
+            f"""
+            <div class="metric-card">
+                <div class="metric-label">Refined weight</div>
+                <div class="metric-value">{refined_text}</div>
+                <div class="metric-sub">{selected_asset}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with c3:
+        delta_text = "–" if delta_weight is None else f"{delta_weight:+.1%}"
+        st.markdown(
+            f"""
+            <div class="metric-card">
+                <div class="metric-label">Weight change</div>
+                <div class="metric-value">{delta_text}</div>
+                <div class="metric-sub">Refined − Base</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    news_available = bool(sig or pred)
+
+    st.markdown("**News / FinBERT signal**")
+
+    if not news_available:
+        st.info(
+            "News signals are available after mathematical news integration. "
+            "The base portfolio does not use FinBERT/news adjustments."
+        )
+        return
+
+    df_asset_news = pd.DataFrame(
+        [
+            {
+                "Ticker": selected_asset,
+                "FinBERT sentiment": _fmt_small_num(sig.get("sentiment_score"), 3),
+                "Confidence": _fmt_pct_from_decimal(_safe_float(sig.get("confidence_score"))),
+                "Articles used": sig.get("raw_article_count"),
+                "Predicted direction": pred.get("predicted_direction") or "–",
+                "Expected return adjustment": _fmt_signed_pct_from_decimal(
+                    pred.get("expected_return_adjustment"), 2
+                ),
+                "Risk adjustment": _fmt_signed_pct_from_decimal(
+                    pred.get("risk_adjustment"), 2
+                ),
+            }
+        ]
+    )
+
+    st.dataframe(df_asset_news, use_container_width=True, hide_index=True)
+
+    explanation = []
+
+    if delta_weight is not None:
+        if delta_weight > 1e-6:
+            explanation.append(
+                f"{selected_asset}'s allocation increased by {delta_weight:+.1%} after refinement."
+            )
+        elif delta_weight < -1e-6:
+            explanation.append(
+                f"{selected_asset}'s allocation decreased by {delta_weight:+.1%} after refinement."
+            )
+        else:
+            explanation.append(
+                f"{selected_asset}'s allocation stayed almost unchanged."
+            )
+
+    exp_adj = _safe_float(pred.get("expected_return_adjustment"))
+    risk_adj = _safe_float(pred.get("risk_adjustment"))
+
+    if exp_adj is not None:
+        explanation.append(
+            f"The news module adjusted the expected return input by {_fmt_signed_pct_from_decimal(exp_adj, 2)}."
+        )
+
+    if risk_adj is not None:
+        explanation.append(
+            f"The news module adjusted the risk input by {_fmt_signed_pct_from_decimal(risk_adj, 2)}."
+        )
+
+    direction = pred.get("predicted_direction")
+    confidence = _safe_float(sig.get("confidence_score"))
+
+    if direction:
+        conf_text = _fmt_pct_from_decimal(confidence)
+        explanation.append(
+            f"The aggregated FinBERT signal for {selected_asset} is `{direction}` with confidence {conf_text}."
+        )
+
+    if explanation:
+        st.markdown("**Interpretation**")
+        for line in explanation:
+            st.write(f"- {line}")
+# ---------------- Asset Detail Drilldown ----------------
+st.markdown("")
+st.markdown('<div class="card">', unsafe_allow_html=True)
+st.markdown(
+    '<div class="section-title">🔎 Asset Detail Drilldown</div>',
+    unsafe_allow_html=True,
+)
+
+_render_asset_detail_drilldown(
+    st.session_state.get("base_state"),
+    st.session_state.get("refined_state"),
+    selected_tickers,
+)
+
+st.markdown("</div>", unsafe_allow_html=True)
 # ---------------- Bottom: Weights + News + Insight + Explanation ----------------
 st.markdown("")
 bottom_left, bottom_right = st.columns([1.3, 1.0])
