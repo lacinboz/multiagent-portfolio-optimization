@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional
 import json
 import re
 
-
+import joblib
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -39,8 +39,17 @@ import streamlit.components.v1 as components
 
 from portfolio_langgraph_withllm import run_graph, run_graph_prob_news
 from llm_client import LLMClient
-
+NEWS_PRED_DIR = Path("data/news_prediction")
+BEST_NEWS_PREDICTIONS_PATH = NEWS_PRED_DIR / "best_news_prediction_predictions.csv"
+BEST_NEWS_METRICS_PATH = NEWS_PRED_DIR / "best_news_prediction_metrics.json"
+BEST_NEWS_MODEL_PATH = NEWS_PRED_DIR / "best_news_prediction_model.joblib"
+LATEST_NEWS_SIGNALS_PATH = NEWS_PRED_DIR / "latest_news_prediction_signals.csv"
+TICKER_ALIASES_FOR_NEWS = {
+    "GOOGL": ["GOOGL", "GOOG"],
+    "GOOG": ["GOOG", "GOOGL"],
+}
 DATA_DIR = Path("data/processed_yahoo")
+
 
 
 @st.cache_data
@@ -48,7 +57,18 @@ def load_available_tickers() -> list[str]:
     summary = pd.read_csv(DATA_DIR / "summary_per_asset_annual.csv", index_col=0)
     return list(map(str, summary.index))
 
+def _expand_tickers_for_news(selected_tickers: List[str]) -> List[str]:
+    expanded = []
 
+    for t in selected_tickers or []:
+        tt = str(t).upper().strip()
+        aliases = TICKER_ALIASES_FOR_NEWS.get(tt, [tt])
+
+        for a in aliases:
+            if a not in expanded:
+                expanded.append(a)
+
+    return expanded
 def _safe_normalize_current_inputs(df: pd.DataFrame, mode: str) -> Optional[dict[str, float]]:
     if df is None or df.empty or "Value" not in df.columns:
         return None
@@ -166,6 +186,591 @@ def _extract_weights_and_metrics(state: Dict[str, Any]):
 
     return optimization_result, chosen, weights_series, portfolio_metrics
 
+@st.cache_data
+def load_saved_news_prediction_outputs() -> Dict[str, Any]:
+    pred_path = BEST_NEWS_PREDICTIONS_PATH
+    metrics_path = BEST_NEWS_METRICS_PATH
+    model_path = BEST_NEWS_MODEL_PATH
+
+    if not pred_path.exists():
+        return {
+            "ok": False,
+            "reason": f"Best prediction file not found: {pred_path}",
+        }
+
+    pred_df = pd.read_csv(pred_path)
+    latest_signals = pd.DataFrame()
+    if LATEST_NEWS_SIGNALS_PATH.exists():
+        latest_signals = pd.read_csv(LATEST_NEWS_SIGNALS_PATH)
+
+    metrics = {}
+    if metrics_path.exists():
+        with open(metrics_path, "r", encoding="utf-8") as f:
+            metrics = json.load(f)
+
+    model_bundle = {}
+    if model_path.exists():
+        try:
+            model_bundle = joblib.load(model_path)
+        except Exception as e:
+            model_bundle = {"load_error": str(e)}
+
+    explanation = {}
+    if isinstance(model_bundle, dict):
+        explanation = model_bundle.get("model_explanation") or {}
+
+    return {
+        "ok": True,
+        "predictions": pred_df,
+        "metrics": metrics,
+        "explanation": explanation,
+        "model_bundle": model_bundle,
+        "pred_path": str(pred_path),
+        "metrics_path": str(metrics_path),
+        "model_path": str(model_path),
+        "latest_signals": latest_signals,
+        "latest_signals_path": str(LATEST_NEWS_SIGNALS_PATH),
+    }
+
+def _prediction_direction_label(x: Any) -> str:
+    try:
+        return "Positive" if int(x) == 1 else "Negative"
+    except Exception:
+        return "–"
+
+def _correct_icon(x: Any) -> str:
+    try:
+        return "Matched realized direction" if bool(x) else "Did not match realized direction"
+    except Exception:
+        return "–"
+
+def _prepare_prediction_display_df(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    df["news_date_dt"] = pd.to_datetime(df["news_date_dt"], errors="coerce")
+    df["predicted_positive_probability"] = pd.to_numeric(
+        df["predicted_positive_probability"], errors="coerce"
+    )
+    df["future_return"] = pd.to_numeric(df["future_return"], errors="coerce")
+
+    if "predicted_direction" in df.columns:
+        df["Predicted direction"] = df["predicted_direction"].apply(_prediction_direction_label)
+    else:
+        df["Predicted direction"] = np.where(
+            df["predicted_positive_probability"] >= 0.5,
+            "Positive",
+            "Negative",
+        )
+
+    if "target_direction" in df.columns:
+        df["Actual direction"] = df["target_direction"].apply(_prediction_direction_label)
+    else:
+        df["Actual direction"] = np.where(df["future_return"] > 0, "Positive", "Negative")
+
+    if "correct" in df.columns:
+        df["Correct?"] = df["correct"].apply(_correct_icon)
+    else:
+        df["Correct?"] = np.where(
+            df["Predicted direction"] == df["Actual direction"],
+            "Matched realized direction",
+            "Did not match realized direction",
+        )
+
+    df["confidence_distance"] = (df["predicted_positive_probability"] - 0.5).abs()
+
+    df["Signal strength"] = pd.cut(
+        df["confidence_distance"],
+        bins=[-0.001, 0.05, 0.20, 0.50],
+        labels=["Weak signal", "Medium signal", "Strong signal"],
+    )
+
+    return df
+
+def _coefficient_interpretation(feature: str, coef: float) -> str:
+    f = str(feature).lower()
+    sign = "positive" if coef > 0 else "negative"
+
+    if "positive_prob" in f and coef < 0:
+        return "High positive-news flow may indicate overreaction or already-priced-in optimism."
+    if "positive_prob" in f and coef > 0:
+        return "Positive news flow is associated with higher probability of positive future returns."
+    if "negative_prob" in f and coef < 0:
+        return "Negative-news flow lowers the predicted probability of positive future returns."
+    if "negative_prob" in f and coef > 0:
+        return "Negative-news flow may behave as a contrarian/rebound signal in this dataset."
+    if "volatility" in f:
+        return f"Past volatility has a {sign} relationship with predicted positive future return."
+    if "momentum" in f or "return" in f:
+        return f"Recent price movement has a {sign} relationship with predicted future direction."
+    if "confidence" in f:
+        return f"Model/news confidence has a {sign} relationship with predicted future direction."
+    if "sentiment" in f:
+        return f"News sentiment flow has a {sign} relationship with predicted future direction."
+
+    return f"This feature has a {sign} coefficient in the logistic model."
+
+
+def _render_confusion_matrix_heatmap(metrics: Dict[str, Any]):
+    cm = metrics.get("confusion_matrix")
+    if not cm:
+        return
+
+    cm_df = pd.DataFrame(
+        cm,
+        index=["Actual Negative", "Actual Positive"],
+        columns=["Predicted Negative", "Predicted Positive"],
+    )
+
+    fig = px.imshow(
+        cm_df,
+        text_auto=True,
+        aspect="auto",
+        color_continuous_scale="Viridis",
+    )
+
+    fig.update_layout(
+        title="Confusion Matrix",
+        paper_bgcolor="#0b1020",
+        plot_bgcolor="#0b1020",
+        font=dict(color="#E2E6FF"),
+        height=360,
+        margin=dict(l=20, r=20, t=50, b=20),
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_probability_distribution(df: pd.DataFrame):
+    if "predicted_positive_probability" not in df.columns:
+        return
+
+    plot_df = df.copy()
+    plot_df["predicted_positive_probability"] = pd.to_numeric(
+        plot_df["predicted_positive_probability"], errors="coerce"
+    )
+    plot_df = plot_df.dropna(subset=["predicted_positive_probability"])
+
+    if plot_df.empty:
+        return
+
+    fig = px.histogram(
+        plot_df,
+        x="predicted_positive_probability",
+        nbins=20,
+        title="Prediction Confidence Distribution",
+    )
+
+    fig.update_layout(
+        paper_bgcolor="#0b1020",
+        plot_bgcolor="#0b1020",
+        font=dict(color="#E2E6FF"),
+        xaxis_title="Predicted probability of positive return",
+        yaxis_title="Number of predictions",
+        height=360,
+        margin=dict(l=20, r=20, t=50, b=20),
+    )
+
+    fig.update_xaxes(tickformat=".0%")
+
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_calibration_table(df: pd.DataFrame):
+    required = {"predicted_positive_probability", "target_direction"}
+    if not required.issubset(set(df.columns)):
+        return
+
+    cal = df.copy()
+    cal["predicted_positive_probability"] = pd.to_numeric(
+        cal["predicted_positive_probability"], errors="coerce"
+    )
+    cal["target_direction"] = pd.to_numeric(cal["target_direction"], errors="coerce")
+    cal = cal.dropna(subset=["predicted_positive_probability", "target_direction"])
+
+    if cal.empty:
+        return
+
+    cal["Probability bucket"] = pd.cut(
+        cal["predicted_positive_probability"],
+        bins=[0.0, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0],
+        include_lowest=True,
+    )
+
+    bucket_df = (
+        cal.groupby("Probability bucket", observed=False)
+        .agg(
+            predictions=("target_direction", "count"),
+            avg_predicted_probability=("predicted_positive_probability", "mean"),
+            realized_positive_rate=("target_direction", "mean"),
+            directional_accuracy=("correct", "mean"),
+        )
+        .reset_index()
+    )
+
+    bucket_labels = ["0–40%", "40–50%", "50–60%", "60–70%", "70–80%", "80–100%"]
+
+    bucket_df["Probability bucket"] = bucket_labels[: len(bucket_df)]
+
+    st.markdown("**Probability calibration by bucket**")
+    st.caption(
+        "This checks whether higher predicted probabilities actually correspond to more positive realized returns."
+    )
+
+    st.dataframe(
+        bucket_df.style.format(
+            {
+                "avg_predicted_probability": "{:.1%}",
+                "realized_positive_rate": "{:.1%}",
+                "directional_accuracy": "{:.1%}",
+            },
+            na_rep="–",
+        ),
+        use_container_width=True,
+    )
+def _render_ticker_level_prediction_summary(df_selected: pd.DataFrame):
+    if df_selected is None or df_selected.empty:
+        return
+
+    latest_signal = (
+        df_selected.sort_values(
+            ["ticker", "confidence_distance", "news_date_dt"],
+            ascending=[True, False, False],
+        )
+        .groupby("ticker", as_index=False)
+        .head(1)
+        .copy()
+    )
+
+    latest_signal["Model signal"] = latest_signal["Predicted direction"]
+    latest_signal["Confidence"] = np.where(
+        latest_signal["predicted_positive_probability"] >= 0.5,
+        latest_signal["predicted_positive_probability"],
+        1.0 - latest_signal["predicted_positive_probability"],
+    )
+
+    latest_signal["Interpretation"] = latest_signal.apply(
+        lambda r: (
+            f"The model leans {r['Model signal'].lower()} for this ticker "
+            f"with {r['Confidence']:.1%} directional confidence."
+        ),
+        axis=1,
+    )
+
+    display_cols = [
+        "ticker",
+        "Model signal",
+        "Confidence",
+        "predicted_positive_probability",
+        "Signal strength",
+        "news_date",
+        "Interpretation",
+    ]
+
+    if "headline" in latest_signal.columns:
+        display_cols.insert(-1, "headline")
+
+    display = latest_signal[display_cols]
+    display = display.rename(
+    columns={
+        "ticker": "Ticker",
+        "predicted_positive_probability": "Positive probability",
+        "news_date": "News date",
+        "headline": "Supporting headline",
+    }
+)
+
+    st.markdown("**Ticker-level prediction summary**")
+    st.caption(
+        "This converts the saved article-level prediction results into one representative signal per selected ticker. "
+        "It is still based on historical out-of-sample prediction rows, not a live trading recommendation."
+    )
+
+    st.dataframe(
+        display.style.format(
+            {
+                "Confidence": "{:.1%}",
+                "Positive probability": "{:.1%}",
+                "Signal strength": "{}",
+            },
+            na_rep="–",
+        ),
+        use_container_width=True,
+        height=300,
+    )
+def _render_latest_prediction_signals(latest_df: pd.DataFrame, selected_tickers: List[str]):
+    if latest_df is None or latest_df.empty:
+        st.info("No latest ticker-level prediction signals available yet.")
+        return
+
+    df = latest_df.copy()
+
+    if selected_tickers:
+        selected_upper = _expand_tickers_for_news(selected_tickers)
+        df = df[df["ticker"].astype(str).str.upper().isin(selected_upper)]
+        df["news_date_dt"] = pd.to_datetime(df["news_date_dt"], errors="coerce")
+
+
+        df = (
+            df.sort_values(["news_date_dt", "ticker"], ascending=[False, True])
+            .groupby(df["ticker"].replace({"GOOG": "GOOGL"}), as_index=False)
+            .head(1)
+        )
+
+    if df.empty:
+        st.info("No latest prediction signals available for the selected tickers.")
+        return
+
+    df["predicted_positive_probability"] = pd.to_numeric(
+        df["predicted_positive_probability"], errors="coerce"
+    )
+    df["prediction_confidence"] = pd.to_numeric(
+        df["prediction_confidence"], errors="coerce"
+    )
+
+    display = df[
+        [
+            "ticker",
+            "news_date",
+            "predicted_positive_probability",
+            "prediction_confidence",
+            "signal_label",
+            "signal_strength",
+            "article_count",
+            "weighted_sentiment",
+            "mean_confidence",
+            "positive_ratio",
+            "negative_ratio",
+        ]
+    ].rename(
+        columns={
+            "ticker": "Ticker",
+            "news_date": "Latest news date",
+            "predicted_positive_probability": "Predicted positive probability",
+            "prediction_confidence": "Prediction confidence",
+            "signal_label": "Signal",
+            "signal_strength": "Strength",
+            "article_count": "Articles",
+            "weighted_sentiment": "Weighted sentiment",
+            "mean_confidence": "Mean FinBERT confidence",
+            "positive_ratio": "Positive news ratio",
+            "negative_ratio": "Negative news ratio",
+        }
+    )
+
+    st.markdown("**Latest ticker-level prediction probabilities**")
+    st.caption(
+        "These are the latest per-ticker model probabilities generated from `latest_news_prediction_signals.csv`. "
+        "They summarize the model's current directional signal for each selected asset."
+    )
+
+    st.dataframe(
+        display.style.format(
+            {
+                "Predicted positive probability": "{:.1%}",
+                "Prediction confidence": "{:.1%}",
+                "Weighted sentiment": "{:.3f}",
+                "Mean FinBERT confidence": "{:.1%}",
+                "Positive news ratio": "{:.1%}",
+                "Negative news ratio": "{:.1%}",
+            },
+            na_rep="–",
+        ),
+        use_container_width=True,
+        height=360,
+    )
+def _render_saved_news_prediction_model(selected_tickers: List[str]):
+    out = load_saved_news_prediction_outputs()
+
+    if not out.get("ok"):
+        st.warning(out.get("reason", "Saved prediction output could not be loaded."))
+        return
+
+    df_all = _prepare_prediction_display_df(out["predictions"].copy())
+
+    metrics = out.get("metrics") or {}
+    explanation = out.get("explanation") or {}
+    latest_signals = out.get("latest_signals")
+
+    df_selected = df_all.copy()
+
+    if selected_tickers:
+        selected_upper = _expand_tickers_for_news(selected_tickers)
+        df_selected = df_selected[
+            df_selected["ticker"].astype(str).str.upper().isin(selected_upper)
+        ]
+
+    if df_selected.empty:
+        st.info("No saved prediction rows available for the selected tickers.")
+        return
+    _render_latest_prediction_signals(latest_signals, selected_tickers)
+    with st.expander("DEBUG latest signals raw rows"):
+        googl_rows = latest_signals[
+            latest_signals["ticker"].astype(str).str.upper().isin(["GOOGL", "GOOG"])
+        ].copy()
+
+        googl_rows["news_date_dt"] = pd.to_datetime(
+            googl_rows["news_date_dt"],
+            errors="coerce"
+        )
+
+        googl_rows = googl_rows.sort_values(
+            "news_date_dt",
+            ascending=False
+        )
+
+        st.dataframe(googl_rows, use_container_width=True)
+        st.markdown("---")
+    _render_ticker_level_prediction_summary(df_selected)
+
+    st.markdown("---")
+
+    latest = (
+        df_selected.sort_values(
+            ["ticker", "confidence_distance", "news_date_dt"],
+            ascending=[True, False, False],
+        )
+        .groupby("ticker", as_index=False)
+        .head(1)
+        .copy()
+    )
+
+    latest_cols = [
+        "ticker",
+        "news_date",
+        "predicted_positive_probability",
+        "Signal strength",
+        "Predicted direction",
+        "Actual direction",
+        "future_return",
+        "Correct?",
+    ]
+
+    if "headline" in latest.columns:
+        latest_cols.insert(2, "headline")
+
+    latest_display = latest[latest_cols]
+    latest_display = latest_display.rename(
+        columns={
+            "ticker": "Ticker",
+            "news_date": "News date",
+            "headline": "Headline",
+            "predicted_positive_probability": "Positive probability",
+            "future_return": "Realized future return",
+        }
+    )
+
+    st.markdown("**Saved News Return Prediction Model**")
+    st.caption(
+        "This uses the selected best trained news prediction model saved as `best_news_prediction_model.joblib`. "
+        "It predicts whether the 7-day future return after a news item is positive."
+    )
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+
+    with c1:
+        st.metric("Accuracy", _fmt_pct_from_decimal(_safe_float(metrics.get("accuracy"))))
+    with c2:
+        st.metric("Balanced accuracy", _fmt_pct_from_decimal(_safe_float(metrics.get("balanced_accuracy"))))
+    with c3:
+        st.metric("ROC-AUC", _fmt_num(_safe_float(metrics.get("roc_auc"))))
+    with c4:
+        baseline = _safe_float(metrics.get("majority_baseline_accuracy"))
+        st.metric("Baseline accuracy", _fmt_pct_from_decimal(baseline))
+    with c5:
+        lift = _safe_float(metrics.get("model_minus_baseline_balanced_accuracy"))
+        st.metric("Balanced lift vs balanced baseline", _fmt_signed_pct_from_decimal(lift, 1))
+
+    reliability_warning = metrics.get("reliability_warning")
+    if reliability_warning:
+        st.warning(reliability_warning)
+    else:
+        st.success(
+            "The model shows out-of-sample predictive signal above the majority baseline "
+            "on the saved time-based test split."
+        )
+
+    with st.expander("Representative article-level prediction examples", expanded=False):
+        st.caption(
+            "These are the highest-confidence out-of-sample examples for the selected tickers. "
+            "The table illustrates how the model's predicted direction compared with the realized future return."
+        )
+
+        st.dataframe(
+            latest_display.style.format(
+                {
+                    "Positive probability": "{:.1%}",
+                    "Realized future return": "{:.2%}",
+                    "Signal strength": "{}",
+                },
+                na_rep="–",
+            ),
+            use_container_width=True,
+            height=280,
+        )
+
+    st.markdown("---")
+
+    c_left, c_right = st.columns(2)
+
+    with c_left:
+        _render_confusion_matrix_heatmap(metrics)
+
+    with c_right:
+        _render_probability_distribution(df_all)
+
+    _render_calibration_table(df_all)
+
+    with st.expander("Show full saved prediction results"):
+            keep_cols = [
+                "ticker",
+                "news_date",
+                "predicted_positive_probability",
+                "Predicted direction",
+                "Actual direction",
+                "future_return",
+                "Correct?",
+            ]
+
+            if "headline" in df_selected.columns:
+                keep_cols.insert(2, "headline")
+
+            show_cols = [c for c in keep_cols if c in df_selected.columns]
+
+            st.dataframe(
+                df_selected[show_cols].style.format(
+                    {
+                        "predicted_positive_probability": "{:.1%}",
+                        "future_return": "{:.2%}",
+                    },
+                    na_rep="–",
+                ),
+                use_container_width=True,
+                height=400,
+            )
+
+    items = explanation.get("items") or []
+    if items:
+        exp_df = pd.DataFrame(items[:15]).copy()
+
+        value_col = "coefficient" if "coefficient" in exp_df.columns else "importance"
+        if value_col in exp_df.columns:
+            exp_df[value_col] = pd.to_numeric(exp_df[value_col], errors="coerce")
+            exp_df["Interpretation"] = exp_df.apply(
+                lambda r: _coefficient_interpretation(
+                    r.get("feature"),
+                    float(r.get(value_col) or 0.0),
+                )
+                if value_col == "coefficient"
+                else "Higher importance means this feature contributed more to the model's decisions.",
+                axis=1,
+            )
+
+        with st.expander("Top model explanation features", expanded=True):
+            st.dataframe(exp_df, use_container_width=True)
+
+    with st.expander("Saved model metrics JSON"):
+        st.json(metrics)
+        
 # not used function 
 def _active_portfolio_label(is_refined: bool) -> str:
     return "Refined Portfolio" if is_refined else "Base Portfolio"
@@ -1788,6 +2393,9 @@ if "chat_pending_clarification" not in st.session_state:
 if "chat_selected_news_mode" not in st.session_state:
     st.session_state["chat_selected_news_mode"] = None
 
+if "news_prediction_state" not in st.session_state:
+    st.session_state["news_prediction_state"] = None
+
 
 
 # ---------------- LAYOUT ----------------
@@ -2126,7 +2734,7 @@ def _handle_chat_command(
 
         _append_chat_message(
             "assistant",
-            "I can use news in two different ways. Please choose one option below.",
+            "I can use news in three different ways. Please choose one option below.",
             kind="news_mode_selection",
             payload={
                 "question": "Which one do you want?",
@@ -2140,6 +2748,11 @@ def _handle_chat_command(
                         "label": "LLM news actions",
                         "value": "llm_actions",
                         "description": "Use news to generate qualitative actions, explanations, and suggestions."
+                    },
+                    {
+                        "label": "Trained news prediction model",
+                        "value": "prediction_model",
+                        "description": "Show saved model probabilities for future return direction."
                     },
                 ],
             },
@@ -2462,6 +3075,9 @@ else:
 
             - **Generate actions from news**  
             Example: `generate actions from news`
+
+            - **Show trained news prediction model results**
+            Example: `show news prediction model`
             """
         )
     for msg_idx, msg in enumerate(st.session_state.get("chat_history", [])):
@@ -2575,6 +3191,27 @@ else:
                                 },
                             )
                             st.rerun()
+                        elif selected_value == "prediction_model":
+                            out = load_saved_news_prediction_outputs()
+                            st.session_state["news_prediction_state"] = out
+
+                            if out.get("ok"):
+                                _append_chat_message(
+                                    "assistant",
+                                    "Loaded the saved news return prediction model results.",
+                                    kind="news_prediction_model",
+                                    payload={
+                                        "state": out,
+                                    },
+                                )
+                            else:
+                                _append_chat_message(
+                                    "assistant",
+                                    out.get("reason", "Could not load saved news prediction results."),
+                                )
+
+                            st.rerun()
+
 
             elif kind == "news_overview":
                 snapshot = payload.get("snapshot_text")
@@ -2823,6 +3460,9 @@ else:
                 if insight_text:
                     st.markdown("**Insight**")
                     st.markdown(insight_text)
+            elif kind == "news_prediction_model":
+                st.markdown("**Trained News Prediction Model**")
+                _render_saved_news_prediction_model(selected_tickers)
 
             elif kind == "final_portfolio_insight":
                 chosen = payload.get("chosen_candidate")
@@ -2843,7 +3483,7 @@ else:
                         st.write(explanation_text)
 
     chat_msg = st.chat_input(
-        "Ask something like: build the base portfolio, show news overview, generate actions from news, make it safer, exclude NVDA"
+        "Ask something like: build base portfolio, use news, show news prediction model, generate actions from news, make it safer, exclude NVDA"
     )
 
     if chat_msg:
