@@ -1381,7 +1381,207 @@ def run_saved_news_flow_experiment(
         **result,
     }
 
+def audit_news_prediction_dataset_for_leakage(
+    raw_path: str = ALL_TICKERS_RAW_PATH,
+    dataset_path: Optional[str] = None,
+) -> None:
+    print("\n==============================")
+    print("DATA LEAKAGE AUDIT")
+    print("==============================")
 
+    raw = pd.read_csv(raw_path)
+    raw["news_date"] = pd.to_datetime(raw["news_date"], errors="coerce")
+    raw["start_price_date"] = pd.to_datetime(raw["start_price_date"], errors="coerce")
+    raw["future_price_date"] = pd.to_datetime(raw["future_price_date"], errors="coerce")
+    raw["datetime_parsed"] = pd.to_datetime(raw["datetime"], errors="coerce", unit="s", utc=True)
+
+    print("\n[RAW DATA DATE CHECK]")
+    print("raw rows:", len(raw))
+    print("news_date range:", raw["news_date"].min(), "->", raw["news_date"].max())
+    print("datetime range:", raw["datetime_parsed"].min(), "->", raw["datetime_parsed"].max())
+    print("start_price_date range:", raw["start_price_date"].min(), "->", raw["start_price_date"].max())
+    print("future_price_date range:", raw["future_price_date"].min(), "->", raw["future_price_date"].max())
+
+    bad_start = raw[raw["start_price_date"] <= raw["news_date"]]
+    bad_future = raw[raw["future_price_date"] <= raw["start_price_date"]]
+    bad_horizon = raw[raw["future_price_date"] <= raw["news_date"]]
+
+    print("\n[LEAKAGE RULE CHECKS]")
+    print("Rows where start_price_date <= news_date:", len(bad_start))
+    print("Rows where future_price_date <= start_price_date:", len(bad_future))
+    print("Rows where future_price_date <= news_date:", len(bad_horizon))
+
+    print("\n[2026 NEWS CHECK]")
+    news_2026 = raw[raw["news_date"].dt.year == 2026].copy()
+    print("2026 raw rows:", len(news_2026))
+    if not news_2026.empty:
+        print("2026 news_date range:", news_2026["news_date"].min(), "->", news_2026["news_date"].max())
+        print("2026 tickers:", news_2026["ticker"].nunique())
+        print(
+            news_2026[
+                ["ticker", "news_date", "start_price_date", "future_price_date", "future_return"]
+            ]
+            .sort_values(["news_date", "ticker"])
+            .head(20)
+        )
+
+    suspicious_cols = [
+        c for c in raw.columns
+        if any(k in c.lower() for k in ["future", "target", "predicted", "correct", "baseline"])
+    ]
+    print("\n[SUSPICIOUS COLUMNS IN RAW]")
+    print(suspicious_cols)
+
+    if dataset_path is not None and Path(dataset_path).exists():
+        ds = pd.read_csv(dataset_path)
+        print("\n[MODEL DATASET CHECK]")
+        print("dataset rows:", len(ds))
+        print("columns:", list(ds.columns))
+        print("date range:", pd.to_datetime(ds["news_date_dt"], errors="coerce").min(), "->", pd.to_datetime(ds["news_date_dt"], errors="coerce").max())
+
+        feature_cols = get_feature_cols()
+        leaked_features = [
+            c for c in feature_cols
+            if any(k in c.lower() for k in ["future", "target", "predicted", "correct"])
+        ]
+        print("feature cols:", feature_cols)
+        print("leaked feature cols:", leaked_features)
+def audit_target_dependent_filtering(
+    raw_path: str = ALL_TICKERS_RAW_PATH,
+    thresholds: List[Optional[float]] = [None, 0.01, 0.02],
+) -> None:
+    print("\n==============================")
+    print("TARGET-DEPENDENT FILTER AUDIT")
+    print("==============================")
+
+    raw = pd.read_csv(raw_path)
+    raw["news_date"] = pd.to_datetime(raw["news_date"], errors="coerce")
+    raw["future_return"] = pd.to_numeric(raw["future_return"], errors="coerce")
+
+    raw = raw.dropna(subset=["ticker", "news_date", "future_return"]).copy()
+    raw["ticker"] = raw["ticker"].astype(str).str.upper().str.strip()
+    raw["target_direction"] = (raw["future_return"] > 0).astype(int)
+
+    print("Raw usable rows:", len(raw))
+    print("Raw tickers:", raw["ticker"].nunique())
+    print("Raw date range:", raw["news_date"].min(), "->", raw["news_date"].max())
+    print("Raw class counts:", raw["target_direction"].value_counts().to_dict())
+    print("Raw future_return describe:")
+    print(raw["future_return"].describe())
+
+    for thr in thresholds:
+        if thr is None:
+            x = raw.copy()
+            label = "NO THRESHOLD"
+        else:
+            x = raw[raw["future_return"].abs() >= thr].copy()
+            label = f"ABS FUTURE RETURN >= {thr}"
+
+        print("\n---", label, "---")
+        print("Rows:", len(x))
+        print("Rows kept ratio:", len(x) / len(raw) if len(raw) else None)
+        print("Tickers:", x["ticker"].nunique())
+        print("Class counts:", x["target_direction"].value_counts().to_dict())
+        print("Class ratio:")
+        print(x["target_direction"].value_counts(normalize=True).to_dict())
+        print("Future return describe:")
+        print(x["future_return"].describe())
+
+def audit_price_feature_correctness(
+    raw_path: str = ALL_TICKERS_RAW_PATH,
+    price_dir: Path = PRICE_DIR,
+    sample_size: int = 50,
+) -> None:
+    print("\n==============================")
+    print("PRICE FEATURE CORRECTNESS AUDIT")
+    print("==============================")
+
+    raw = pd.read_csv(raw_path)
+
+    required = [
+        "ticker",
+        "news_date",
+        "start_price_date",
+        "future_price_date",
+        "start_close",
+        "future_close",
+        "future_return",
+    ]
+
+    missing = [c for c in required if c not in raw.columns]
+    if missing:
+        print("[ERROR] Missing columns:", missing)
+        return
+
+    raw["news_date"] = pd.to_datetime(raw["news_date"], errors="coerce")
+    raw["start_price_date"] = pd.to_datetime(raw["start_price_date"], errors="coerce")
+    raw["future_price_date"] = pd.to_datetime(raw["future_price_date"], errors="coerce")
+    raw["start_close"] = pd.to_numeric(raw["start_close"], errors="coerce")
+    raw["future_close"] = pd.to_numeric(raw["future_close"], errors="coerce")
+    raw["future_return"] = pd.to_numeric(raw["future_return"], errors="coerce")
+
+    raw = raw.dropna(subset=required).copy()
+
+    print("Rows checked:", len(raw))
+
+    bad_start = raw[raw["start_price_date"] <= raw["news_date"]]
+    bad_future = raw[raw["future_price_date"] <= raw["start_price_date"]]
+    bad_return = raw[
+        ~np.isclose(
+            raw["future_return"],
+            (raw["future_close"] / raw["start_close"]) - 1.0,
+            atol=1e-8,
+            rtol=1e-8,
+        )
+    ]
+
+    print("Bad start_price_date <= news_date:", len(bad_start))
+    print("Bad future_price_date <= start_price_date:", len(bad_future))
+    print("Bad future_return formula:", len(bad_return))
+
+    if len(bad_return) > 0:
+        print("\nSample bad future_return rows:")
+        print(
+            bad_return[
+                [
+                    "ticker",
+                    "news_date",
+                    "start_price_date",
+                    "future_price_date",
+                    "start_close",
+                    "future_close",
+                    "future_return",
+                ]
+            ].head(20)
+        )
+
+    raw["calendar_gap_start"] = (raw["start_price_date"] - raw["news_date"]).dt.days
+    raw["calendar_gap_future"] = (raw["future_price_date"] - raw["start_price_date"]).dt.days
+
+    print("\nCalendar gap from news_date to start_price_date:")
+    print(raw["calendar_gap_start"].describe())
+
+    print("\nCalendar gap from start_price_date to future_price_date:")
+    print(raw["calendar_gap_future"].describe())
+
+    print("\nSample checked rows:")
+    print(
+        raw[
+            [
+                "ticker",
+                "news_date",
+                "start_price_date",
+                "future_price_date",
+                "calendar_gap_start",
+                "calendar_gap_future",
+                "start_close",
+                "future_close",
+                "future_return",
+            ]
+        ]
+        .sample(min(sample_size, len(raw)), random_state=42)
+        .sort_values(["ticker", "news_date"])
+    )
 def save_latest_ticker_prediction_signals(
     *,
     dataset: pd.DataFrame,
@@ -1644,82 +1844,316 @@ def run_all_ticker_news_prediction_experiment(
         **result,
     }
 
+def debug_goog_googl_news_coverage(
+    raw_path: str = ALL_TICKERS_RAW_PATH,
+) -> None:
+    print("\n==============================")
+    print("GOOG / GOOGL NEWS COVERAGE DEBUG")
+    print("==============================")
 
+    raw = pd.read_csv(raw_path)
+    raw["news_date"] = pd.to_datetime(raw["news_date"], errors="coerce")
+
+    for t in ["GOOG", "GOOGL"]:
+        x = raw[raw["ticker"].astype(str).str.upper().eq(t)].copy()
+
+        print("\n====", t, "====")
+        print("rows:", len(x))
+        print("date range:", x["news_date"].min(), "->", x["news_date"].max())
+
+        if x.empty:
+            print("[WARNING] No rows found for", t)
+            continue
+
+        print(
+            x.sort_values("news_date", ascending=False)[
+                ["ticker", "news_date", "headline", "source", "url"]
+            ].head(20)
+        )
+def run_model_sanity_checks(
+    raw_path: str = ALL_TICKERS_RAW_PATH,
+    threshold: Optional[float] = None,
+    model_type: str = "logistic",
+    random_state: int = 42,
+) -> None:
+    print("\n==============================")
+    print("MODEL SANITY CHECKS")
+    print("==============================")
+    print("threshold:", threshold)
+    print("model_type:", model_type)
+
+    dataset = build_ticker_date_prediction_dataset_v2(
+        raw_path=raw_path,
+        min_abs_return_for_signal=threshold,
+    )
+
+    if dataset.empty:
+        print("[STOP] Dataset is empty.")
+        return
+
+    df_model, feature_cols = prepare_model_frame(
+        dataset,
+        use_ticker_features=USE_TICKER_FEATURES,
+    )
+
+    print("\n[MODEL FEATURE CHECK]")
+    print("Number of model features:", len(feature_cols))
+    print("Feature columns:")
+    print(feature_cols)
+
+    suspicious_features = [
+        c for c in feature_cols
+        if any(k in c.lower() for k in [
+            "future",
+            "target",
+            "predicted",
+            "correct",
+            "baseline",
+        ])
+    ]
+
+    print("\nSuspicious model features:")
+    print(suspicious_features)
+
+    allowed_return_features = [
+        c for c in feature_cols
+        if "past" in c.lower() and "return" in c.lower()
+    ]
+
+    print("\nAllowed past return features:")
+    print(allowed_return_features)
+
+    result = train_news_flow_predictor(
+        dataset=dataset,
+        model_type=model_type,
+        random_state=random_state,
+    )
+
+    if not result.get("ok"):
+        print("[STOP] Normal model training failed:", result.get("reason"))
+        return
+
+    print("\n[NORMAL MODEL METRICS]")
+    m = result["metrics"]
+    print("accuracy:", m.get("accuracy"))
+    print("balanced_accuracy:", m.get("balanced_accuracy"))
+    print("baseline_accuracy:", m.get("majority_baseline_accuracy"))
+    print("baseline_balanced_accuracy:", m.get("majority_baseline_balanced_accuracy"))
+    print("model_minus_baseline_accuracy:", m.get("model_minus_baseline_accuracy"))
+    print("model_minus_baseline_balanced_accuracy:", m.get("model_minus_baseline_balanced_accuracy"))
+    print("roc_auc:", m.get("roc_auc"))
+    print("precision:", m.get("precision"))
+    print("recall:", m.get("recall"))
+    print("f1:", m.get("f1"))
+
+    print("\n[TOP MODEL EXPLANATION ITEMS]")
+    for item in result["model_explanation"].get("items", [])[:20]:
+        print(item)
+
+    print("\n[RANDOM LABEL TEST]")
+    shuffled_dataset = dataset.copy()
+    rng = np.random.default_rng(random_state)
+    shuffled_dataset["target_direction"] = rng.permutation(
+        shuffled_dataset["target_direction"].values
+    )
+
+    shuffled_result = train_news_flow_predictor(
+        dataset=shuffled_dataset,
+        model_type=model_type,
+        random_state=random_state,
+    )
+
+    if not shuffled_result.get("ok"):
+        print("[STOP] Shuffled model training failed:", shuffled_result.get("reason"))
+        return
+
+    sm = shuffled_result["metrics"]
+
+    print("shuffled_accuracy:", sm.get("accuracy"))
+    print("shuffled_balanced_accuracy:", sm.get("balanced_accuracy"))
+    print("shuffled_baseline_accuracy:", sm.get("majority_baseline_accuracy"))
+    print("shuffled_roc_auc:", sm.get("roc_auc"))
+    print("shuffled_precision:", sm.get("precision"))
+    print("shuffled_recall:", sm.get("recall"))
+    print("shuffled_f1:", sm.get("f1"))
+
+    print("\n[INTERPRETATION]")
+    if suspicious_features:
+        print("[WARNING] Suspicious model features found. Check these carefully.")
+    else:
+        print("[OK] No future/target/prediction columns are used as model features.")
+
+    if sm.get("roc_auc") is not None and abs(sm.get("roc_auc") - 0.5) < 0.05:
+        print("[OK] Random label test is near chance level. This supports that there is no obvious leakage.")
+    else:
+        print("[WARNING] Random label test is not near chance level. Investigate possible leakage or split issue.")
+def run_threshold_debug_experiments(
+    raw_path: str = ALL_TICKERS_RAW_PATH,
+    model_type: str = "logistic",
+    thresholds: List[Optional[float]] = [None, 0.01, 0.02],
+) -> pd.DataFrame:
+    print("\n==============================")
+    print("THRESHOLD DEBUG EXPERIMENTS")
+    print("==============================")
+
+    rows = []
+
+    debug_dir = OUT_DIR / "threshold_debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    for thr in thresholds:
+        suffix = "none" if thr is None else str(thr).replace(".", "p")
+
+        print("\n" + "=" * 80)
+        print(f"Running debug experiment | threshold={thr}")
+        print("=" * 80)
+
+        dataset = build_ticker_date_prediction_dataset_v2(
+            raw_path=raw_path,
+            min_abs_return_for_signal=thr,
+        )
+
+        result = train_news_flow_predictor(
+            dataset=dataset,
+            model_type=model_type,
+        )
+
+        dataset_path = debug_dir / f"debug_dataset_thr{suffix}_{model_type}.csv"
+        metrics_path = debug_dir / f"debug_metrics_thr{suffix}_{model_type}.json"
+        predictions_path = debug_dir / f"debug_predictions_thr{suffix}_{model_type}.csv"
+        model_path = debug_dir / f"debug_model_thr{suffix}_{model_type}.joblib"
+
+        dataset.to_csv(dataset_path, index=False)
+
+        if not result.get("ok"):
+            rows.append({
+                "threshold": thr,
+                "ok": False,
+                "rows": len(dataset),
+                "reason": result.get("reason"),
+            })
+            continue
+
+        result["predictions"].to_csv(predictions_path, index=False)
+
+        with open(metrics_path, "w", encoding="utf-8") as f:
+            json.dump(result["metrics"], f, indent=2, ensure_ascii=False)
+
+        joblib.dump(
+            {
+                "model": result["model"],
+                "feature_cols": result["feature_cols"],
+                "metrics": result["metrics"],
+                "threshold": thr,
+                "model_type": model_type,
+                "debug_only": True,
+                "note": "This model is only for threshold comparison. It does not overwrite the best production model.",
+            },
+            model_path,
+        )
+
+        m = result["metrics"]
+
+        rows.append({
+            "threshold": "None" if thr is None else thr,
+            "ok": True,
+            "rows": len(dataset),
+            "train_size": m.get("train_size"),
+            "test_size": m.get("test_size"),
+            "accuracy": m.get("accuracy"),
+            "balanced_accuracy": m.get("balanced_accuracy"),
+            "baseline_accuracy": m.get("majority_baseline_accuracy"),
+            "baseline_balanced_accuracy": m.get("majority_baseline_balanced_accuracy"),
+            "model_minus_baseline_accuracy": m.get("model_minus_baseline_accuracy"),
+            "model_minus_baseline_balanced_accuracy": m.get("model_minus_baseline_balanced_accuracy"),
+            "roc_auc": m.get("roc_auc"),
+            "inverse_roc_auc": m.get("inverse_roc_auc"),
+            "precision": m.get("precision"),
+            "recall": m.get("recall"),
+            "f1": m.get("f1"),
+            "train_date_range": m.get("train_date_range"),
+            "test_date_range": m.get("test_date_range"),
+            "train_class_counts": m.get("class_counts_train"),
+            "test_class_counts": m.get("class_counts_test"),
+        })
+
+        print("Saved debug dataset:", dataset_path)
+        print("Saved debug model:", model_path)
+        print("Saved debug metrics:", metrics_path)
+        print("Saved debug predictions:", predictions_path)
+
+    comparison = pd.DataFrame(rows)
+    comparison_path = debug_dir / f"threshold_debug_comparison_{model_type}.csv"
+    comparison.to_csv(comparison_path, index=False)
+
+    print("\n==============================")
+    print("THRESHOLD DEBUG COMPARISON")
+    print("==============================")
+    pd.set_option("display.max_columns", None)
+    pd.set_option("display.width", 200)
+
+    metric_cols = [
+        "threshold",
+        "rows",
+        "train_size",
+        "test_size",
+        "accuracy",
+        "balanced_accuracy",
+        "baseline_accuracy",
+        "baseline_balanced_accuracy",
+        "model_minus_baseline_accuracy",
+        "model_minus_baseline_balanced_accuracy",
+        "roc_auc",
+        "inverse_roc_auc",
+        "precision",
+        "recall",
+        "f1",
+    ]
+
+    print(comparison[metric_cols])
+    print(comparison)
+    print("Saved comparison:", comparison_path)
+
+    return comparison
 # ============================================================
 # MAIN
 # ============================================================
 
 if __name__ == "__main__":
 
-    if REFRESH_RAW_DATASET:
-        refresh_raw_news_timeseries_dataset(
-            tickers=TICKERS_FOR_NEWS_DATASET,
-            output_path=RAW_PATH,
-            lookback_days=NEWS_LOOKBACK_DAYS,
-            exclude_recent_days=EXCLUDE_RECENT_DAYS,
-            max_items_per_window=MAX_ITEMS_PER_WINDOW,
-            horizon_days=HORIZON_DAYS,
-            cache_ttl_s=CACHE_TTL_S,
-            sleep_s=API_SLEEP_S,
-            append_to_existing=True,
-            max_api_calls_per_run=MAX_API_CALLS_PER_RUN,
-        )
+    audit_news_prediction_dataset_for_leakage(
+        raw_path=ALL_TICKERS_RAW_PATH,
+    )
 
-    #print_missing_tickers_status()
+    audit_target_dependent_filtering(
+        raw_path=ALL_TICKERS_RAW_PATH,
+        thresholds=[None, 0.01, 0.02],
+    )
 
-
+    audit_price_feature_correctness(
+        raw_path=ALL_TICKERS_RAW_PATH,
+        price_dir=PRICE_DIR,
+        sample_size=30,
+    )
     
-    experiments = [
-        #{"min_abs_return_for_signal": 0.01, "model_type": "logistic", "all_tickers": True},
-        {"min_abs_return_for_signal": 0.02, "model_type": "logistic", "all_tickers": True},
-        #{"min_abs_return_for_signal": 0.01, "model_type": "random_forest", "all_tickers": True},
-        #{"min_abs_return_for_signal": 0.02, "model_type": "random_forest", "all_tickers": True},
-    ]
+    debug_goog_googl_news_coverage(
+        raw_path=ALL_TICKERS_RAW_PATH,
+    )
 
-
-    for exp in experiments:
-        if exp.get("all_tickers"):
-            result = run_all_ticker_news_prediction_experiment(
-                min_abs_return_for_signal=exp["min_abs_return_for_signal"],
-                model_type=exp["model_type"],
-                output_tag=f"{ALL_TICKERS_OUTPUT_TAG}_{exp['model_type']}",
-                refresh_raw_dataset=False,
-                save_outputs=True,
-                batch_size=5,
-                batch_index=0,
-                max_api_calls_per_run=70,
-            )
-        else:
-            result = run_saved_news_flow_experiment(
-                raw_path=RAW_PATH,
-                min_abs_return_for_signal=exp["min_abs_return_for_signal"],
-                model_type=exp["model_type"],
-                save_outputs=True,
-            )
-
-        print("\n=== NEWS FLOW RESULT ===")
-        print("threshold:", exp["min_abs_return_for_signal"])
-        print("model_type:", exp["model_type"])
-        print("OK:", result.get("ok"))
-        print("rows:", result.get("rows"))
-        print("raw_rows:", result.get("raw_rows"))
-        print("trained_tickers:", result.get("trained_tickers"))
-
-        if result.get("ok"):
-            print("\n=== Metrics ===")
-            for k, v in result["metrics"].items():
-                if k != "classification_report":
-                    print(k, ":", v)
-
-            print("\n=== Classification report ===")
-            print(result["metrics"]["classification_report"])
-
-            print("\n=== Top model explanation items ===")
-            for item in result["model_explanation"].get("items", [])[:10]:
-                print(item)
-        else:
-            print("Reason:", result.get("reason"))
-
-        print("\n" + "=" * 80 + "\n")
+    run_threshold_debug_experiments(
+        raw_path=ALL_TICKERS_RAW_PATH,
+        model_type="logistic",
+        thresholds=[None, 0.01, 0.02],
+    )
+    run_model_sanity_checks(
+    raw_path=ALL_TICKERS_RAW_PATH,
+    threshold=None,
+    model_type="logistic",
+    )
+    run_model_sanity_checks(
+    raw_path=ALL_TICKERS_RAW_PATH,
+    threshold=0.02,
+    model_type="logistic",
+)
 
         
