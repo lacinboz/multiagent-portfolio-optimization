@@ -37,7 +37,11 @@ import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
 
-from portfolio_langgraph_withllm import run_graph, run_graph_prob_news
+from portfolio_langgraph_withllm import (
+    run_graph,
+    run_graph_prob_news,
+    run_graph_prediction_constraint,
+)
 from llm_client import LLMClient
 NEWS_PRED_DIR = Path("data/news_prediction")
 BEST_NEWS_PREDICTIONS_PATH = NEWS_PRED_DIR / "best_news_prediction_predictions.csv"
@@ -200,6 +204,8 @@ def load_saved_news_prediction_outputs() -> Dict[str, Any]:
 
     pred_df = pd.read_csv(pred_path)
     latest_signals = pd.DataFrame()
+    
+
     if LATEST_NEWS_SIGNALS_PATH.exists():
         latest_signals = pd.read_csv(LATEST_NEWS_SIGNALS_PATH)
 
@@ -578,7 +584,122 @@ def _render_latest_prediction_signals(latest_df: pd.DataFrame, selected_tickers:
         use_container_width=True,
         height=360,
     )
-def _render_saved_news_prediction_model(selected_tickers: List[str]):
+def _render_prediction_weight_shift_chart(
+    refined_state: Dict[str, Any],
+    *,
+    chart_key: str = "prediction_shift_chart",
+):
+    if not refined_state:
+        return
+
+    base_w = refined_state.get("baseline_candidate_weights") or {}
+    final_w = refined_state.get("optimized_weights") or {}
+
+    if not base_w or not final_w:
+        return
+
+    rows = []
+
+    tickers = sorted(set(base_w.keys()) | set(final_w.keys()))
+
+    for t in tickers:
+        rows.append(
+            {
+                "Ticker": t,
+                "Baseline": float(base_w.get(t, 0.0)),
+                "Prediction-Constrained": float(final_w.get(t, 0.0)),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+
+    long_df = df.melt(
+        id_vars="Ticker",
+        value_vars=["Baseline", "Prediction-Constrained"],
+        var_name="Portfolio",
+        value_name="Weight",
+    )
+
+    fig = px.bar(
+        long_df,
+        x="Ticker",
+        y="Weight",
+        color="Portfolio",
+        barmode="group",
+        text="Weight",
+        title="Prediction Constraint Effect on Portfolio Weights",
+    )
+
+    fig.update_traces(
+        texttemplate="%{text:.1%}",
+        textposition="outside",
+    )
+
+    fig.update_yaxes(tickformat=".0%")
+
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        key=chart_key,
+    )
+def _render_prediction_constraint_table(
+    refined_state: Dict[str, Any],
+):
+    if not refined_state:
+        return
+
+    probs = refined_state.get("prediction_probs") or {}
+    base_w = refined_state.get("baseline_candidate_weights") or {}
+    final_w = refined_state.get("optimized_weights") or {}
+
+    if not probs:
+        return
+
+    rows = []
+
+    tickers = sorted(probs.keys())
+
+    for t in tickers:
+        p = probs.get(t)
+
+        if p >= 0.60:
+            signal = "Bullish"
+        elif p <= 0.40:
+            signal = "Bearish"
+        else:
+            signal = "Neutral"
+
+        rows.append(
+            {
+                "Ticker": t,
+                "Probability": p,
+                "Signal": signal,
+                "Old Weight": float(base_w.get(t, 0.0)),
+                "New Weight": float(final_w.get(t, 0.0)),
+                "Shift": float(final_w.get(t, 0.0))
+                - float(base_w.get(t, 0.0)),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+
+    st.markdown("### Constraint-Level Changes")
+
+    st.dataframe(
+        df.style.format(
+            {
+                "Probability": "{:.1%}",
+                "Old Weight": "{:.1%}",
+                "New Weight": "{:.1%}",
+                "Shift": "{:+.1%}",
+            }
+        ),
+        use_container_width=True,
+    )
+def _render_saved_news_prediction_model(
+    selected_tickers: List[str],
+    active_state: Optional[Dict[str, Any]] = None,
+):
     out = load_saved_news_prediction_outputs()
 
     if not out.get("ok"):
@@ -634,6 +755,181 @@ def _render_saved_news_prediction_model(selected_tickers: List[str]):
         .copy()
     )
 
+    # ============================================================
+    # Portfolio integration
+    # ============================================================
+    prediction_probs = {}
+    prediction_caps = {}
+    prediction_used = False
+    optimized_weights = {}
+
+    if active_state:
+                    prediction_probs = active_state.get("prediction_probs") or {}
+                    prediction_caps = active_state.get("prediction_adjusted_caps") or {}
+                    prediction_used = active_state.get("prediction_model_used")
+                    optimized_weights = active_state.get("optimized_weights") or {}
+                    constraint_debug = active_state.get("constraint_debug")
+
+                    if optimized_weights:
+                        st.markdown("---")
+                        st.markdown("## Portfolio Integration")
+
+                        st.caption(
+                            "This section connects the trained news prediction model "
+                            "with the currently optimized portfolio."
+                        )
+
+                        exposure_rows = []
+
+                        for _, row in latest.iterrows():
+                            ticker = str(row.get("ticker")).upper()
+
+                            portfolio_weight = float(
+                                optimized_weights.get(ticker, 0.0)
+                            )
+
+                            exposure_rows.append({
+                                "Ticker": ticker,
+                                "Portfolio weight": portfolio_weight,
+                                "Predicted direction": row.get("Predicted direction"),
+                                "Positive probability": row.get("predicted_positive_probability"),
+                                "Signal strength": row.get("Signal strength"),
+                            })
+
+                        exposure_df = pd.DataFrame(exposure_rows)
+
+                        exposure_df = exposure_df.sort_values(
+                            "Portfolio weight",
+                            ascending=False,
+                        )
+
+                        st.dataframe(
+                            exposure_df.style.format({
+                                "Portfolio weight": "{:.2%}",
+                                "Positive probability": "{:.1%}",
+                            }),
+                            use_container_width=True,
+                        )
+    if prediction_used and prediction_probs:
+
+        st.markdown("### Prediction-Constrained Optimization")
+
+        pred_rows = []
+
+        for ticker in selected_tickers:
+
+            pred_rows.append({
+                "Ticker": ticker,
+                "Prediction probability":
+                    prediction_probs.get(ticker),
+
+                "Adjusted max allocation":
+                    prediction_caps.get(ticker),
+
+                "Final portfolio weight":
+                    optimized_weights.get(ticker, 0.0),
+                "Cap delta":
+                    prediction_caps.get(ticker, 0.0)
+                    - float(active_state.get("w_max", 0.30)),
+            })
+
+        pred_df = pd.DataFrame(pred_rows)
+
+        st.dataframe(
+            pred_df.style.format({
+                "Prediction probability": "{:.1%}",
+                "Adjusted max allocation": "{:.1%}",
+                "Final portfolio weight": "{:.1%}",
+            }),
+            use_container_width=True,
+    )
+        # ============================================================
+        # Compare baseline vs prediction-constrained portfolio
+        # ============================================================
+
+        baseline_weights = active_state.get("baseline_candidate_weights") or {}
+
+        if baseline_weights:
+
+            st.markdown("### Portfolio Weight Shift")
+
+            shift_rows = []
+
+            for ticker in selected_tickers:
+
+                baseline_w = float(baseline_weights.get(ticker, 0.0))
+                final_w = float(optimized_weights.get(ticker, 0.0))
+
+                shift_rows.append({
+                    "Ticker": ticker,
+                    "Baseline weight": baseline_w,
+                    "Prediction-constrained weight": final_w,
+                    "Weight change": final_w - baseline_w,
+                })
+
+            shift_df = pd.DataFrame(shift_rows)
+
+            st.dataframe(
+                shift_df.style.format({
+                    "Baseline weight": "{:.1%}",
+                    "Prediction-constrained weight": "{:.1%}",
+                    "Weight change": "{:+.1%}",
+                }),
+                use_container_width=True,
+            )
+        st.write("DEBUG constraint_debug:", constraint_debug)
+        st.write("DEBUG active_state keys:", list(active_state.keys()) if active_state else None)
+        if constraint_debug:
+            st.markdown("### Constraint Debug Information")
+
+            debug_rows = []
+
+            for ticker, info in constraint_debug.items():
+                constraint_type = info.get("constraint_type", "None")
+                
+                # Bullish → min floor göster, Bearish → max cap göster
+                if constraint_type == "Bullish Min Floor":
+                    constraint_value_label = "Min weight (floor)"
+                    constraint_value = info.get("adjusted_min_weight") or info.get("adjusted_cap")
+                elif constraint_type == "Bearish Max Cap":
+                    constraint_value_label = "Max weight (cap)"
+                    constraint_value = info.get("adjusted_max_weight") or info.get("adjusted_cap")
+                else:
+                    constraint_value_label = "No constraint"
+                    constraint_value = None
+
+                debug_rows.append({
+                    "Ticker": ticker,
+                    "Constraint type": constraint_type,
+                    "Baseline max weight": info.get("baseline_cap"),
+                    "Prediction probability": info.get("prediction_probability"),
+                    constraint_value_label: constraint_value,
+                    "Final weight": info.get("final_weight"),
+                    "Bullish": info.get("is_bullish"),
+                    "Bearish": info.get("is_bearish"),
+                    "Binding": info.get("constraint_binding"),
+                })
+
+            debug_df = pd.DataFrame(debug_rows)
+
+            # Format: sadece sayısal kolonları format et
+            format_dict = {
+                "Baseline max weight": "{:.1%}",
+                "Prediction probability": "{:.1%}",
+                "Final weight": "{:.1%}",
+            }
+            
+            # Dinamik kolon adı için
+            if "Min weight (floor)" in debug_df.columns:
+                format_dict["Min weight (floor)"] = "{:.1%}"
+            if "Max weight (cap)" in debug_df.columns:
+                format_dict["Max weight (cap)"] = "{:.1%}"
+
+            st.dataframe(
+                debug_df.style.format(format_dict, na_rep="–"),
+                use_container_width=True,
+            )
+                    
     latest_cols = [
         "ticker",
         "news_date",
@@ -1896,14 +2192,25 @@ def _render_why_this_portfolio_cards(state: Optional[Dict[str, Any]]):
         st.info("No portfolio explanation available yet.")
         return
 
-    is_refined = st.session_state.get("refined_state") is not None
+    active_state = (
+    st.session_state.get("refined_state")
+    or st.session_state.get("base_state")
+    or {}
+    )
+
+    is_refined = active_state is not st.session_state.get("base_state")
 
     insight_text = str(state.get("insight_raw_text") or "").strip()
     explanation_text = str(state.get("explanation") or "").strip()
     text = insight_text or explanation_text
 
     opt_m = state.get("optimized_metrics") or {}
-    chosen = _get_chosen_candidate(state)
+    if state.get("prediction_model_used"):
+        chosen = _get_chosen_candidate(
+            st.session_state.get("base_state") or state
+        )
+    else:
+        chosen = _get_chosen_candidate(state)
 
     ret = _fmt_pct_from_decimal(_safe_float(opt_m.get("return")))
     vol = _fmt_pct_from_decimal(_safe_float(opt_m.get("vol")))
@@ -1911,7 +2218,12 @@ def _render_why_this_portfolio_cards(state: Optional[Dict[str, Any]]):
 
     objective_label = "Max Sharpe" if chosen == "maxsharpe" else "Min Variance"
     news_used = bool(state.get("prob_news_trace") or state.get("news_adjustment_evaluation"))
-    news_label = "News-adjusted" if news_used else "No mathematical news adjustment"
+    if state.get("prediction_model_used"):
+        news_label = "Prediction-constrained optimization"
+    elif news_used:
+        news_label = "News-adjusted (FinBERT/probabilistic)"
+    else:
+        news_label = "No mathematical news adjustment"
 
     st.markdown("### 🧠 Why this portfolio?")
 
@@ -2087,7 +2399,23 @@ def _render_portfolio_story_timeline(
             or refined_state.get("news_adjustment_evaluation")
         )
 
-        if news_used:
+        if refined_state.get("prediction_model_used"):
+            # prediction constraint için özel timeline adımı
+            summary = refined_state.get("prediction_constraint_summary") or {}
+            bullish = summary.get("bullish") or []
+            bearish = summary.get("bearish") or []
+            parts = []
+            if bullish:
+                parts.append(f"Bullish min-floor: {', '.join(bullish)}")
+            if bearish:
+                parts.append(f"Bearish max-cap: {', '.join(bearish)}")
+            story_steps.append({
+                "title": "News prediction constraints applied",
+                "subtitle": "Trained LogisticRegression model constrained feasible portfolio allocations.",
+                "detail": " | ".join(parts) if parts else "Side constraints from prediction model applied.",
+                "status": "done",
+            })
+        elif news_used:
             trace = refined_state.get("prob_news_trace") or {}
             ticker_signals = trace.get("ticker_signals") or {}
             prediction_signals = trace.get("prediction_signals") or {}
@@ -2157,16 +2485,28 @@ def _render_portfolio_story_timeline(
             else:
                 detail = "Portfolio weights stayed almost unchanged."
 
+
+            if refined_state.get("prediction_model_used"):
+                weight_subtitle = (
+                    "Portfolio weights were constrained using predicted news probabilities."
+                )
+            else:
+                weight_subtitle = (
+                    "The optimizer selected the final allocation after applying the refinement inputs."
+                )
+
             story_steps.append(
                 {
                     "title": "Portfolio weights updated",
-                    "subtitle": "The optimizer selected the final allocation after applying the refinement inputs.",
+                    "subtitle": weight_subtitle,                     
                     "detail": detail,
-                    "status": "done",
-                }
-            )
-
-        ref_obj = _get_chosen_candidate(refined_state)
+                                "status": "done",
+                            }
+                        )
+        if refined_state.get("prediction_model_used"):
+            ref_obj = _get_chosen_candidate(base_state)
+        else:
+            ref_obj = _get_chosen_candidate(refined_state)
         ref_m = refined_state.get("optimized_metrics") or {}
 
         story_steps.append(
@@ -2649,6 +2989,49 @@ def _run_prob_news_refine_flow(
 
     st.session_state["refined_state"] = refined_state
     return refined_state
+
+def run_prediction_constrained_optimization(
+    selected_tickers,
+    rf,
+    w_max,
+    current_weights_dict,
+):
+    """
+    Runs prediction-constrained portfolio optimization
+    after trained prediction model visualization.
+    """
+
+    base_state = st.session_state.get("base_state") or {}
+
+    prediction_state = run_graph_prediction_constraint(
+        selected_tickers=selected_tickers,
+        rf=float(rf),
+        w_max=float(w_max),
+
+        preferences={},
+
+        current_weights=current_weights_dict,
+
+        clarification_answers={
+            "satisfaction": "no",
+            "use_news": "yes",
+            "extra_notes": "Prediction constrained optimization",
+        },
+
+        mode="refine",
+        stage="main",
+
+        use_llm=True,
+        use_news=True,
+
+        base_portfolio_metrics=base_state.get("optimized_metrics"),
+        base_portfolio_weights=base_state.get("optimized_weights"),
+        base_portfolio_objective=base_state.get("objective_key"),
+    )
+
+    st.session_state["refined_state"] = prediction_state
+
+    return prediction_state
 # ---------------- RUN BASE ----------------
 if run_base and selected_tickers:
     _run_base_flow(
@@ -2936,9 +3319,21 @@ def _get_compare_state_for_charts():
 
 
 # ---------------- ACTIVE STATE ----------------
-graph_state = st.session_state["refined_state"] or st.session_state["base_state"]
-is_refined_active = st.session_state["refined_state"] is not None
-active_label = "Refined Portfolio" if is_refined_active else "Base Portfolio"
+graph_state = (
+    st.session_state["refined_state"]
+    or st.session_state["base_state"]
+)
+
+is_refined_active = (
+    st.session_state["refined_state"] is not None
+)
+
+if graph_state and graph_state.get("prediction_model_used"):
+    active_label = "Prediction-Constrained Portfolio"
+elif is_refined_active:
+    active_label = "Refined Portfolio"
+else:
+    active_label = "Base Portfolio"
 
 optimization_result = None
 portfolio_weights = None
@@ -3462,8 +3857,37 @@ else:
                     st.markdown(insight_text)
             elif kind == "news_prediction_model":
                 st.markdown("**Trained News Prediction Model**")
-                _render_saved_news_prediction_model(selected_tickers)
 
+                # 1. Önce prediction-constrained optimization çalıştır
+                prediction_state = run_prediction_constrained_optimization(
+                    selected_tickers=selected_tickers,
+                    rf=rf,
+                    w_max=w_max,
+                    current_weights_dict=current_weights_dict,
+                )
+                
+
+                # 2. refined_state artık set edildi, active_state olarak kullan
+                active_state = st.session_state.get("refined_state")
+
+
+                # 3. Modeli render et
+                _render_saved_news_prediction_model(
+                    selected_tickers=selected_tickers,
+                    active_state=active_state,
+                )
+                _render_prediction_weight_shift_chart(
+                    active_state,
+                    chart_key=f"prediction_shift_{msg_idx}",
+                )
+
+                _render_prediction_constraint_table(active_state)
+
+                if prediction_state:
+                    st.markdown("## Prediction-Constrained Portfolio")
+                    st.write(prediction_state.get("optimized_weights"))
+                    st.write(prediction_state.get("optimized_metrics"))
+                
             elif kind == "final_portfolio_insight":
                 chosen = payload.get("chosen_candidate")
                 insight_text = payload.get("insight_text")
@@ -3934,6 +4358,7 @@ _render_asset_detail_drilldown(
     st.session_state.get("refined_state"),
     selected_tickers,
 )
+
 
 st.markdown("</div>", unsafe_allow_html=True)
 # ---------------- Bottom: Weights + News + Insight + Explanation ----------------

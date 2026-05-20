@@ -1,3 +1,4 @@
+# news_return_predictor.py
 from __future__ import annotations
 
 from pathlib import Path
@@ -1643,7 +1644,50 @@ def run_all_ticker_news_prediction_experiment(
         "dataset": dataset,
         **result,
     }
+def load_prediction_model(
+    model_path: str = "data/news_prediction/best_news_prediction_model.joblib"
+):
+    bundle = joblib.load(model_path)
 
+    return {
+        "model": bundle["model"],
+        "feature_cols": bundle["feature_cols"],
+        "metrics": bundle.get("metrics", {}),
+        "trained_tickers": bundle.get("trained_tickers", []),
+    }
+def predict_ticker_probabilities(
+    model_bundle,
+    tickers,
+):
+    latest_path = (
+        OUT_DIR / "latest_news_prediction_signals.csv"
+    )
+
+    if not latest_path.exists():
+        return {}
+
+    latest = pd.read_csv(latest_path)
+
+    latest["ticker"] = (
+        latest["ticker"]
+        .astype(str)
+        .str.upper()
+    )
+
+    selected = latest[
+        latest["ticker"].isin(
+            [t.upper() for t in tickers]
+        )
+    ]
+
+    probs = {}
+
+    for _, row in selected.iterrows():
+        probs[row["ticker"]] = float(
+            row["predicted_positive_probability"]
+        )
+
+    return probs
 
 # ============================================================
 # MAIN

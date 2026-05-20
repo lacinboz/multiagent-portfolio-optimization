@@ -1,4 +1,5 @@
 
+# portfolio_langgraph_withllm.py
 from __future__ import annotations
 from collections import defaultdict, Counter
 import hashlib
@@ -12,8 +13,7 @@ import re
 from collections import Counter
 import pandas as pd
 from langgraph.graph import StateGraph, END
-
-
+from news_return_predictor import load_prediction_model
 from probabilistic_news_integration import (
     build_adjusted_inputs_from_existing_news_state,
     evaluate_news_adjustment_effect,  
@@ -21,6 +21,7 @@ from probabilistic_news_integration import (
 from agents_langgraph import (
     data_agent_get_mu_cov,
     optimization_agent_from_mu_cov,
+    prediction_constrained_optimization_agent,
     risk_agent,
     recommendation_agent,
     apply_news_actions_to_params,
@@ -109,6 +110,14 @@ class PortfolioState(TypedDict, total=False):
     news_adjustment_evaluation: Optional[Dict[str, Any]]
     prob_prediction_evaluation: Optional[Dict[str, Any]]
 
+    prediction_probs: Optional[Dict[str, float]]
+    prediction_adjusted_caps: Optional[Dict[str, float]]
+    prediction_model_metrics: Optional[Dict[str, Any]]
+    prediction_model_used: Optional[bool]
+
+    constraint_debug: Optional[Dict[str, Any]]
+    baseline_candidate_weights: Optional[Dict[str, float]]
+
 
 
     debug_notes: List[str]
@@ -189,6 +198,8 @@ def _init_defaults(state: PortfolioState) -> PortfolioState:
 
     state.setdefault("prob_news_trace", None)
     state.setdefault("historical_prediction_evaluation", None)
+
+    
     
 
 
@@ -1189,6 +1200,243 @@ def node_optimize_prob_news(state: PortfolioState) -> PortfolioState:
     state["debug_notes"].append("OptimizationProbNews: done.")
     return state
 
+def node_optimize_prediction_constraint(state: PortfolioState) -> PortfolioState:
+
+    if state.get("mu") is None or state.get("cov") is None:
+        state["optimization_result"] = {}
+        
+
+        state["debug_notes"].append(
+            "OptimizationPredictionConstraint: skipped (missing mu/cov)."
+        )
+
+        return state
+
+    mu_to_use = state["mu"]
+    cov_to_use = state["cov"]
+    prediction_probs = {}
+    news_constraints = {}
+    baseline_weights = {}
+
+    try:
+        state["debug_notes"].append(
+            "PredictionConstraint: ENTER TRY BLOCK"
+        )
+        state["debug_notes"].append(
+            "PredictionConstraint: importing integration module"
+        )
+
+
+        from news_constraint_integration import (
+            build_news_probability_constraints
+        )
+        state["debug_notes"].append(
+            "PredictionConstraint: import success"
+        )
+
+        # =====================================================
+        # Load latest prediction signals
+        # =====================================================
+
+        from pathlib import Path
+
+        csv_path = Path(
+            "data/news_prediction/latest_news_prediction_signals.csv"
+        )
+
+        state["debug_notes"].append(
+            f"PredictionConstraint: csv_path={csv_path}"
+        )
+
+        state["debug_notes"].append(
+            f"PredictionConstraint: csv_exists={csv_path.exists()}"
+        )
+        latest_signals = pd.read_csv(csv_path)
+
+        prediction_probs = {
+        str(row["ticker"]).upper(): float(row["predicted_positive_probability"])
+        for _, row in latest_signals.iterrows()
+        }
+
+        state["prediction_probs"] = prediction_probs
+
+        # =====================================================
+        # FIRST:
+        # Build baseline portfolio
+        # (without news constraints)
+        # =====================================================
+
+        baseline_res = optimization_agent_from_mu_cov(
+            mu=mu_to_use,
+            cov=cov_to_use,
+            rf=float(state["rf"]),
+            w_max=float(state["w_max"]),
+            lambda_l2=float(state["lambda_l2"]),
+        )
+        state["debug_notes"].append(
+            f"PredictionConstraint: baseline_res_keys={list(baseline_res.keys())}"
+        )
+
+        state["debug_notes"].append(
+            f"PredictionConstraint: baseline_maxsharpe="
+            f"{baseline_res.get('maxsharpe')}"
+        )
+
+        objective_key = str(
+            state.get("objective_key", "maxsharpe")
+        ).lower().strip()
+
+        state["debug_notes"].append(
+            f"PredictionConstraint: objective_key={objective_key}"
+        )
+        baseline_weights = (
+            baseline_res
+            .get(objective_key, {})
+            .get("weights", {})
+        )
+        state["debug_notes"].append(
+            f"PredictionConstraint: baseline_weights={baseline_weights}"
+        )
+
+        # =====================================================
+        # Build threshold-based constraints
+        # =====================================================
+
+        news_constraints = build_news_probability_constraints(
+            latest_signals=latest_signals,
+            baseline_weights=baseline_weights,
+            bullish_threshold=0.60,
+            bearish_threshold=0.40,
+            delta=0.02,
+            w_max=float(state["w_max"]), 
+        )
+
+        state["prediction_model_used"] = True
+
+        state["debug_notes"].append(
+            f"PredictionConstraint: constraints={news_constraints}"
+        )
+
+
+    except Exception as e:
+
+        state["prediction_model_used"] = False
+
+        state["debug_notes"].append(
+            f"PredictionConstraint failed -> fallback normal optimization: {e}"
+        )
+
+        news_constraints = {}
+
+    # =====================================================
+    # FINAL constrained optimization
+    # =====================================================
+
+    res = prediction_constrained_optimization_agent(
+        mu=mu_to_use,
+        cov=cov_to_use,
+        rf=float(state["rf"]),
+        w_max=float(state["w_max"]),
+        lambda_l2=float(state["lambda_l2"]),
+        news_constraints=news_constraints,
+    )
+
+    state["optimization_result"] = res
+
+    state["debug_notes"].append(
+        "OptimizationPredictionConstraint: done."
+    )
+
+    # =====================================================
+    # Store dashboard visualization fields
+    # =====================================================
+
+    # baseline weights (before prediction constraints)
+    state["baseline_candidate_weights"] = baseline_weights
+
+    # final optimized weights
+    state["optimized_weights"] = (
+        res.get(objective_key, {})
+        .get("weights", {})
+    )
+    raw_m = res.get(objective_key, {})
+    state["optimized_metrics"] = {
+        "return": raw_m.get("return"),
+        "vol": raw_m.get("vol"),
+        "sharpe": raw_m.get("sharpe"),
+        "return_pct": (raw_m.get("return") or 0) * 100,
+        "vol_pct": (raw_m.get("vol") or 0) * 100,
+        "active_assets": len([
+            v for v in state["optimized_weights"].values()
+            if abs(v) > 1e-6
+        ]),
+        "max_weight": max(state["optimized_weights"].values())
+            if state["optimized_weights"] else 0.0,
+    }
+    # Pie chart ve header için chosen_candidate set et
+    state["chosen_candidate"] = objective_key
+    state["debug_notes"].append(
+        f"PredictionConstraint: chosen_candidate set to {objective_key}"
+    )
+
+    # ✅ FIX 2: prediction_constraint_summary — UI elementleri için
+    state["prediction_constraint_summary"] = {
+        "constraints_applied": list(news_constraints.keys()),
+        "bullish": [t for t, c in news_constraints.items() if c.get("type") == "bullish"],
+        "bearish": [t for t, c in news_constraints.items() if c.get("type") == "bearish"],
+        "delta": 0.02,
+        "model": "LogisticRegression",
+        "constraint_type": "side_constraints",
+    }
+
+
+    constraint_debug_enriched = {}
+
+    for row in res.get("constraint_debug", []):
+
+        ticker = row["ticker"]
+
+        prob = prediction_probs.get(ticker, 0.5)
+
+        enriched_row = {
+            **row,
+
+            "prediction_probability": float(prob),
+
+            "is_bullish": bool(prob >= 0.60),
+
+            "is_bearish": bool(prob <= 0.40),
+        }
+
+        constraint_debug_enriched[ticker] = enriched_row
+
+    state["constraint_debug"] = constraint_debug_enriched
+    state["debug_notes"].append(
+    f"constraint_debug_keys={list(state['constraint_debug'].keys())}"
+    )
+
+    # prediction-adjusted caps
+    prediction_caps = {}
+
+    for ticker in state.get("selected_tickers", []):
+
+        adjusted_cap = float(state["w_max"])
+
+        if ticker in news_constraints:
+
+            cdict = news_constraints[ticker]
+
+            if "max_weight" in cdict:
+                adjusted_cap = float(cdict["max_weight"])
+
+            elif "min_weight" in cdict:
+                adjusted_cap = float(cdict["min_weight"])
+
+        prediction_caps[ticker] = adjusted_cap
+
+    state["prediction_adjusted_caps"] = prediction_caps
+
+    return state
 def route_after_data_prob_news(state: PortfolioState) -> str:
     if state.get("mode") == "base":
         return "skip_news"
@@ -1974,6 +2222,21 @@ def node_llm_select_candidate(state: PortfolioState) -> PortfolioState:
         }
         state["debug_notes"].append("LLM_Select(BASE): accept (no selection).")
         return state
+    # ✅ Prediction constraint flow: objective ve chosen_candidate değişmemeli
+    if state.get("prediction_model_used"):
+        chosen = str(state.get("chosen_candidate") or state.get("objective_key") or "maxsharpe").lower().strip()
+        state["llm_decision"] = {
+            "decision": "accept",
+            "rationale": (
+                "Prediction constraint flow: objective locked. "
+                "Feasible set constrained by news predictions; objective unchanged."
+            ),
+            "chosen_candidate": chosen,
+        }
+        state["debug_notes"].append(
+            f"LLM_Select(PREDICTION_CONSTRAINT_LOCK): chosen={chosen}"
+        )
+        return state
     
         # ✅ Mathematical news integration:
     # News already changed mu/cov before optimization.
@@ -2099,6 +2362,11 @@ def node_finalize_selection(state: PortfolioState) -> PortfolioState:
     # ✅ In news_actions stage we should never finalize portfolio
     if state.get("stage") == "news_actions":
         state["debug_notes"].append("FinalizeSelection: skipped (stage=news_actions).")
+        return state
+    if state.get("prediction_model_used") and state.get("optimized_weights"):
+        state["debug_notes"].append(
+            "FinalizeSelection: skipped (prediction_model_used=True, weights already set)."
+        )
         return state
 
     chosen = state.get("chosen_candidate") or state.get("objective_key", "maxsharpe")
@@ -2415,6 +2683,84 @@ def build_portfolio_graph_prob_news():
 
     return g.compile()
 
+def build_portfolio_graph_prediction_constraint():
+    g = StateGraph(PortfolioState)
+
+    g.add_node("ask_clarifications", node_ask_clarifications)
+    g.add_node("perception", node_perception)
+    g.add_node("baselines", node_compute_baselines)
+
+    g.add_node("data", node_data)
+
+    g.add_node("news_fetch", node_news_fetch)
+
+    g.add_node(
+        "optimize_prediction_constraint",
+        node_optimize_prediction_constraint,
+    )
+
+    g.add_node("extract_candidates", node_extract_candidates)
+    g.add_node("risk_candidates", node_risk_candidates)
+
+    g.add_node("news_snapshot", node_news_snapshot_and_risk)
+
+    g.add_node("llm_select", node_llm_select_candidate)
+    g.add_node("finalize", node_finalize_selection)
+
+    g.add_node("insight", node_insight_generator)
+    g.add_node("explain", node_explain)
+
+    g.set_entry_point("ask_clarifications")
+
+    g.add_conditional_edges(
+        "ask_clarifications",
+        route_after_clarifications,
+        {"end": END, "perception": "perception"},
+    )
+
+    g.add_edge("perception", "baselines")
+    g.add_edge("baselines", "data")
+
+    g.add_conditional_edges(
+        "data",
+        route_after_data_prob_news,
+        {
+            "do_news": "news_fetch",
+            "skip_news": "optimize_prediction_constraint",
+        },
+    )
+
+    g.add_edge(
+        "news_fetch",
+        "optimize_prediction_constraint",
+    )
+
+    g.add_edge(
+        "optimize_prediction_constraint",
+        "extract_candidates",
+    )
+
+    g.add_edge("extract_candidates", "risk_candidates")
+
+    g.add_conditional_edges(
+        "risk_candidates",
+        route_after_risk_candidates,
+        {
+            "do_news": "news_snapshot",
+            "skip_news": "llm_select",
+        },
+    )
+
+    g.add_edge("news_snapshot", "llm_select")
+
+    g.add_edge("llm_select", "finalize")
+    g.add_edge("finalize", "insight")
+    g.add_edge("insight", "explain")
+    g.add_edge("explain", END)
+
+    return g.compile()
+
+
 
 def run_graph(
     selected_tickers: List[str],
@@ -2567,4 +2913,109 @@ def run_graph_prob_news(
         f"[DEBUG FINAL STATE PROB] "
         f"prob_news_signals_keys={list((out.get('prob_news_signals') or {}).keys())}"
     )
+    return out
+
+def run_graph_prediction_constraint(
+    selected_tickers: List[str],
+    rf: float,
+    w_max: float,
+    preferences: Optional[Dict[str, Any]] = None,
+    current_weights: Optional[Dict[str, float]] = None,
+    max_iterations: int = 0,
+    clarification_answers: Optional[Dict[str, Any]] = None,
+    mode: Mode = "refine",
+    stage: Stage = "main",
+    use_llm: bool = False,
+    use_news: bool = False,
+    base_portfolio_metrics: Optional[Dict[str, Any]] = None,
+    base_portfolio_weights: Optional[Dict[str, float]] = None,
+    base_portfolio_objective: Optional[str] = None,
+) -> PortfolioState:
+
+    app = build_portfolio_graph_prediction_constraint()
+
+    init: PortfolioState = {
+        "mode": mode,
+        "stage": stage,
+
+        "selected_tickers": selected_tickers,
+
+        "rf": float(rf),
+        "w_max": float(w_max),
+        "lambda_l2": 1e-3,
+
+        "preferences": preferences or {},
+
+        "use_llm": bool(use_llm),
+
+        # base mode => no news
+        "use_news": bool(use_news) if mode != "base" else False,
+
+        "current_weights": current_weights,
+
+        "debug_notes": [],
+
+        "clarification_answers": clarification_answers,
+
+        # IMPORTANT:
+        # Keep same objective as base portfolio
+        "objective_key": str(
+            base_portfolio_objective or "maxsharpe"
+        ).lower().strip(),
+
+        "chosen_candidate": None,
+
+        "candidates": {},
+
+        "llm_decision": None,
+
+        "optimized_weights": {},
+        "optimized_metrics": {},
+
+        # news
+        "news_raw": None,
+        "news_signals": None,
+        "news_snapshot_text": None,
+        "news_risk_json": None,
+
+        # evidence / actions
+        "news_actions": None,
+        "news_actions_verifier": None,
+        "news_items_llm": None,
+        "evidence_map": None,
+
+        # prediction model outputs
+        "prediction_probs": None,
+        "prediction_adjusted_caps": None,
+        "prediction_model_metrics": None,
+        "prediction_model_used": None,
+
+        # optional evaluation
+        "prob_prediction_evaluation": None,
+
+        # insight
+        "insight": None,
+        "insight_ok": None,
+        "insight_issues": [],
+        "insight_raw_text": None,
+        "insight_parse_mode": None,
+
+        # base portfolio carry-over
+        "base_portfolio_metrics": base_portfolio_metrics,
+        "base_portfolio_weights": base_portfolio_weights,
+        "base_portfolio_objective": base_portfolio_objective,
+    }
+
+    out = app.invoke(
+        init,
+        config={"recursion_limit": 200},
+    )
+
+    out["debug_notes"].append(
+        f"[DEBUG FINAL STATE PREDICTION] "
+        f"prediction_used={out.get('prediction_model_used')} "
+        f"prediction_probs_keys="
+        f"{list((out.get('prediction_probs') or {}).keys())}"
+    )
+
     return out

@@ -1,3 +1,5 @@
+
+# agents_langgraph.py 
 from __future__ import annotations
 
 from pathlib import Path
@@ -17,7 +19,7 @@ import pandas as pd
 import requests
 
 from portfolio_core import run_portfolio_optimization, portfolio_stats, risk_contributions
-
+from portfolio_prediction_core import run_portfolio_optimization_prediction
 DATA_DIR = Path("data/processed_yahoo")
 
 
@@ -151,6 +153,35 @@ def optimization_agent(
 
     return result
 
+
+def prediction_constrained_optimization_agent(
+    mu: pd.Series,
+    cov: pd.DataFrame,
+    news_constraints: Dict[str, Dict[str, Any]],
+    rf: float = 0.02,
+    w_max: float = 0.30,
+    lambda_l2: float = 1e-3,
+): 
+    result = run_portfolio_optimization_prediction(
+        mu=mu,
+        cov=cov,
+        rf=rf,
+        w_max=w_max,
+        lambda_l2=lambda_l2,
+        news_constraints=news_constraints,
+        data_dir=DATA_DIR,
+        save_csv=True,
+    )
+
+    if isinstance(result, dict):
+
+        for k in ("maxsharpe", "minvar"):
+
+            if k in result and isinstance(result[k], dict):
+
+                _normalize_metrics_inplace(result[k])
+
+    return result
 
 def optimization_agent_from_mu_cov(
     mu: pd.Series,
