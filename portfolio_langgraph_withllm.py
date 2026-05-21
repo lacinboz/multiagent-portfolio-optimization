@@ -81,7 +81,7 @@ class PortfolioState(TypedDict, total=False):
     news_evidence_snapshot_ok: Optional[bool]
     news_evidence_snapshot_issues: List[str]
     news_snapshot_text_raw: Optional[str]   # ✅ UI-friendly, evidence tag'siz
-
+    probabilistic_news_used: Optional[bool]
 
     mu: Optional[pd.Series]
     cov: Optional[pd.DataFrame]
@@ -195,6 +195,7 @@ def _init_defaults(state: PortfolioState) -> PortfolioState:
 
     state.setdefault("news_adjustment_evaluation", None)
     state.setdefault("prob_prediction_evaluation", None)
+    state.setdefault("probabilistic_news_used", False)
 
     state.setdefault("prob_news_trace", None)
     state.setdefault("historical_prediction_evaluation", None)
@@ -1073,10 +1074,16 @@ def node_optimize(state: PortfolioState) -> PortfolioState:
     return state
 
 def node_optimize_prob_news(state: PortfolioState) -> PortfolioState:
+    state["debug_notes"].append(
+        f"[PROB_NEWS_DEBUG] use_news={state.get('use_news')} "
+        f"news_raw_len={len(state.get('news_raw') or [])} "
+        f"news_raw_sample={str((state.get('news_raw') or [{}])[:1])[:200]}"
+    )
     if state.get("mu") is None or state.get("cov") is None:
         state["optimization_result"] = {}
         state["debug_notes"].append("OptimizationProbNews: skipped (missing mu/cov).")
         return state
+    
 
     mu_to_use = state["mu"]
     cov_to_use = state["cov"]
@@ -1100,6 +1107,7 @@ def node_optimize_prob_news(state: PortfolioState) -> PortfolioState:
             cov_to_use = news_out["adjusted_cov"]
 
             state["prob_news_signals"] = news_out.get("ticker_signals", {})
+            state["probabilistic_news_used"] = True
             state["prob_adjusted_mu"] = mu_to_use
             state["prob_adjusted_cov"] = cov_to_use
 
@@ -1628,7 +1636,7 @@ def node_news_fetch(state: PortfolioState) -> PortfolioState:
         if stats:
             state["debug_notes"].append(
                 f"NewsFetchStats: company_used={stats.get('company_used')} fallback_used={stats.get('fallback_used')} "
-                f"errors={len((stats.get('errors') or {}))}"
+                f"errors={len((stats.get('errors') or {}))} error_details={dict((stats.get('errors') or {}))}"
             )
 
         return state
@@ -1637,6 +1645,8 @@ def node_news_fetch(state: PortfolioState) -> PortfolioState:
     except Exception as e:
         state["news_raw"] = [{"ticker": t, "headline": None, "source": None, "ts": None} for t in tickers]
         state["debug_notes"].append(f"NewsFetch: failed → stub fallback: {e}")
+        state["news_raw"] = [{"ticker": t, "headline": None, "source": None, "ts": None} for t in tickers]
+        state["debug_notes"].append(f"NewsFetch: FAILED with exception -> stub fallback: {e}")
         return state
 
 
@@ -2204,7 +2214,6 @@ def route_after_news_snapshot(state: PortfolioState) -> str:
     # ✅ news_overview = main flow + overlay, so continue main
     return "news_actions" if state.get("stage") == "news_actions" else "main"
 
-
 def node_llm_select_candidate(state: PortfolioState) -> PortfolioState:
     state = _init_defaults(state)
 
@@ -2222,20 +2231,49 @@ def node_llm_select_candidate(state: PortfolioState) -> PortfolioState:
         }
         state["debug_notes"].append("LLM_Select(BASE): accept (no selection).")
         return state
-    # ✅ Prediction constraint flow: objective ve chosen_candidate değişmemeli
-    if state.get("prediction_model_used"):
-        chosen = str(state.get("chosen_candidate") or state.get("objective_key") or "maxsharpe").lower().strip()
+    # -------------------------------------------------
+    # Probabilistic news requested BUT news unavailable
+    # Preserve original objective and skip LLM override
+    # -------------------------------------------------
+
+    if (
+        state.get("mode") == "refine"
+        and bool(state.get("use_news", False))
+        and not state.get("prediction_model_used", False)
+        and not state.get("probabilistic_news_used", False)
+    ):
+
+        chosen = str(
+            state.get("base_portfolio_objective")
+            or state.get("objective_key")
+            or "maxsharpe"
+        ).lower().strip()
+
+        candidates = state.get("candidates") or {}
+
+        if chosen not in candidates:
+            chosen = (
+                "maxsharpe"
+                if "maxsharpe" in candidates
+                else next(iter(candidates.keys()))
+            )
+
+        state["chosen_candidate"] = chosen
+        state["objective_key"] = chosen
+
         state["llm_decision"] = {
-            "decision": "accept",
-            "rationale": (
-                "Prediction constraint flow: objective locked. "
-                "Feasible set constrained by news predictions; objective unchanged."
-            ),
+            "decision": "preserve_objective_news_unavailable",
             "chosen_candidate": chosen,
+            "rationale": (
+                "News integration was requested, but news retrieval "
+                "failed. Preserving original portfolio objective."
+            ),
         }
+
         state["debug_notes"].append(
-            f"LLM_Select(PREDICTION_CONSTRAINT_LOCK): chosen={chosen}"
+            f"LLM_Select(NEWS_UNAVAILABLE_LOCK): chosen={chosen}"
         )
+
         return state
     
         # ✅ Mathematical news integration:
@@ -2354,6 +2392,7 @@ def node_llm_select_candidate(state: PortfolioState) -> PortfolioState:
     }
     state["debug_notes"].append(f"LLM_Select(Fallback): chosen={chosen}")
     return state
+
 
 
 def node_finalize_selection(state: PortfolioState) -> PortfolioState:

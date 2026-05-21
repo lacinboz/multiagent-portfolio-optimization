@@ -22,7 +22,8 @@ from portfolio_core import run_portfolio_optimization, portfolio_stats, risk_con
 from portfolio_prediction_core import run_portfolio_optimization_prediction
 DATA_DIR = Path("data/processed_yahoo")
 
-
+from dotenv import load_dotenv
+load_dotenv()
 # ------------------------------------------------------------
 # Small numeric helpers (consistency + safety)
 # ------------------------------------------------------------
@@ -1084,6 +1085,7 @@ def _print_fetch_proof(tag: str, endpoint: str, url: str, extra: Dict[str, Any])
 
 
 def _finnhub_get(endpoint: str, params: Dict[str, Any], *, timeout_s: int = 30, cache_ttl_s: int = 600) -> Any:
+    print("FINNHUB")
     api_key = os.getenv("FINNHUB_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("Missing FINNHUB_API_KEY in environment (or .env loaded).")

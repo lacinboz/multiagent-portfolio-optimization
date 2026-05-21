@@ -631,13 +631,16 @@ def evaluate_news_adjustment_effect(
     turnover = _turnover(base_weights, news_weights)
 
     risk_effect = "unchanged"
+
     if delta_vol is not None:
         if delta_vol > 1.0:
-            "increased_risk"
+            risk_effect = "increased_risk"
+
         elif delta_vol > 0:
-            "slightly_increased_risk"
+            risk_effect = "slightly_increased_risk"
+
         else:
-            "reduced_risk"
+            risk_effect = "reduced_risk"
 
     efficiency_effect = "unchanged"
     if delta_sharpe is not None:

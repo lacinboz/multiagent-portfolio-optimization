@@ -54,7 +54,8 @@ TICKER_ALIASES_FOR_NEWS = {
 }
 DATA_DIR = Path("data/processed_yahoo")
 
-
+from dotenv import load_dotenv
+load_dotenv()
 
 @st.cache_data
 def load_available_tickers() -> list[str]:
@@ -1286,21 +1287,16 @@ def _render_news_impact_heatmap(
         st.info("No numeric news impact values available for heatmap.")
         return
 
+
+    max_abs = np.nanmax(np.abs(heat_df.values))
+
     fig = px.imshow(
         heat_df,
         text_auto=".3f",
         aspect="auto",
         color_continuous_scale="RdYlGn",
+        range_color=[-max_abs, max_abs],
         origin="lower",
-    )
-
-    fig.update_layout(
-        paper_bgcolor="#0b1020",
-        plot_bgcolor="#0b1020",
-        font=dict(color="#E2E6FF"),
-        margin=dict(l=10, r=10, t=40, b=10),
-        height=max(320, 55 * len(heat_df)),
-        coloraxis_colorbar=dict(title="Value"),
     )
 
     fig.update_xaxes(side="top")
@@ -1310,6 +1306,9 @@ def _render_news_impact_heatmap(
     st.caption(
         "This heatmap shows how FinBERT/news signals affected each asset before optimization. "
         "Positive expected return adjustments increase the return input, while positive risk adjustments or Δ variance increase the risk input."
+    )
+    st.caption(
+    "Green indicates larger positive magnitudes, while values near zero appear neutral."
     )
 def _render_prob_news_trace(trace: Optional[Dict[str, Any]]):
     if not isinstance(trace, dict) or not trace:
@@ -1380,6 +1379,14 @@ def _render_prob_news_trace(trace: Optional[Dict[str, Any]]):
                 df[col] = pd.to_numeric(df[col], errors="coerce")
 
         st.markdown("**Predictive news signals and their effect on the optimization inputs**")
+        st.markdown(
+            """
+            **Direction thresholds**
+            - Positive: sentiment > 0.10
+            - Negative: sentiment < -0.10
+            - Neutral: between -0.10 and 0.10
+            """
+        )
         st.dataframe(df, use_container_width=True)
         st.markdown("**News Impact Heatmap**")
         _render_news_impact_heatmap(
@@ -2938,6 +2945,17 @@ def _run_refine_flow(
         base_portfolio_weights=base_state.get("optimized_weights"),
         base_portfolio_objective=base_state.get("objective_key"),
     )
+    print("\n=== NORMAL REFINE DEBUG ===")
+    print("optimized_weights exists:",
+        refined_state.get("optimized_weights") is not None)
+
+    print("chosen_candidate:",
+        refined_state.get("chosen_candidate"))
+
+    print("objective_key:",
+        refined_state.get("objective_key"))
+
+    print("===========================\n")
 
     st.session_state["refined_state"] = refined_state
     return refined_state
@@ -2969,6 +2987,15 @@ def _run_prob_news_refine_flow(
     print(json.dumps(refined_answers, indent=2, default=str))
     print("========================================================================\n")
 
+    print("\n" + "="*60)
+    print("DEBUG _run_prob_news_refine_flow CALLED")
+    print(f"  selected_tickers: {selected_tickers}")
+    print(f"  use_news=True, use_llm={use_llm_refine}")
+    print(f"  base_state keys: {list(base_state.keys()) if base_state else 'EMPTY'}")
+    print(f"  base_portfolio_objective: {base_state.get('objective_key')}")
+    print(f"  refined_answers: {refined_answers}")
+    print("="*60 + "\n")
+
     refined_state = run_graph_prob_news(
         selected_tickers=selected_tickers,
         rf=float(rf),
@@ -2986,6 +3013,19 @@ def _run_prob_news_refine_flow(
         prob_alpha=0.15,
         prob_beta=0.08,
     )
+    print("\n" + "="*60)
+    print("DEBUG _run_prob_news_refine_flow RESULT")
+    print(f"  refined_state keys: {list(refined_state.keys()) if refined_state else 'NONE'}")
+    print(f"  news_raw length: {len(refined_state.get('news_raw') or [])}")
+    print(f"  use_news in state: {refined_state.get('use_news')}")
+    print(f"  probabilistic_news_used: {refined_state.get('probabilistic_news_used')}")
+    print(f"  prob_news_trace: {'SET' if refined_state.get('prob_news_trace') else 'NONE'}")
+    print(f"  prob_news_signals: {'SET' if refined_state.get('prob_news_signals') else 'NONE'}")
+    print(f"  debug_notes relevant:")
+    for note in (refined_state.get('debug_notes') or []):
+        if any(x in note for x in ['NewsFetch', 'PROB_NEWS', 'use_news', 'Perception', 'news_raw']):
+            print(f"    → {note}")
+    print("="*60 + "\n")
 
     st.session_state["refined_state"] = refined_state
     return refined_state
@@ -3028,6 +3068,23 @@ def run_prediction_constrained_optimization(
         base_portfolio_weights=base_state.get("optimized_weights"),
         base_portfolio_objective=base_state.get("objective_key"),
     )
+    print("DEBUG prediction_model_used:",
+      prediction_state.get("prediction_model_used"))
+
+    print("DEBUG has_prob_news_trace:",
+        prediction_state.get("prob_news_trace") is not None)
+
+    print("DEBUG has_constraint_debug:",
+        prediction_state.get("constraint_debug") is not None)
+
+    print("DEBUG optimized_weights exists:",
+        prediction_state.get("optimized_weights") is not None)
+
+    print("DEBUG prediction_probs exists:",
+        prediction_state.get("prediction_probs") is not None)
+
+    print("DEBUG prediction_adjusted_caps exists:",
+        prediction_state.get("prediction_adjusted_caps") is not None)
 
     st.session_state["refined_state"] = prediction_state
 
@@ -3065,7 +3122,37 @@ def _handle_chat_command(
     if not selected_tickers:
         _append_chat_message("assistant", "Please select at least one ticker in the universe first.")
         return
-    
+    # ✅ FIX: news keyword'lerini LLM'den önce yakala
+    _msg_lower = user_msg.lower().strip()
+    _news_phrases = [
+        "use news", "include news", "apply news", "consider news",
+        "add news", "news integration", "news model", "prediction model",
+        "show news prediction", "news prediction model", "use recent news",
+        "news in the portfolio", "integrate news",
+    ]
+    if any(phrase in _msg_lower for phrase in _news_phrases):
+        st.session_state["chat_pending_clarification"] = {
+            "type": "news_mode_selection",
+            "original_user_msg": user_msg,
+        }
+        _append_chat_message(
+            "assistant",
+            "I can use news in three different ways. Please choose one option below.",
+            kind="news_mode_selection",
+            payload={
+                "question": "Which one do you want?",
+                "options": [
+                    {"label": "Mathematical news integration", "value": "probabilistic",
+                     "description": "Use news signals to adjust return/risk inputs before optimization."},
+                    {"label": "LLM news actions", "value": "llm_actions",
+                     "description": "Use news to generate qualitative actions, explanations, and suggestions."},
+                    {"label": "Trained news prediction model", "value": "prediction_model",
+                     "description": "Show saved model probabilities for future return direction."},
+                ],
+            },
+        )
+        return  # ← LLM'e hiç gitme
+
 
     client = LLMClient()
     cmd = client.interpret_dashboard_chat_command(
@@ -3076,6 +3163,12 @@ def _handle_chat_command(
 
     intent = str(cmd.get("intent") or "unsupported").strip()
     params = cmd.get("parameters") if isinstance(cmd.get("parameters"), dict) else {}
+    # ← GEÇİCİ DEBUG: terminalde göreceksin
+    print(f"\n===== CHAT INTENT DEBUG =====")
+    print(f"user_msg: {user_msg!r}")
+    print(f"intent: {intent!r}")
+    print(f"cmd: {cmd}")
+    print(f"=============================\n")
 
     if intent == "run_base_portfolio":
         _run_base_flow(
@@ -3327,11 +3420,15 @@ graph_state = (
 is_refined_active = (
     st.session_state["refined_state"] is not None
 )
-
 if graph_state and graph_state.get("prediction_model_used"):
     active_label = "Prediction-Constrained Portfolio"
+
+elif graph_state and graph_state.get("probabilistic_news_used"):
+    active_label = "News-Integrated Portfolio"
+
 elif is_refined_active:
     active_label = "Refined Portfolio"
+
 else:
     active_label = "Base Portfolio"
 
@@ -3858,20 +3955,21 @@ else:
             elif kind == "news_prediction_model":
                 st.markdown("**Trained News Prediction Model**")
 
-                # 1. Önce prediction-constrained optimization çalıştır
-                prediction_state = run_prediction_constrained_optimization(
-                    selected_tickers=selected_tickers,
-                    rf=rf,
-                    w_max=w_max,
-                    current_weights_dict=current_weights_dict,
-                )
-                
+                # ✅ FIX: sadece prediction_model_used=True değilse çalıştır
+                # Böylece prob_news flow'u (veya başka bir flow) refined_state'i set etmişse EZMEYİZ
+                active_state = st.session_state.get("refined_state")
+                if active_state is None or not active_state.get("prediction_model_used"):
+                    run_prediction_constrained_optimization(
+                        selected_tickers=selected_tickers,
+                        rf=rf,
+                        w_max=w_max,
+                        current_weights_dict=current_weights_dict,
+                    )
+                    st.rerun()
 
-                # 2. refined_state artık set edildi, active_state olarak kullan
+                # rerun sonrası buraya gelir
                 active_state = st.session_state.get("refined_state")
 
-
-                # 3. Modeli render et
                 _render_saved_news_prediction_model(
                     selected_tickers=selected_tickers,
                     active_state=active_state,
@@ -3880,14 +3978,13 @@ else:
                     active_state,
                     chart_key=f"prediction_shift_{msg_idx}",
                 )
-
                 _render_prediction_constraint_table(active_state)
 
-                if prediction_state:
+                if active_state:
                     st.markdown("## Prediction-Constrained Portfolio")
-                    st.write(prediction_state.get("optimized_weights"))
-                    st.write(prediction_state.get("optimized_metrics"))
-                
+                    st.write(active_state.get("optimized_weights"))
+                    st.write(active_state.get("optimized_metrics"))
+                            
             elif kind == "final_portfolio_insight":
                 chosen = payload.get("chosen_candidate")
                 insight_text = payload.get("insight_text")
