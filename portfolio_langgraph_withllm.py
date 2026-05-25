@@ -2217,7 +2217,26 @@ def route_after_news_snapshot(state: PortfolioState) -> str:
 def node_llm_select_candidate(state: PortfolioState) -> PortfolioState:
     state = _init_defaults(state)
 
- 
+    if state.get("prediction_model_used"):
+        chosen = str(
+            state.get("objective_key") or "maxsharpe"
+        ).lower().strip()
+        candidates = state.get("candidates") or {}
+        if chosen not in candidates:
+            chosen = "maxsharpe" if "maxsharpe" in candidates else (
+                next(iter(candidates.keys())) if candidates else "maxsharpe"
+            )
+        state["chosen_candidate"] = chosen
+        state["objective_key"] = chosen
+        state["llm_decision"] = {
+            "decision": "locked_prediction_constraint",
+            "chosen_candidate": chosen,
+            "rationale": "Prediction constraint: LLM/Verifier override disabled.",
+        }
+        state["debug_notes"].append(
+            f"LLM_Select(PREDICTION_LOCK): chosen={chosen}, LLM disabled."
+        )
+        return state  
     if state.get("stage") == "news_actions":
         state["debug_notes"].append("LLM_Select: skipped (stage=news_actions).")
         return state
