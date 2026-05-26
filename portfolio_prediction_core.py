@@ -8,9 +8,6 @@ from scipy.optimize import minimize
 DATA_DIR = Path("data/processed_yahoo")
 
 
-
-
-
 def near_psd(A, eps=1e-8):
     """Negatif en küçük özdeğerleri 0'a çekerek PSD kovaryans matrisi üretir."""
     vals, vecs = np.linalg.eigh(A)

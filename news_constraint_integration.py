@@ -12,6 +12,7 @@ def build_news_probability_constraints(
     bearish_threshold: float = 0.40,
     delta: float = 0.02,
     w_max: float = 0.30,
+    min_baseline_weight: float = 1e-3,
 ) -> Dict[str, Dict[str, float]]:
     """
     Build portfolio weight constraints from news probabilities.
@@ -65,6 +66,9 @@ def build_news_probability_constraints(
         # =====================================================
 
         if prob >= bullish_threshold:
+
+            if base_weight < min_baseline_weight:  # 0.001
+                continue
 
             min_weight = base_weight + delta
             min_weight = min(min_weight, w_max - 1e-4) 
