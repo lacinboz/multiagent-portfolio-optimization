@@ -1,8 +1,21 @@
 # component_level_impact_study.py
 # ============================================================
-# Hocamın istediği: "What effect they have on each component"
-# Feature group → constraint quality → portfolio impact tablosu.
-# Mevcut kodlara dokunmaz. Standalone script.
+# LAYER 1 ONLY — Full 101-ticker universe
+# Layer 2 (case study) removed.
+#
+# Feature sets (consistent with news_model_feature_ablation.py):
+#   price_only      — 3 features  — Does price alone suffice?
+#   sentiment_only  — 7 features  — Does current-day sentiment alone work?
+#   news_only       — 11 features — Full news + flow, no price
+#   sentiment_price — 10 features — News + price, no flow (what does flow add?)
+#   all_features    — 14 features — Production model
+#
+# All experiments use:
+#   - Same 101-ticker universe (mu/cov files)
+#   - Same 70/30 chronological split
+#   - Same LR (C=0.3)
+#   - Same constraint parameters (bull=0.60, bear=0.40, delta=0.02)
+#   - min_baseline_weight=1e-3 filter for near-zero positions
 # ============================================================
 from __future__ import annotations
 
@@ -24,18 +37,35 @@ RAW_PATH = "data/news_prediction/news_timeseries_dataset_raw_h7_alltickers_v2_en
 MU_PATH = Path("data/processed_yahoo/summary_per_asset_annual.csv")
 COV_PATH = Path("data/processed_yahoo/cov_annual.csv")
 
-PORTFOLIO_TICKERS = ["AVGO", "GOOGL", "MU", "NVDA"]
 RF = 0.02
 W_MAX = 0.30
 LAMBDA_L2 = 1e-3
+BULLISH_THRESHOLD = 0.60
+BEARISH_THRESHOLD = 0.40
+DELTA = 0.02
 
 # ============================================================
-# Feature group definitions
+# FEATURE SET DEFINITIONS
+# Consistent with news_model_feature_ablation.py
+# Each set answers a distinct question.
 # ============================================================
 
 FEATURE_GROUPS = {
+    "price_only": {
+        "features": [
+            "past_5d_return",
+            "past_20d_return",
+            "past_20d_volatility",
+        ],
+        "description": (
+            "Only price/momentum features — no news, no sentiment. "
+            "Pure technical baseline. (3 features)"
+        ),
+        "question": "Does price momentum alone provide sufficient directional signal?",
+    },
     "sentiment_only": {
         "features": [
+            "article_count",
             "weighted_sentiment",
             "sentiment_std",
             "mean_confidence",
@@ -43,10 +73,15 @@ FEATURE_GROUPS = {
             "negative_ratio",
             "mean_sentiment_confidence",
         ],
-        "description": "Sentiment only (no price, no flow)",
+        "description": (
+            "Current-day FinBERT sentiment features only — "
+            "no price, no rolling flow. (7 features)"
+        ),
+        "question": "What is the standalone value of current-day news sentiment?",
     },
-    "sentiment_confidence": {
+    "news_only": {
         "features": [
+            "article_count",
             "weighted_sentiment",
             "sentiment_std",
             "mean_confidence",
@@ -58,9 +93,30 @@ FEATURE_GROUPS = {
             "sentiment_flow_20d",
             "confidence_flow_20d",
         ],
-        "description": "Sentiment + confidence flow features",
+        "description": (
+            "Full news features including rolling flow — no price features. (11 features)"
+        ),
+        "question": "How much does the full news signal (with trend) contribute without price?",
     },
-    "full_feature_set": {
+    "sentiment_price": {
+        "features": [
+            "article_count",
+            "weighted_sentiment",
+            "sentiment_std",
+            "mean_confidence",
+            "positive_ratio",
+            "negative_ratio",
+            "mean_sentiment_confidence",
+            "past_5d_return",
+            "past_20d_return",
+            "past_20d_volatility",
+        ],
+        "description": (
+            "Current-day sentiment + price features — no rolling flow. (10 features)"
+        ),
+        "question": "What does adding price momentum to sentiment contribute? (flow ablated out)",
+    },
+    "all_features": {
         "features": [
             "article_count",
             "weighted_sentiment",
@@ -77,7 +133,10 @@ FEATURE_GROUPS = {
             "past_20d_return",
             "past_20d_volatility",
         ],
-        "description": "Full feature set (production model)",
+        "description": (
+            "Full feature set: sentiment + flow + price. Production model. (14 features)"
+        ),
+        "question": "Does adding rolling flow to sentiment+price further improve outcomes?",
     },
 }
 
@@ -90,37 +149,30 @@ def _near_psd(A: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     return vecs @ np.diag(np.clip(vals, eps, None)) @ vecs.T
 
 
-def _load_mu_cov(tickers: List[str]):
+def _load_mu_cov(tickers: Optional[List[str]] = None):
     summary = pd.read_csv(MU_PATH, index_col=0)
     cov_df = pd.read_csv(COV_PATH, index_col=0)
-    common = [t for t in tickers if t in summary.index and t in cov_df.index]
+    if tickers is None:
+        common = [t for t in summary.index if t in cov_df.index]
+    else:
+        common = [t for t in tickers if t in summary.index and t in cov_df.index]
     mu = summary.loc[common, "mu_annual"].astype(float)
     cov = cov_df.loc[common, common].astype(float)
     return mu, cov
 
 
-def _optimize_portfolio(
-    mu: pd.Series,
-    cov: pd.DataFrame,
-    rf: float,
-    w_max: float,
-    lambda_l2: float,
-    extra_constraints: List = None,
-) -> Dict:
+def _optimize_portfolio(mu, cov, rf, w_max, lambda_l2, extra_constraints=None):
     tickers = list(mu.index)
     n = len(tickers)
     effective_w_max = max(w_max, 1.0 / n + 1e-6)
-
     cov_np = cov.values.copy()
     if np.linalg.eigvalsh(cov_np).min() < 0:
         cov_np = _near_psd(cov_np)
     cov_f = pd.DataFrame(cov_np, index=tickers, columns=tickers)
-
     bounds = [(0.0, effective_w_max)] * n
     cons = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
     if extra_constraints:
         cons += extra_constraints
-
     w0 = np.full(n, 1.0 / n)
 
     def neg_sharpe(w):
@@ -133,21 +185,18 @@ def _optimize_portfolio(
     if not res.success:
         res = minimize(neg_sharpe, w0, method="trust-constr",
                        bounds=bounds, constraints=cons)
-
     w = pd.Series(np.clip(res.x, 0, None), index=tickers)
     w = w / w.sum()
     r = float(w.values @ mu.values)
     v = float(np.sqrt(w.values @ cov_f.values @ w.values))
     sharpe = (r - rf) / v if v > 0 else 0.0
+    return {"weights": {t: float(w[t]) for t in tickers},
+            "return": r, "vol": v, "sharpe": sharpe,
+            "success": bool(res.success)}
 
-    return {
-        "weights": {t: float(w[t]) for t in tickers},
-        "return": r, "vol": v, "sharpe": sharpe,
-        "success": bool(res.success),
-    }
 
 # ============================================================
-# Dataset builder (standalone)
+# Dataset builder
 # ============================================================
 
 def _build_dataset(raw_path: str) -> pd.DataFrame:
@@ -162,7 +211,6 @@ def _build_dataset(raw_path: str) -> pd.DataFrame:
     ]).copy()
     df = df[df["future_return"].abs() >= 0.02].copy()
     df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
-
     df["is_positive_article"] = (df["prob_positive"] > df["prob_negative"]).astype(int)
     df["is_negative_article"] = (df["prob_negative"] > df["prob_positive"]).astype(int)
     df["sentiment_confidence"] = df["article_sentiment"] * df["article_confidence"]
@@ -215,8 +263,9 @@ def _build_dataset(raw_path: str) -> pd.DataFrame:
     out["target_direction"] = (out["future_return"] > 0).astype(int)
     return out
 
+
 # ============================================================
-# Train model + generate signals for portfolio tickers
+# Train model + predict
 # ============================================================
 
 def _train_and_predict(
@@ -235,7 +284,6 @@ def _train_and_predict(
     ).copy()
     df = df.sort_values(["news_date_dt", "ticker"]).reset_index(drop=True)
 
-    # ticker dummies
     dummies = pd.get_dummies(df["ticker"], prefix="ticker", dtype=float)
     df = pd.concat([df, dummies], axis=1)
     feat_cols = available + list(dummies.columns)
@@ -260,18 +308,14 @@ def _train_and_predict(
     ])
     model.fit(X_train, y_train)
 
-    # Predict on latest data for each portfolio ticker
     probs = {}
     for ticker in portfolio_tickers:
         ticker_data = df[df["ticker"] == ticker].copy()
         if ticker_data.empty:
             continue
-
-        # align columns
         for col in feat_cols:
             if col not in ticker_data.columns:
                 ticker_data[col] = 0.0
-
         latest_row = ticker_data.sort_values("news_date_dt").tail(1)
         X_pred = latest_row[feat_cols].astype(float)
         p = float(model.predict_proba(X_pred)[0, 1])
@@ -280,10 +324,7 @@ def _train_and_predict(
     return probs
 
 
-def _build_scipy_constraints(
-    news_constraints: Dict[str, Any],
-    ticker_to_idx: Dict[str, int],
-) -> List:
+def _build_scipy_constraints(news_constraints, ticker_to_idx):
     sci = []
     for ticker, cdict in news_constraints.items():
         if ticker not in ticker_to_idx:
@@ -291,39 +332,35 @@ def _build_scipy_constraints(
         idx = ticker_to_idx[ticker]
         if "min_weight" in cdict:
             mw = float(cdict["min_weight"])
-            sci.append({"type": "ineq",
-                        "fun": lambda w, i=idx, m=mw: w[i] - m})
+            sci.append({"type": "ineq", "fun": lambda w, i=idx, m=mw: w[i] - m})
         if "max_weight" in cdict:
             mw = float(cdict["max_weight"])
-            sci.append({"type": "ineq",
-                        "fun": lambda w, i=idx, m=mw: m - w[i]})
+            sci.append({"type": "ineq", "fun": lambda w, i=idx, m=mw: m - w[i]})
     return sci
 
 
-def _probs_to_constraints(
-    probs: Dict[str, float],
-    baseline_weights: Dict[str, float],
-    bullish_threshold: float = 0.60,
-    bearish_threshold: float = 0.40,
-    delta: float = 0.02,
-    w_max: float = 0.30,
-) -> Dict[str, Any]:
+def _probs_to_constraints(probs, baseline_weights, min_baseline_weight=1e-3):
     constraints = {}
     for ticker, prob in probs.items():
         if ticker not in baseline_weights:
             continue
         base_w = float(baseline_weights[ticker])
-        if prob >= bullish_threshold:
+        if base_w < min_baseline_weight:
+            continue
+        if prob >= BULLISH_THRESHOLD:
             constraints[ticker] = {
                 "type": "bullish", "prob": prob,
-                "min_weight": min(base_w + delta, w_max - 1e-4),
+                "baseline_weight": base_w,
+                "min_weight": min(base_w + DELTA, W_MAX - 1e-4),
             }
-        elif prob <= bearish_threshold:
+        elif prob <= BEARISH_THRESHOLD:
             constraints[ticker] = {
                 "type": "bearish", "prob": prob,
-                "max_weight": max(0.0, base_w - delta),
+                "baseline_weight": base_w,
+                "max_weight": max(0.0, base_w - DELTA),
             }
     return constraints
+
 
 # ============================================================
 # Main study
@@ -331,176 +368,169 @@ def _probs_to_constraints(
 
 def run_component_level_impact_study(
     raw_path: str = RAW_PATH,
-    portfolio_tickers: List[str] = None,
     rf: float = RF,
     w_max: float = W_MAX,
     lambda_l2: float = LAMBDA_L2,
-    bullish_threshold: float = 0.60,
-    bearish_threshold: float = 0.40,
-    delta: float = 0.02,
     save_outputs: bool = True,
 ) -> Dict[str, Any]:
 
-    if portfolio_tickers is None:
-        portfolio_tickers = PORTFOLIO_TICKERS
-
     print("\n" + "=" * 70)
-    print("COMPONENT-LEVEL IMPACT STUDY")
+    print("COMPONENT-LEVEL PORTFOLIO IMPACT STUDY")
     print("=" * 70)
+    print(f"Universe: full 101-ticker NASDAQ universe")
+    print(f"rf={rf}, w_max={w_max}, lambda_l2={lambda_l2}")
+    print(f"Constraints: bull>={BULLISH_THRESHOLD}, bear<={BEARISH_THRESHOLD}, delta={DELTA}")
+    print(f"Model: LogisticRegression (C=0.3), 70/30 chronological split")
+    print(f"Filter: constraints applied only to tickers with baseline weight >= 0.001")
 
-    # Load portfolio inputs
-    mu, cov = _load_mu_cov(portfolio_tickers)
+    # Print feature group summary
+    print(f"\nFeature groups ({len(FEATURE_GROUPS)}):")
+    for name, cfg in FEATURE_GROUPS.items():
+        print(f"  {name:<20} {len(cfg['features']):>3} features — {cfg['question']}")
+
+    # Load full universe
+    mu, cov = _load_mu_cov(tickers=None)
     tickers = list(mu.index)
     ticker_to_idx = {t: i for i, t in enumerate(tickers)}
+    print(f"\nLoaded {len(tickers)} tickers")
 
-    # Baseline portfolio (no constraints)
+    # Baseline
     baseline = _optimize_portfolio(mu, cov, rf, w_max, lambda_l2)
     baseline_weights = baseline["weights"]
-
     print(f"Baseline: return={baseline['return']*100:.2f}% "
           f"vol={baseline['vol']*100:.2f}% sharpe={baseline['sharpe']:.4f}")
 
-    # Load dataset
+    # Dataset
     print("\nBuilding dataset...")
     dataset = _build_dataset(raw_path)
-    print(f"Dataset rows: {len(dataset)}, tickers: {dataset['ticker'].nunique()}")
+    print(f"Dataset: {len(dataset)} rows, {dataset['ticker'].nunique()} tickers")
 
     # Run each feature group
-    results = {}
     rows = []
 
     for group_name, cfg in FEATURE_GROUPS.items():
-        print(f"\n→ {group_name}: {cfg['description']}")
+        print(f"\n{'─'*60}")
+        print(f"Feature group: {group_name}")
+        print(f"  {cfg['description']}")
+        print(f"  Question: {cfg['question']}")
 
-        # Train model, get probabilities for portfolio tickers
         probs = _train_and_predict(
             dataset=dataset,
             feature_cols=cfg["features"],
             portfolio_tickers=tickers,
+            test_size=0.30,
+            C=0.3,
         )
-
         if not probs:
-            print(f"  FAILED: could not generate predictions")
+            print("  FAILED: could not generate predictions")
             continue
 
-        print(f"  Predicted probs: { {t: f'{p:.3f}' for t, p in probs.items()} }")
-
-        # Build constraints from those probs
         news_constraints = _probs_to_constraints(
-            probs=probs,
-            baseline_weights=baseline_weights,
-            bullish_threshold=bullish_threshold,
-            bearish_threshold=bearish_threshold,
-            delta=delta,
-            w_max=w_max,
+            probs, baseline_weights, min_baseline_weight=1e-3
         )
+        n_bull = sum(1 for c in news_constraints.values() if c["type"] == "bullish")
+        n_bear = sum(1 for c in news_constraints.values() if c["type"] == "bearish")
+        print(f"  Active constraints: {n_bull} bullish, {n_bear} bearish")
 
-        n_bullish = sum(1 for c in news_constraints.values() if c["type"] == "bullish")
-        n_bearish = sum(1 for c in news_constraints.values() if c["type"] == "bearish")
-        print(f"  Constraints: {n_bullish} bullish, {n_bearish} bearish")
-
-        # Optimize with constraints
         sci_cons = _build_scipy_constraints(news_constraints, ticker_to_idx)
         constrained = _optimize_portfolio(mu, cov, rf, w_max, lambda_l2, sci_cons)
 
-        # Compute deltas vs baseline
-        sharpe_delta = constrained["sharpe"] - baseline["sharpe"]
-        return_delta = constrained["return"] - baseline["return"]
-        vol_delta = constrained["vol"] - baseline["vol"]
+        sd = constrained["sharpe"] - baseline["sharpe"]
+        rd = constrained["return"] - baseline["return"]
+        vd = constrained["vol"] - baseline["vol"]
         turnover = sum(
             abs(constrained["weights"].get(t, 0) - baseline_weights.get(t, 0))
             for t in tickers
         ) / 2.0
 
-        print(f"  Sharpe Δ={sharpe_delta:+.4f} | "
-              f"Return Δ={return_delta*100:+.2f}% | "
-              f"Vol Δ={vol_delta*100:+.2f}% | "
-              f"Turnover={turnover*100:.1f}%")
-
-        results[group_name] = {
-            "description": cfg["description"],
-            "probs": probs,
-            "n_bullish": n_bullish,
-            "n_bearish": n_bearish,
-            "constrained_weights": constrained["weights"],
-            "sharpe": constrained["sharpe"],
-            "return": constrained["return"],
-            "vol": constrained["vol"],
-            "sharpe_delta": sharpe_delta,
-            "return_delta_pct": return_delta * 100,
-            "vol_delta_pct": vol_delta * 100,
-            "turnover": turnover,
-        }
+        print(f"  Sharpe Δ={sd:+.4f} | Return Δ={rd*100:+.2f}% | "
+              f"Vol Δ={vd*100:+.2f}% | Turnover={turnover*100:.1f}%")
 
         rows.append({
             "feature_group": group_name,
-            "description": cfg["description"],
             "n_features": len(cfg["features"]),
-            "n_bullish_constraints": n_bullish,
-            "n_bearish_constraints": n_bearish,
+            "description": cfg["description"],
+            "question": cfg["question"],
+            "n_bullish_constraints": n_bull,
+            "n_bearish_constraints": n_bear,
             "sharpe": constrained["sharpe"],
             "return_pct": constrained["return"] * 100,
             "vol_pct": constrained["vol"] * 100,
-            "sharpe_delta": sharpe_delta,
-            "return_delta_pct": return_delta * 100,
-            "vol_delta_pct": vol_delta * 100,
+            "sharpe_delta": sd,
+            "return_delta_pct": rd * 100,
+            "vol_delta_pct": vd * 100,
             "turnover_pct": turnover * 100,
-            **{f"prob_{t}": probs.get(t) for t in tickers},
-            **{f"w_{t}": constrained["weights"].get(t) for t in tickers},
         })
 
-    # Print final comparison table
-    print("\n\n" + "=" * 70)
+    # Print results table
+    print(f"\n\n{'='*70}")
     print("COMPONENT-LEVEL IMPACT TABLE")
-    print("=" * 70)
-    print(f"{'Feature Group':<26} {'Sharpe Δ':>10} {'Vol Δ':>8} "
-          f"{'Return Δ':>10} {'Turnover':>10} {'#Bull':>6} {'#Bear':>6}")
+    print(f"Universe: {len(tickers)} tickers | Baseline Sharpe={baseline['sharpe']:.4f}")
+    print(f"{'='*70}")
+    print(f"{'Feature Group':<20} {'#Feat':>6} {'Sharpe Δ':>10} "
+          f"{'Return Δ':>10} {'Vol Δ':>8} {'Turnover':>10} "
+          f"{'#Bull':>6} {'#Bear':>6}")
     print("-" * 78)
+    print(f"{'Baseline (no news)':<20} {'—':>6} {0.0:>+10.4f} "
+          f"{0.0:>+10.2f}% {0.0:>+8.2f}% {0.0:>9.1f}% {'—':>6} {'—':>6}")
     for row in rows:
         print(
-            f"{row['feature_group']:<26}"
+            f"{row['feature_group']:<20}"
+            f"{row['n_features']:>6}"
             f"{row['sharpe_delta']:>+10.4f}"
-            f"{row['vol_delta_pct']:>+8.2f}%"
             f"{row['return_delta_pct']:>+10.2f}%"
+            f"{row['vol_delta_pct']:>+8.2f}%"
             f"{row['turnover_pct']:>9.1f}%"
             f"{row['n_bullish_constraints']:>6}"
             f"{row['n_bearish_constraints']:>6}"
         )
-    print(f"\n{'Baseline':<26}"
-          f"{0.0:>+10.4f}"
-          f"{0.0:>+8.2f}%"
-          f"{0.0:>+10.2f}%"
-          f"{0.0:>9.1f}%"
-          f"{'—':>6}{'—':>6}")
 
+    # Save
     if save_outputs:
-        df = pd.DataFrame(rows)
+        df_out = pd.DataFrame(rows)
         csv_path = OUT_DIR / "component_level_impact.csv"
-        df.to_csv(csv_path, index=False)
+        df_out.to_csv(csv_path, index=False)
         print(f"\n[Saved] {csv_path}")
 
         json_path = OUT_DIR / "component_level_impact.json"
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump({
-                "baseline": baseline,
-                "results": results,
                 "parameters": {
-                    "bullish_threshold": bullish_threshold,
-                    "bearish_threshold": bearish_threshold,
-                    "delta": delta,
-                    "w_max": w_max,
-                    "rf": rf,
+                    "rf": rf, "w_max": w_max, "lambda_l2": lambda_l2,
+                    "bullish_threshold": BULLISH_THRESHOLD,
+                    "bearish_threshold": BEARISH_THRESHOLD,
+                    "delta": DELTA,
+                    "model": "LogisticRegression",
+                    "C": 0.3,
+                    "train_test_split": "70/30 chronological",
+                    "universe_size": len(tickers),
+                    "min_baseline_weight_filter": 0.001,
                 },
+                "feature_groups": {
+                    k: {
+                        "features": v["features"],
+                        "n_features": len(v["features"]),
+                        "description": v["description"],
+                        "question": v["question"],
+                    }
+                    for k, v in FEATURE_GROUPS.items()
+                },
+                "baseline": {
+                    "return": baseline["return"],
+                    "vol": baseline["vol"],
+                    "sharpe": baseline["sharpe"],
+                },
+                "results": rows,
             }, f, indent=2)
         print(f"[Saved] {json_path}")
 
-    return {"baseline": baseline, "results": results, "rows": rows}
+    return {"baseline": baseline, "rows": rows, "universe_size": len(tickers)}
 
 
 if __name__ == "__main__":
     run_component_level_impact_study(
-        portfolio_tickers=["AVGO", "GOOGL", "MU", "NVDA"],
-        rf=0.02,
-        w_max=0.30,
+        raw_path=RAW_PATH,
+        rf=RF,
+        w_max=W_MAX,
         save_outputs=True,
     )
