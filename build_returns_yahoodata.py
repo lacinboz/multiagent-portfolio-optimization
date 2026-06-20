@@ -17,6 +17,9 @@ for path in sorted(glob.glob(os.path.join(RAW_DIR, "*_daily.csv"))):
     fname = os.path.basename(path)
     ticker = fname.split("_")[0]   # "AAPL_daily.csv" -> "AAPL"
 
+    if ticker == "SPY":        # ← BU SATIRI EKLE
+        continue      
+
     df = pd.read_csv(path)
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     df["close"] = pd.to_numeric(df["close"], errors="coerce")

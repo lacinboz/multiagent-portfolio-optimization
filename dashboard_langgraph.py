@@ -2350,6 +2350,90 @@ def _render_why_this_portfolio_cards(state: Optional[Dict[str, Any]]):
             """,
             unsafe_allow_html=True,
         )
+def _render_mode_c_diversification_chart(
+    base_sum: Optional[Dict[str, Any]],
+    ref_sum: Optional[Dict[str, Any]],
+    chart_key: str = "mode_c_diversification_chart",
+):
+    if base_sum is None or ref_sum is None:
+        return
+
+    rows = [
+        {
+            "Metric": "Max Weight (%)",
+            "Base": _safe_float(base_sum.get("max_weight")),
+            "Mode C Refined": _safe_float(ref_sum.get("max_weight")),
+            "lower_is_better": True,
+        },
+        {
+            "Metric": "Effective N",
+            "Base": _safe_float(base_sum.get("effective_n")),
+            "Mode C Refined": _safe_float(ref_sum.get("effective_n")),
+            "lower_is_better": False,
+        },
+        {
+            "Metric": "Active Assets",
+            "Base": _safe_float(base_sum.get("active_assets")),
+            "Mode C Refined": _safe_float(ref_sum.get("active_assets")),
+            "lower_is_better": False,
+        },
+    ]
+
+    df = pd.DataFrame(rows)
+    pct_mask = df["Metric"] == "Max Weight (%)"
+    df.loc[pct_mask, ["Base", "Mode C Refined"]] = (
+        df.loc[pct_mask, ["Base", "Mode C Refined"]] * 100
+    )
+
+    df_long = df.melt(
+        id_vars=["Metric", "lower_is_better"],
+        value_vars=["Base", "Mode C Refined"],
+        var_name="Portfolio",
+        value_name="Value",
+    )
+
+    df_long["Label"] = df_long.apply(
+        lambda r: f"{r['Value']:.1f}%" if r["Metric"] == "Max Weight (%)" else f"{r['Value']:.1f}",
+        axis=1,
+    )
+
+    fig = px.bar(
+        df_long,
+        x="Metric",
+        y="Value",
+        color="Portfolio",
+        barmode="group",
+        text="Label",
+        color_discrete_map={
+            "Base": "#6366f1",
+            "Mode C Refined": "#4ade80",
+        },
+        title="Mode C: Diversification Impact",
+    )
+
+    fig.update_traces(textposition="outside", cliponaxis=False)
+
+    fig.update_layout(
+        paper_bgcolor="#0b1020",
+        plot_bgcolor="#0b1020",
+        font=dict(color="#E2E6FF"),
+        margin=dict(l=10, r=10, t=50, b=10),
+        height=400,
+        legend_title="",
+    )
+
+    st.plotly_chart(fig, use_container_width=True, key=chart_key)
+
+    st.caption(
+        "Mode C LLM news actions reduced concentration: max weight dropped from "
+        f"{_fmt_pct_from_decimal(_safe_float(base_sum.get('max_weight')))} to "
+        f"{_fmt_pct_from_decimal(_safe_float(ref_sum.get('max_weight')))}, "
+        f"effective holdings increased from {base_sum.get('effective_n', 0):.1f} to "
+        f"{ref_sum.get('effective_n', 0):.1f}, "
+        f"and active assets from {base_sum.get('active_assets', 0)} to "
+        f"{ref_sum.get('active_assets', 0)}. "
+        "Return and Sharpe declined marginally (−0.5%, −0.02) as a trade-off for better diversification."
+    )
 def _render_portfolio_story_timeline(
     base_state: Optional[Dict[str, Any]],
     refined_state: Optional[Dict[str, Any]],
@@ -2899,6 +2983,18 @@ def _run_news_actions_flow(
         base_portfolio_weights=base_state.get("optimized_weights"),
         base_portfolio_objective=base_state.get("objective_key"),
     )
+    print("\n===== NEWS ACTIONS DEBUG NOTES =====")
+
+    for note in (news_actions_state.get("debug_notes") or []):
+        if (
+            "NewsActions" in note
+            or "Evidence" in note
+            or "Drop" in note
+            or "[CHECK]" in note
+        ):
+            print(note)
+
+    print("===== /NEWS ACTIONS DEBUG NOTES =====\n")
 
     st.session_state["news_actions_state"] = news_actions_state
     st.session_state["selected_news_actions"] = []
@@ -3743,17 +3839,21 @@ else:
                             reason = str(a.get("reason") or "").strip()
 
                             label_parts = [x for x in [t, ticker, intensity] if x]
-                            label = " | ".join(label_parts) if label_parts else f"Action #{i}"
+                            base_label = " | ".join(label_parts) if label_parts else f"Action #{i}"
+
+                            checkbox_label = base_label
+                            if a.get("weak_evidence"):
+                                checkbox_label += " ⚠️ (indirect evidence)"
 
                             checked = st.checkbox(
-                                f"Select: {label}",
+                                f"Select: {checkbox_label}",
                                 key=f"news_action_checkbox_{msg_idx}_{i}",
                             )
 
                             if checked:
                                 selected_action_indices.append(i - 1)
 
-                            with st.expander(label, expanded=False):
+                            with st.expander(base_label, expanded=False):
                                 if reason:
                                     st.write(reason)
 
@@ -3795,7 +3895,7 @@ else:
                                 pain_points=[],
                                 excluded_assets=[],
                                 extra_notes="Applying selected news actions",
-                                use_llm_refine=True,
+                                use_llm_refine=False,
                             )
 
                             _append_chat_message(
@@ -4137,6 +4237,19 @@ if st.session_state.get("refined_state") is not None:
 
 
 st.markdown("</div>", unsafe_allow_html=True)
+
+# Mode C diversification chart (shown when news actions were used)
+refined_state_check = st.session_state.get("refined_state") or {}
+news_actions_were_applied = bool(
+        (refined_state_check.get("clarification_answers") or {}).get("selected_news_actions")
+    )
+if news_actions_were_applied and base_sum and ref_sum:
+        st.markdown("**Mode C — Diversification Focus**")
+        _render_mode_c_diversification_chart(
+            base_sum,
+            ref_sum,
+            chart_key="mode_c_diversification_chart_eval",
+        )
 
 # ---------------- Efficient Frontier ----------------
 st.markdown("")

@@ -601,6 +601,10 @@ def _clean_news_actions(
             base["evidence_ids"] = []
         if not base["reason"]:
             base["reason"] = "Derived from recent news risk signals."
+
+        if a.get("weak_evidence"):
+            base["weak_evidence"] = True
+            base["weak_evidence_ids"] = a.get("weak_evidence_ids") or []
               
         ev = a.get("evidence")
         if isinstance(ev, list):

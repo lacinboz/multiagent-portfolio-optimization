@@ -940,7 +940,6 @@ def clean_news_actions(
 
     return {"ok": (len(issues) == 0), "issues": issues, "actions": cleaned}
 
-
 def apply_news_actions_to_params(
     *,
     selected_tickers: List[str],
@@ -968,8 +967,16 @@ def apply_news_actions_to_params(
 
         elif t == "reduce_exposure":
             intensity = str(a.get("intensity") or "medium").lower().strip()
-            mult = 2.0 if intensity == "low" else (3.0 if intensity == "medium" else 5.0)
+            # Global w_max'ı düşür: o hissenin etkisini azaltır
+            reduction = {"low": 0.03, "medium": 0.07, "high": 0.12}[intensity]
+            w_max_new = max(0.05, w_max_new - reduction)
+            # lambda'yı da biraz artır (diversification teşvik eder)
+            mult = {"low": 1.5, "medium": 2.0, "high": 3.0}[intensity]
             lambda_new = lambda_new * mult
+
+        elif t == "hedge":
+            # hedge optimizer'a direkt map edilmiyor, lambda artır
+            lambda_new = lambda_new * 1.5
 
     return {
         "selected_tickers": universe,
@@ -977,7 +984,6 @@ def apply_news_actions_to_params(
         "lambda_l2": lambda_new,
         "objective_key": obj_new,
     }
-
 
 # ============================================================
 # NEWS — Finnhub primary + fallback
