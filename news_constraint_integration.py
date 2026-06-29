@@ -1,7 +1,7 @@
 # news_constraint_integration.py
 from __future__ import annotations
 
-from typing import Dict, Tuple
+from typing import Dict
 import pandas as pd
 
 
@@ -14,40 +14,6 @@ def build_news_probability_constraints(
     w_max: float = 0.30,
     min_baseline_weight: float = 1e-3,
 ) -> Dict[str, Dict[str, float]]:
-    """
-    Build portfolio weight constraints from news probabilities.
-
-    This does NOT modify expected returns or covariance.
-    It only constrains feasible portfolio allocations.
-
-    Parameters
-    ----------
-    latest_signals : pd.DataFrame
-        Output of latest_news_prediction_signals.csv
-
-    baseline_weights : Dict[str, float]
-        Baseline mean-variance portfolio weights.
-
-    bullish_threshold : float
-        Probability threshold for bullish signal.
-
-    bearish_threshold : float
-        Probability threshold for bearish signal.
-
-    delta : float
-        Minimum allocation adjustment.
-
-    Returns
-    -------
-    constraints : dict
-
-        Example:
-
-        {
-            "AAPL": {"min_weight": 0.10},
-            "TSLA": {"max_weight": 0.03},
-        }
-    """
 
     constraints = {}
 
@@ -61,17 +27,19 @@ def build_news_probability_constraints(
         prob = float(row["predicted_positive_probability"])
         base_weight = float(baseline_weights[ticker])
 
-        # =====================================================
-        # Bullish constraint
-        # =====================================================
+        # ✅ IMPORTANT:
+        # Do not create constraints for assets that are effectively not used
+        # in the baseline portfolio.
+        if base_weight < min_baseline_weight:
+            continue
 
+        # =====================================================
+        # Bullish constraint: require slightly higher allocation
+        # =====================================================
         if prob >= bullish_threshold:
 
-            if base_weight < min_baseline_weight:  # 0.001
-                continue
-
             min_weight = base_weight + delta
-            min_weight = min(min_weight, w_max - 1e-4) 
+            min_weight = min(min_weight, w_max - 1e-4)
 
             constraints[ticker] = {
                 "type": "bullish",
@@ -81,9 +49,8 @@ def build_news_probability_constraints(
             }
 
         # =====================================================
-        # Bearish constraint
+        # Bearish constraint: require lower allocation
         # =====================================================
-
         elif prob <= bearish_threshold:
 
             max_weight = max(0.0, base_weight - delta)
