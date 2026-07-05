@@ -1,21 +1,11 @@
 # component_level_impact_study.py
 # ============================================================
 # LAYER 1 ONLY — Full 101-ticker universe
-# Layer 2 (case study) removed.
 #
-# Feature sets (consistent with news_model_feature_ablation.py):
-#   price_only      — 3 features  — Does price alone suffice?
-#   sentiment_only  — 7 features  — Does current-day sentiment alone work?
-#   news_only       — 11 features — Full news + flow, no price
-#   sentiment_price — 10 features — News + price, no flow (what does flow add?)
-#   all_features    — 14 features — Production model
-#
-# All experiments use:
-#   - Same 101-ticker universe (mu/cov files)
-#   - Same 70/30 chronological split
-#   - Same LR (C=0.3)
-#   - Same constraint parameters (bull=0.60, bear=0.40, delta=0.02)
-#   - min_baseline_weight=1e-3 filter for near-zero positions
+# ✅ look-ahead bias fix: latest signals capped at 2026-01-14
+# ✅ Both expected AND realized metrics reported
+# ✅ 5-run mean±std (no fixed seeds)
+# ✅ Deterministic for LR (std≈0 expected, confirms stability)
 # ============================================================
 from __future__ import annotations
 
@@ -29,25 +19,28 @@ from scipy.optimize import minimize
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from realized_eval import compute_realized_metrics, load_test_returns
 
 OUT_DIR = Path("data/ablation_study")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 RAW_PATH = "data/news_prediction/news_timeseries_dataset_raw_h7_alltickers_v2_enrichedd.csv"
-MU_PATH = Path("data/processed_yahoo/summary_per_asset_annual.csv")
+MU_PATH  = Path("data/processed_yahoo/summary_per_asset_annual.csv")
 COV_PATH = Path("data/processed_yahoo/cov_annual.csv")
 
-RF = 0.02
-W_MAX = 0.30
-LAMBDA_L2 = 1e-3
+# ✅ look-ahead bias fix
+SIGNAL_CUTOFF = pd.Timestamp("2026-01-14")
+
+N_RUNS            = 5
+RF                = 0.02
+W_MAX             = 0.30
+LAMBDA_L2         = 1e-3
 BULLISH_THRESHOLD = 0.60
 BEARISH_THRESHOLD = 0.40
-DELTA = 0.02
+DELTA             = 0.02
 
 # ============================================================
 # FEATURE SET DEFINITIONS
-# Consistent with news_model_feature_ablation.py
-# Each set answers a distinct question.
 # ============================================================
 
 FEATURE_GROUPS = {
@@ -57,11 +50,7 @@ FEATURE_GROUPS = {
             "past_20d_return",
             "past_20d_volatility",
         ],
-        "description": (
-            "Only price/momentum features — no news, no sentiment. "
-            "Pure technical baseline. (3 features)"
-        ),
-        "question": "Does price momentum alone provide sufficient directional signal?",
+        "description": "Only price/momentum — no news. (3 features)",
     },
     "sentiment_only": {
         "features": [
@@ -73,11 +62,7 @@ FEATURE_GROUPS = {
             "negative_ratio",
             "mean_sentiment_confidence",
         ],
-        "description": (
-            "Current-day FinBERT sentiment features only — "
-            "no price, no rolling flow. (7 features)"
-        ),
-        "question": "What is the standalone value of current-day news sentiment?",
+        "description": "Current-day FinBERT sentiment — no price, no flow. (7 features)",
     },
     "news_only": {
         "features": [
@@ -93,10 +78,7 @@ FEATURE_GROUPS = {
             "sentiment_flow_20d",
             "confidence_flow_20d",
         ],
-        "description": (
-            "Full news features including rolling flow — no price features. (11 features)"
-        ),
-        "question": "How much does the full news signal (with trend) contribute without price?",
+        "description": "Full news + rolling flow — no price. (11 features)",
     },
     "sentiment_price": {
         "features": [
@@ -111,10 +93,7 @@ FEATURE_GROUPS = {
             "past_20d_return",
             "past_20d_volatility",
         ],
-        "description": (
-            "Current-day sentiment + price features — no rolling flow. (10 features)"
-        ),
-        "question": "What does adding price momentum to sentiment contribute? (flow ablated out)",
+        "description": "Sentiment + price — no rolling flow. (10 features)",
     },
     "all_features": {
         "features": [
@@ -133,10 +112,7 @@ FEATURE_GROUPS = {
             "past_20d_return",
             "past_20d_volatility",
         ],
-        "description": (
-            "Full feature set: sentiment + flow + price. Production model. (14 features)"
-        ),
-        "question": "Does adding rolling flow to sentiment+price further improve outcomes?",
+        "description": "Full: sentiment + flow + price. Production model. (14 features)",
     },
 }
 
@@ -151,14 +127,13 @@ def _near_psd(A: np.ndarray, eps: float = 1e-8) -> np.ndarray:
 
 def _load_mu_cov(tickers: Optional[List[str]] = None):
     summary = pd.read_csv(MU_PATH, index_col=0)
-    cov_df = pd.read_csv(COV_PATH, index_col=0)
+    cov_df  = pd.read_csv(COV_PATH, index_col=0)
     if tickers is None:
         common = [t for t in summary.index if t in cov_df.index]
     else:
         common = [t for t in tickers if t in summary.index and t in cov_df.index]
-    mu = summary.loc[common, "mu_annual"].astype(float)
-    cov = cov_df.loc[common, common].astype(float)
-    return mu, cov
+    return (summary.loc[common, "mu_annual"].astype(float),
+            cov_df.loc[common, common].astype(float))
 
 
 def _optimize_portfolio(mu, cov, rf, w_max, lambda_l2, extra_constraints=None):
@@ -189,17 +164,19 @@ def _optimize_portfolio(mu, cov, rf, w_max, lambda_l2, extra_constraints=None):
     w = w / w.sum()
     r = float(w.values @ mu.values)
     v = float(np.sqrt(w.values @ cov_f.values @ w.values))
-    sharpe = (r - rf) / v if v > 0 else 0.0
-    return {"weights": {t: float(w[t]) for t in tickers},
-            "return": r, "vol": v, "sharpe": sharpe,
-            "success": bool(res.success)}
+    return {
+        "weights": {t: float(w[t]) for t in tickers},
+        "return": r, "vol": v,
+        "sharpe": (r - rf) / v if v > 0 else 0.0,
+    }
 
 
 # ============================================================
-# Dataset builder
+# Dataset builders
 # ============================================================
 
 def _build_dataset(raw_path: str) -> pd.DataFrame:
+    """Training dataset with tau=0.02 filter."""
     df = pd.read_csv(raw_path)
     df["news_date_dt"] = pd.to_datetime(df["news_date"], errors="coerce")
     df = df.dropna(subset=[
@@ -222,9 +199,81 @@ def _build_dataset(raw_path: str) -> pd.DataFrame:
         weights = g["article_confidence"].astype(float)
         w_sum = float(weights.sum())
 
-        def wmean(col):
-            vals = g[col].astype(float)
-            return float(np.average(vals, weights=weights)) if w_sum > 0 else float(vals.mean())
+        def wmean(col, _g=g, _w=weights, _ws=w_sum):
+            vals = _g[col].astype(float)
+            return float(np.average(vals, weights=_w)) if _ws > 0 else float(vals.mean())
+
+        grouped_rows.append({
+            "ticker": ticker,
+            "news_date": news_date,
+            "news_date_dt": news_date_dt,
+            "article_count": int(len(g)),
+            "weighted_sentiment": wmean("article_sentiment"),
+            "sentiment_std": float(g["article_sentiment"].std()) if len(g) > 1 else 0.0,
+            "mean_confidence": float(g["article_confidence"].mean()),
+            "positive_ratio": float(g["is_positive_article"].mean()),
+            "negative_ratio": float(g["is_negative_article"].mean()),
+            "mean_sentiment_confidence": float(g["sentiment_confidence"].mean()),
+            "past_5d_return": float(g["past_5d_return"].mean()),
+            "past_20d_return": float(g["past_20d_return"].mean()),
+            "past_20d_volatility": float(g["past_20d_volatility"].mean()),
+            "future_return": float(g["future_return"].mean()),
+        })
+
+    out = pd.DataFrame(grouped_rows)
+    out = out.sort_values(["ticker", "news_date_dt"]).reset_index(drop=True)
+
+    flow_parts = []
+    for ticker, g in out.groupby("ticker"):
+        g = g.sort_values("news_date_dt").copy()
+        for w in [5, 20]:
+            g[f"sentiment_flow_{w}d"] = (
+                g["weighted_sentiment"].shift(1).rolling(w, min_periods=1).mean()
+            )
+            g[f"confidence_flow_{w}d"] = (
+                g["mean_confidence"].shift(1).rolling(w, min_periods=1).mean()
+            )
+        flow_parts.append(g)
+
+    out = pd.concat(flow_parts, ignore_index=True)
+    out = out.dropna().reset_index(drop=True)
+    out["target_direction"] = (out["future_return"] > 0).astype(int)
+    return out
+
+
+def _build_latest_dataset(raw_path: str) -> pd.DataFrame:
+    """
+    Unfiltered dataset for latest signal generation (tau=None).
+    ✅ look-ahead bias fix: capped at SIGNAL_CUTOFF (2026-01-14).
+    """
+    df = pd.read_csv(raw_path)
+    df["news_date_dt"] = pd.to_datetime(df["news_date"], errors="coerce")
+    df = df.dropna(subset=[
+        "news_date_dt", "ticker", "future_return",
+        "article_sentiment", "article_confidence",
+        "prob_positive", "prob_negative", "prob_neutral",
+        "combined_weight", "past_5d_return",
+        "past_20d_return", "past_20d_volatility",
+    ]).copy()
+    df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
+
+    # ✅ look-ahead bias fix
+    df = df[df["news_date_dt"] <= SIGNAL_CUTOFF].copy()
+
+    df["is_positive_article"] = (df["prob_positive"] > df["prob_negative"]).astype(int)
+    df["is_negative_article"] = (df["prob_negative"] > df["prob_positive"]).astype(int)
+    df["sentiment_confidence"] = df["article_sentiment"] * df["article_confidence"]
+
+    grouped_rows = []
+    for (ticker, news_date, news_date_dt), g in df.groupby(
+        ["ticker", "news_date", "news_date_dt"]
+    ):
+        weights = g["article_confidence"].astype(float)
+        w_sum = float(weights.sum())
+
+        def wmean(col, _g=g, _w=weights, _ws=w_sum):
+            vals = _g[col].astype(float)
+            return float(np.average(vals, weights=_w)) if _ws > 0 else float(vals.mean())
 
         grouped_rows.append({
             "ticker": ticker,
@@ -265,15 +314,15 @@ def _build_dataset(raw_path: str) -> pd.DataFrame:
 
 
 # ============================================================
-# Train model + predict
+# Train model + predict (single run)
 # ============================================================
 
 def _train_and_predict(
     dataset: pd.DataFrame,
     feature_cols: List[str],
     portfolio_tickers: List[str],
+    latest_dataset: pd.DataFrame,
     test_size: float = 0.30,
-    C: float = 0.3,
 ) -> Optional[Dict[str, float]]:
     available = [f for f in feature_cols if f in dataset.columns]
     if not available:
@@ -299,29 +348,61 @@ def _train_and_predict(
     X_train = df.iloc[:split_idx][feat_cols].astype(float)
     y_train = y.iloc[:split_idx]
 
+    if y_train.nunique() < 2:
+        return None
+
+    # NO random_state — probabilistic
     model = Pipeline([
         ("scaler", StandardScaler()),
         ("clf", LogisticRegression(
-            max_iter=2000, class_weight="balanced",
-            C=C, random_state=42,
+            max_iter=2000, class_weight="balanced", C=0.3,
         )),
     ])
     model.fit(X_train, y_train)
 
+    # Latest signals from CUTOFF-capped dataset
+    latest_df = latest_dataset.dropna(
+        subset=available + ["target_direction", "news_date_dt", "ticker"]
+    ).copy()
+    latest_df = latest_df.sort_values(["news_date_dt", "ticker"]).reset_index(drop=True)
+
+    latest_dummies = pd.get_dummies(latest_df["ticker"], prefix="ticker", dtype=float)
+    latest_df = pd.concat([latest_df, latest_dummies], axis=1)
+    for col in feat_cols:
+        if col not in latest_df.columns:
+            latest_df[col] = 0.0
+
     probs = {}
     for ticker in portfolio_tickers:
-        ticker_data = df[df["ticker"] == ticker].copy()
-        if ticker_data.empty:
+        sub = latest_df[latest_df["ticker"] == ticker].copy()
+        if sub.empty:
             continue
-        for col in feat_cols:
-            if col not in ticker_data.columns:
-                ticker_data[col] = 0.0
-        latest_row = ticker_data.sort_values("news_date_dt").tail(1)
-        X_pred = latest_row[feat_cols].astype(float)
-        p = float(model.predict_proba(X_pred)[0, 1])
+        latest_row = sub.sort_values("news_date_dt").tail(1)
+        p = float(model.predict_proba(latest_row[feat_cols].astype(float))[0, 1])
         probs[ticker] = p
 
     return probs
+
+
+def _probs_to_constraints(probs, baseline_weights, min_baseline_weight=1e-3):
+    constraints = {}
+    for ticker, prob in probs.items():
+        if ticker not in baseline_weights:
+            continue
+        base_w = float(baseline_weights[ticker])
+        if base_w < min_baseline_weight:
+            continue
+        if prob >= BULLISH_THRESHOLD:
+            constraints[ticker] = {
+                "type": "bullish",
+                "min_weight": min(base_w + DELTA, W_MAX - 1e-4),
+            }
+        elif prob <= BEARISH_THRESHOLD:
+            constraints[ticker] = {
+                "type": "bearish",
+                "max_weight": max(0.0, base_w - DELTA),
+            }
+    return constraints
 
 
 def _build_scipy_constraints(news_constraints, ticker_to_idx):
@@ -339,27 +420,30 @@ def _build_scipy_constraints(news_constraints, ticker_to_idx):
     return sci
 
 
-def _probs_to_constraints(probs, baseline_weights, min_baseline_weight=1e-3):
-    constraints = {}
-    for ticker, prob in probs.items():
-        if ticker not in baseline_weights:
-            continue
-        base_w = float(baseline_weights[ticker])
-        if base_w < min_baseline_weight:
-            continue
-        if prob >= BULLISH_THRESHOLD:
-            constraints[ticker] = {
-                "type": "bullish", "prob": prob,
-                "baseline_weight": base_w,
-                "min_weight": min(base_w + DELTA, W_MAX - 1e-4),
-            }
-        elif prob <= BEARISH_THRESHOLD:
-            constraints[ticker] = {
-                "type": "bearish", "prob": prob,
-                "baseline_weight": base_w,
-                "max_weight": max(0.0, base_w - DELTA),
-            }
-    return constraints
+# ============================================================
+# Aggregate runs → mean ± std
+# ============================================================
+
+def _aggregate(group_name: str, run_results: List[Dict]) -> Dict:
+    if not run_results:
+        return {"feature_group": group_name, "n_runs": 0}
+
+    metrics = [
+        "exp_sharpe_delta", "exp_return_delta", "exp_vol_delta",
+        "real_sharpe_delta", "real_sharpe", "real_return_pct", "real_vol_pct",
+        "turnover", "n_bullish", "n_bearish",
+    ]
+    out: Dict[str, Any] = {
+        "feature_group": group_name,
+        "n_runs": len(run_results),
+        "n_features": run_results[0].get("n_features"),
+    }
+    for m in metrics:
+        vals = [r[m] for r in run_results if m in r and r[m] is not None]
+        if vals:
+            out[f"{m}_mean"] = float(np.mean(vals))
+            out[f"{m}_std"]  = float(np.std(vals))
+    return out
 
 
 # ============================================================
@@ -376,155 +460,203 @@ def run_component_level_impact_study(
 
     print("\n" + "=" * 70)
     print("COMPONENT-LEVEL PORTFOLIO IMPACT STUDY")
+    print(f"N_RUNS={N_RUNS} | No fixed seeds (probabilistic)")
+    print(f"✅ Signal cutoff: {SIGNAL_CUTOFF.date()} (no look-ahead bias)")
+    print(f"✅ Both expected AND realized metrics reported")
     print("=" * 70)
-    print(f"Universe: full 101-ticker NASDAQ universe")
     print(f"rf={rf}, w_max={w_max}, lambda_l2={lambda_l2}")
-    print(f"Constraints: bull>={BULLISH_THRESHOLD}, bear<={BEARISH_THRESHOLD}, delta={DELTA}")
-    print(f"Model: LogisticRegression (C=0.3), 70/30 chronological split")
-    print(f"Filter: constraints applied only to tickers with baseline weight >= 0.001")
+    print(f"bull>={BULLISH_THRESHOLD}, bear<={BEARISH_THRESHOLD}, delta={DELTA}")
 
-    # Print feature group summary
-    print(f"\nFeature groups ({len(FEATURE_GROUPS)}):")
-    for name, cfg in FEATURE_GROUPS.items():
-        print(f"  {name:<20} {len(cfg['features']):>3} features — {cfg['question']}")
-
-    # Load full universe
+    # Load mu/cov
     mu, cov = _load_mu_cov(tickers=None)
     tickers = list(mu.index)
     ticker_to_idx = {t: i for i, t in enumerate(tickers)}
-    print(f"\nLoaded {len(tickers)} tickers")
+    print(f"\nUniverse: {len(tickers)} tickers")
 
     # Baseline
     baseline = _optimize_portfolio(mu, cov, rf, w_max, lambda_l2)
     baseline_weights = baseline["weights"]
-    print(f"Baseline: return={baseline['return']*100:.2f}% "
-          f"vol={baseline['vol']*100:.2f}% sharpe={baseline['sharpe']:.4f}")
 
-    # Dataset
-    print("\nBuilding dataset...")
-    dataset = _build_dataset(raw_path)
-    print(f"Dataset: {len(dataset)} rows, {dataset['ticker'].nunique()} tickers")
+    # Load test returns
+    returns_test = load_test_returns()
+    baseline_realized = compute_realized_metrics(baseline_weights, returns_test)
+    baseline_realized_sharpe = baseline_realized["realized_sharpe"]
+
+    print(f"Baseline expected : Sharpe={baseline['sharpe']:.4f} | "
+          f"Return={baseline['return']*100:.2f}% | Vol={baseline['vol']*100:.2f}%")
+    print(f"Baseline realized : Sharpe={baseline_realized_sharpe:.4f} | "
+          f"Return={baseline_realized['realized_return']*100:.2f}% | "
+          f"Vol={baseline_realized['realized_vol']*100:.2f}%")
+
+    # Build datasets once
+    print("\nBuilding datasets...")
+    dataset        = _build_dataset(raw_path)
+    latest_dataset = _build_latest_dataset(raw_path)
+    print(f"Training dataset : {len(dataset)} rows (tau=0.02)")
+    print(f"Latest dataset   : {len(latest_dataset)} rows "
+          f"(tau=None, capped at {SIGNAL_CUTOFF.date()})")
+    print(f"Latest max date  : {latest_dataset['news_date_dt'].max().date()}")
 
     # Run each feature group
-    rows = []
+    summary_rows = []
+    all_run_rows  = []
 
     for group_name, cfg in FEATURE_GROUPS.items():
         print(f"\n{'─'*60}")
-        print(f"Feature group: {group_name}")
-        print(f"  {cfg['description']}")
-        print(f"  Question: {cfg['question']}")
+        print(f"Feature group: {group_name} ({len(cfg['features'])} features)")
+        print(f"{'─'*60}")
 
-        probs = _train_and_predict(
-            dataset=dataset,
-            feature_cols=cfg["features"],
-            portfolio_tickers=tickers,
-            test_size=0.30,
-            C=0.3,
-        )
-        if not probs:
-            print("  FAILED: could not generate predictions")
-            continue
+        run_results = []
 
-        news_constraints = _probs_to_constraints(
-            probs, baseline_weights, min_baseline_weight=1e-3
-        )
-        n_bull = sum(1 for c in news_constraints.values() if c["type"] == "bullish")
-        n_bear = sum(1 for c in news_constraints.values() if c["type"] == "bearish")
-        print(f"  Active constraints: {n_bull} bullish, {n_bear} bearish")
+        for run_idx in range(N_RUNS):
+            print(f"  Run {run_idx+1}/{N_RUNS} ...", end=" ", flush=True)
 
-        sci_cons = _build_scipy_constraints(news_constraints, ticker_to_idx)
-        constrained = _optimize_portfolio(mu, cov, rf, w_max, lambda_l2, sci_cons)
+            probs = _train_and_predict(
+                dataset=dataset,
+                feature_cols=cfg["features"],
+                portfolio_tickers=tickers,
+                latest_dataset=latest_dataset,
+                test_size=0.30,
+            )
+            if not probs:
+                print("FAILED")
+                continue
 
-        sd = constrained["sharpe"] - baseline["sharpe"]
-        rd = constrained["return"] - baseline["return"]
-        vd = constrained["vol"] - baseline["vol"]
-        turnover = sum(
-            abs(constrained["weights"].get(t, 0) - baseline_weights.get(t, 0))
-            for t in tickers
-        ) / 2.0
+            news_constraints = _probs_to_constraints(
+                probs, baseline_weights, min_baseline_weight=1e-3
+            )
+            n_bull = sum(1 for c in news_constraints.values() if c["type"] == "bullish")
+            n_bear = sum(1 for c in news_constraints.values() if c["type"] == "bearish")
 
-        print(f"  Sharpe Δ={sd:+.4f} | Return Δ={rd*100:+.2f}% | "
-              f"Vol Δ={vd*100:+.2f}% | Turnover={turnover*100:.1f}%")
+            sci_cons = _build_scipy_constraints(news_constraints, ticker_to_idx)
+            constrained = _optimize_portfolio(mu, cov, rf, w_max, lambda_l2, sci_cons)
 
-        rows.append({
-            "feature_group": group_name,
-            "n_features": len(cfg["features"]),
-            "description": cfg["description"],
-            "question": cfg["question"],
-            "n_bullish_constraints": n_bull,
-            "n_bearish_constraints": n_bear,
-            "sharpe": constrained["sharpe"],
-            "return_pct": constrained["return"] * 100,
-            "vol_pct": constrained["vol"] * 100,
-            "sharpe_delta": sd,
-            "return_delta_pct": rd * 100,
-            "vol_delta_pct": vd * 100,
-            "turnover_pct": turnover * 100,
-        })
+            exp_sd = constrained["sharpe"] - baseline["sharpe"]
+            exp_rd = constrained["return"] - baseline["return"]
+            exp_vd = constrained["vol"] - baseline["vol"]
+            turnover = sum(
+                abs(constrained["weights"].get(t, 0) - baseline_weights.get(t, 0))
+                for t in tickers
+            ) / 2.0
 
-    # Print results table
-    print(f"\n\n{'='*70}")
-    print("COMPONENT-LEVEL IMPACT TABLE")
-    print(f"Universe: {len(tickers)} tickers | Baseline Sharpe={baseline['sharpe']:.4f}")
-    print(f"{'='*70}")
-    print(f"{'Feature Group':<20} {'#Feat':>6} {'Sharpe Δ':>10} "
-          f"{'Return Δ':>10} {'Vol Δ':>8} {'Turnover':>10} "
-          f"{'#Bull':>6} {'#Bear':>6}")
-    print("-" * 78)
-    print(f"{'Baseline (no news)':<20} {'—':>6} {0.0:>+10.4f} "
-          f"{0.0:>+10.2f}% {0.0:>+8.2f}% {0.0:>9.1f}% {'—':>6} {'—':>6}")
-    for row in rows:
+            # Realized metrics
+            real = compute_realized_metrics(constrained["weights"], returns_test)
+
+            run_row = {
+                "feature_group": group_name,
+                "run": run_idx + 1,
+                "n_features": len(cfg["features"]),
+                "n_bullish": n_bull,
+                "n_bearish": n_bear,
+                "exp_sharpe_delta": exp_sd,
+                "exp_return_delta": exp_rd,
+                "exp_vol_delta": exp_vd,
+                "turnover": turnover,
+                "real_sharpe": real["realized_sharpe"],
+                "real_sharpe_delta": real["realized_sharpe"] - baseline_realized_sharpe,
+                "real_return_pct": real["realized_return"] * 100,
+                "real_vol_pct": real["realized_vol"] * 100,
+            }
+            run_results.append(run_row)
+            all_run_rows.append(run_row)
+
+            print(f"Exp ΔS={exp_sd:+.4f} | Real ΔS={real['realized_sharpe'] - baseline_realized_sharpe:+.4f} | "
+                  f"#C={n_bull+n_bear} | TO={turnover*100:.1f}%")
+
+        summary = _aggregate(group_name, run_results)
+        summary_rows.append(summary)
+
+    # ============================================================
+    # Print summary table
+    # ============================================================
+    print(f"\n\n{'='*80}")
+    print(f"COMPONENT-LEVEL IMPACT — EXPECTED METRICS (mean±std, {N_RUNS} runs)")
+    print(f"Expected baseline: Sharpe={baseline['sharpe']:.4f} | "
+          f"Return={baseline['return']*100:.2f}%")
+    print(f"{'='*80}")
+
+    col = 18
+    print(f"\n{'Feature group':<20} {'#Feat':>6} "
+          f"{'Exp ΔSharpe':>{col}} {'Turnover':>{col}} {'#Bull':>8} {'#Bear':>8}")
+    print("─" * (20 + 6 + col * 2 + 16 + 4))
+
+    print(f"{'Baseline (no news)':<20} {'—':>6} "
+          f"{'+0.000±0.000':>{col}} {'0.0%±0.0%':>{col}} {'—':>8} {'—':>8}")
+
+    for s in summary_rows:
+        def ms(key, pct=False, digits=3):
+            m = s.get(f"{key}_mean")
+            d = s.get(f"{key}_std")
+            if m is None:
+                return "—"
+            if pct:
+                return f"{m*100:+.1f}%±{d*100:.1f}%"
+            return f"{m:+.{digits}f}±{d:.{digits}f}"
+
+        def fmt_int(key):
+            m = s.get(f"{key}_mean")
+            d = s.get(f"{key}_std")
+            if m is None:
+                return "—"
+            return f"{m:.1f}±{d:.1f}"
+
         print(
-            f"{row['feature_group']:<20}"
-            f"{row['n_features']:>6}"
-            f"{row['sharpe_delta']:>+10.4f}"
-            f"{row['return_delta_pct']:>+10.2f}%"
-            f"{row['vol_delta_pct']:>+8.2f}%"
-            f"{row['turnover_pct']:>9.1f}%"
-            f"{row['n_bullish_constraints']:>6}"
-            f"{row['n_bearish_constraints']:>6}"
+            f"{s['feature_group']:<20} {s.get('n_features', '?'):>6} "
+            f"{ms('exp_sharpe_delta'):>{col}} "
+            f"{ms('turnover', pct=True):>{col}} "
+            f"{fmt_int('n_bullish'):>8} "
+            f"{fmt_int('n_bearish'):>8}"
         )
 
-    # Save
+    print(f"\n\n{'='*80}")
+    print(f"COMPONENT-LEVEL IMPACT — REALIZED METRICS (mean±std, {N_RUNS} runs)")
+    print(f"Realized baseline: Sharpe={baseline_realized_sharpe:.4f} | "
+          f"Return={baseline_realized['realized_return']*100:.2f}%")
+    print(f"{'='*80}")
+
+    print(f"\n{'Feature group':<20} {'#Feat':>6} "
+          f"{'Real ΔSharpe':>{col}} {'Real Return':>{col}} {'Real Vol':>{col}}")
+    print("─" * (20 + 6 + col * 3 + 6))
+
+    _br = f"{baseline_realized['realized_return']*100:.2f}%"
+    _bv = f"{baseline_realized['realized_vol']*100:.2f}%"
+    print(f"{'Baseline (no news)':<20} {'—':>6} "
+          f"{'+0.000±0.000':>{col}} "
+          f"{_br:>{col}} "
+          f"{_bv:>{col}}")
+
+    for s in summary_rows:
+        def ms_r(key, pct=False, digits=3):
+            m = s.get(f"{key}_mean")
+            d = s.get(f"{key}_std")
+            if m is None:
+                return "—"
+            if pct:
+                return f"{m:.2f}%±{d:.2f}%"
+            return f"{m:+.{digits}f}±{d:.{digits}f}"
+
+        print(
+            f"{s['feature_group']:<20} {s.get('n_features', '?'):>6} "
+            f"{ms_r('real_sharpe_delta'):>{col}} "
+            f"{ms_r('real_return_pct', pct=True):>{col}} "
+            f"{ms_r('real_vol_pct', pct=True):>{col}}"
+        )
+
+    # ============================================================
+    # Save outputs
+    # ============================================================
     if save_outputs:
-        df_out = pd.DataFrame(rows)
-        csv_path = OUT_DIR / "component_level_impact.csv"
-        df_out.to_csv(csv_path, index=False)
-        print(f"\n[Saved] {csv_path}")
+        if all_run_rows:
+            pd.DataFrame(all_run_rows).to_csv(
+                OUT_DIR / "component_level_all_runs.csv", index=False)
+            print(f"\n[Saved] {OUT_DIR}/component_level_all_runs.csv")
 
-        json_path = OUT_DIR / "component_level_impact.json"
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump({
-                "parameters": {
-                    "rf": rf, "w_max": w_max, "lambda_l2": lambda_l2,
-                    "bullish_threshold": BULLISH_THRESHOLD,
-                    "bearish_threshold": BEARISH_THRESHOLD,
-                    "delta": DELTA,
-                    "model": "LogisticRegression",
-                    "C": 0.3,
-                    "train_test_split": "70/30 chronological",
-                    "universe_size": len(tickers),
-                    "min_baseline_weight_filter": 0.001,
-                },
-                "feature_groups": {
-                    k: {
-                        "features": v["features"],
-                        "n_features": len(v["features"]),
-                        "description": v["description"],
-                        "question": v["question"],
-                    }
-                    for k, v in FEATURE_GROUPS.items()
-                },
-                "baseline": {
-                    "return": baseline["return"],
-                    "vol": baseline["vol"],
-                    "sharpe": baseline["sharpe"],
-                },
-                "results": rows,
-            }, f, indent=2)
-        print(f"[Saved] {json_path}")
+        if summary_rows:
+            pd.DataFrame(summary_rows).to_csv(
+                OUT_DIR / "component_level_impact.csv", index=False)
+            print(f"[Saved] {OUT_DIR}/component_level_impact.csv")
 
-    return {"baseline": baseline, "rows": rows, "universe_size": len(tickers)}
+    return {"baseline": baseline, "summary_rows": summary_rows}
 
 
 if __name__ == "__main__":

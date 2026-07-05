@@ -7,17 +7,10 @@
 #   bear ∈ {0.30, 0.35, 0.40, 0.45}
 #   delta ∈ {0.01, 0.02, 0.03, 0.05}
 #
-# Fixed across all 64 configs:
-#   - Full 101-ticker universe (mu/cov files)
-#   - Same baseline portfolio (unconstrained max-Sharpe)
-#   - Same LR model signals (latest_news_prediction_signals.csv)
-#   - rf=0.02, w_max=0.30, lambda_l2=1e-3
-#   - min_baseline_weight=1e-3 filter (both directions)
-#
-# Production constraint logic matches news_constraint_integration.py:
-#   - Bullish: min_weight = baseline + delta (only if baseline >= 1e-3)
-#   - Bearish: max_weight = max(0, baseline - delta) (only if baseline >= 1e-3)
-#   - Both directions filtered to avoid no-op constraints on near-zero positions
+# ✅ Reports BOTH expected metrics (w^T mu, w^T Sigma w)
+#    AND realized metrics (test period daily returns)
+# ✅ No look-ahead bias: uses as_of_20260114 signals file
+# ✅ Deterministic — no 5-run loop needed (no model randomness)
 # ============================================================
 from __future__ import annotations
 
@@ -28,19 +21,20 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
+from realized_eval import compute_realized_metrics, load_test_returns
 
 OUT_DIR = Path("data/ablation_study")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-SIGNALS_PATH = Path("data/news_prediction/latest_news_prediction_signals.csv")
-MU_PATH = Path("data/processed_yahoo/summary_per_asset_annual.csv")
-COV_PATH = Path("data/processed_yahoo/cov_annual.csv")
+SIGNALS_PATH = Path("data/news_prediction/latest_news_prediction_signals_as_of_20260114.csv")
+MU_PATH      = Path("data/processed_yahoo/summary_per_asset_annual.csv")
+COV_PATH     = Path("data/processed_yahoo/cov_annual.csv")
 
 BULLISH_THRESHOLDS = [0.55, 0.60, 0.65, 0.70]
 BEARISH_THRESHOLDS = [0.30, 0.35, 0.40, 0.45]
 DELTAS             = [0.01, 0.02, 0.03, 0.05]
 
-MIN_BASELINE_WEIGHT = 1e-3  # skip near-zero positions for both directions
+MIN_BASELINE_WEIGHT = 1e-3
 
 
 # ============================================================
@@ -111,14 +105,6 @@ def _build_constraints(
     w_max: float,
     min_baseline_weight: float = MIN_BASELINE_WEIGHT,
 ) -> Dict[str, Any]:
-    """
-    Build threshold-based portfolio constraints from prediction signals.
-
-    Both bullish and bearish constraints are skipped for tickers with
-    near-zero baseline weight (< min_baseline_weight). This prevents
-    no-op constraints that inflate constraint counts without portfolio effect.
-    Consistent with the min_baseline_weight=1e-3 filter in the ablation studies.
-    """
     constraints = {}
     for _, row in latest_signals.iterrows():
         ticker = str(row["ticker"]).upper().strip()
@@ -128,7 +114,7 @@ def _build_constraints(
         base_w = float(baseline_weights[ticker])
 
         if base_w < min_baseline_weight:
-            continue  # skip near-zero positions
+            continue
 
         if prob >= bullish_threshold:
             constraints[ticker] = {
@@ -172,11 +158,13 @@ def run_constraint_sensitivity_study(
 
     print("\n" + "=" * 70)
     print("NEWS CONSTRAINT SENSITIVITY STUDY")
+    print("✅ Both expected AND realized metrics reported")
+    print("✅ No look-ahead bias: signals capped at 2026-01-14")
     print("=" * 70)
-    print(f"Universe: full 101-ticker NASDAQ universe (mu/cov files)")
     print(f"rf={rf}, w_max={w_max}, lambda_l2={lambda_l2}")
     print(f"Grid: bull∈{BULLISH_THRESHOLDS} × bear∈{BEARISH_THRESHOLDS} "
           f"× delta∈{DELTAS}")
+
     n_total = sum(
         1 for b in BULLISH_THRESHOLDS
         for br in BEARISH_THRESHOLDS
@@ -188,39 +176,49 @@ def run_constraint_sensitivity_study(
     if not signals_path.exists():
         raise FileNotFoundError(f"Signals file not found: {signals_path}")
 
-    # Load signals — use ALL tickers from signals file
+    # Load signals
     latest_signals = pd.read_csv(signals_path)
     latest_signals["ticker"] = (
         latest_signals["ticker"].astype(str).str.upper().str.strip()
     )
     signal_tickers = latest_signals["ticker"].unique().tolist()
 
-    # Load mu/cov for all signal tickers
+    # Load mu/cov
     mu, cov = _load_mu_cov(tickers=signal_tickers)
-    tickers      = list(mu.index)
+    tickers       = list(mu.index)
     ticker_to_idx = {t: i for i, t in enumerate(tickers)}
+    sig_filtered  = latest_signals[latest_signals["ticker"].isin(tickers)].copy()
 
-    sig_filtered = latest_signals[latest_signals["ticker"].isin(tickers)].copy()
+    print(f"\nSignal tickers:    {len(signal_tickers)}")
+    print(f"With mu/cov data:  {len(tickers)}")
+    print(f"Signals used:      {len(sig_filtered)} rows")
 
-    print(f"\nSignal tickers:          {len(signal_tickers)}")
-    print(f"With mu/cov data:        {len(tickers)}")
-    print(f"Signals used:            {len(sig_filtered)} rows")
+    # Load test returns for realized metrics
+    returns_test = load_test_returns()
+    print(f"Test returns:      {len(returns_test)} days "
+          f"({returns_test.index[0].date()} → {returns_test.index[-1].date()})")
 
-    # Baseline
+    # Baseline (unconstrained)
     baseline = _optimize(mu, cov, rf, w_max, lambda_l2)
     baseline_weights = baseline["weights"]
-    print(f"\nBaseline Sharpe: {baseline['sharpe']:.4f} | "
-          f"Return: {baseline['return']*100:.2f}% | "
-          f"Vol: {baseline['vol']*100:.2f}%")
+    baseline_realized = compute_realized_metrics(baseline_weights, returns_test)
+
+    print(f"\nBaseline expected : Sharpe={baseline['sharpe']:.4f} | "
+          f"Return={baseline['return']*100:.2f}% | "
+          f"Vol={baseline['vol']*100:.2f}%")
+    print(f"Baseline realized : Sharpe={baseline_realized['realized_sharpe']:.4f} | "
+          f"Return={baseline_realized['realized_return']*100:.2f}% | "
+          f"Vol={baseline_realized['realized_vol']*100:.2f}%")
 
     # Signal distribution at production defaults
     n_bull_def = (sig_filtered["predicted_positive_probability"] >= 0.60).sum()
     n_bear_def = (sig_filtered["predicted_positive_probability"] <= 0.40).sum()
-    n_neut_def = len(sig_filtered) - n_bull_def - n_bear_def
-    print(f"\nSignal distribution at production defaults (bull>=0.60, bear<=0.40):")
-    print(f"  Bullish: {n_bull_def} | Bearish: {n_bear_def} | Neutral: {n_neut_def}")
+    print(f"\nSignal distribution (bull>=0.60, bear<=0.40): "
+          f"Bullish={n_bull_def} | Bearish={n_bear_def}")
 
+    # ============================================================
     # Grid search
+    # ============================================================
     print(f"\nRunning {n_total} configurations...")
     rows = []
 
@@ -257,78 +255,122 @@ def run_constraint_sensitivity_study(
                     for t in tickers
                 ) / 2.0
 
+                # Realized metrics for this config
+                real = compute_realized_metrics(res["weights"], returns_test)
+
                 rows.append({
-                    "bullish_threshold": bull_thr,
-                    "bearish_threshold": bear_thr,
-                    "delta": delta,
-                    "n_bullish": n_bullish,
-                    "n_bearish": n_bearish,
-                    "n_constrained": n_bullish + n_bearish,
-                    "sharpe": res["sharpe"],
-                    "sharpe_delta": res["sharpe"] - baseline["sharpe"],
-                    "return_pct": res["return"] * 100,
-                    "return_delta_pct": (res["return"] - baseline["return"]) * 100,
-                    "vol_pct": res["vol"] * 100,
-                    "vol_delta_pct": (res["vol"] - baseline["vol"]) * 100,
-                    "turnover": turnover,
-                    "optimizer_success": res["success"],
+                    # config
+                    "bullish_threshold":   bull_thr,
+                    "bearish_threshold":   bear_thr,
+                    "delta":               delta,
+                    "n_bullish":           n_bullish,
+                    "n_bearish":           n_bearish,
+                    "n_constrained":       n_bullish + n_bearish,
+                    "optimizer_success":   res["success"],
+                    "turnover":            turnover,
+                    # expected metrics
+                    "exp_sharpe":          res["sharpe"],
+                    "exp_sharpe_delta":    res["sharpe"] - baseline["sharpe"],
+                    "exp_return_pct":      res["return"] * 100,
+                    "exp_return_delta_pct":(res["return"] - baseline["return"]) * 100,
+                    "exp_vol_pct":         res["vol"] * 100,
+                    "exp_vol_delta_pct":   (res["vol"] - baseline["vol"]) * 100,
+                    # realized metrics
+                    "real_sharpe":         real["realized_sharpe"],
+                    "real_sharpe_delta":   real["realized_sharpe"] - baseline_realized["realized_sharpe"],
+                    "real_return_pct":     real["realized_return"] * 100,
+                    "real_return_delta_pct": (real["realized_return"] - baseline_realized["realized_return"]) * 100,
+                    "real_vol_pct":        real["realized_vol"] * 100,
+                    "real_vol_delta_pct":  (real["realized_vol"] - baseline_realized["realized_vol"]) * 100,
+                    "real_max_dd_pct":     real["realized_max_dd"] * 100,
+                    "real_n_days":         real["realized_n_days"],
                 })
 
     df = pd.DataFrame(rows)
 
-    # Summary
+    # ============================================================
+    # Summary print
+    # ============================================================
     print("\n" + "=" * 70)
-    print("SENSITIVITY RESULTS SUMMARY")
-    print(f"Universe: {len(tickers)} tickers | Baseline Sharpe={baseline['sharpe']:.4f}")
+    print("SENSITIVITY RESULTS — EXPECTED METRICS")
+    print(f"Baseline: Sharpe={baseline['sharpe']:.4f} | "
+          f"Return={baseline['return']*100:.2f}% | "
+          f"Vol={baseline['vol']*100:.2f}%")
     print("=" * 70)
     print(f"Configs tested: {len(df)} | All converged: {df['optimizer_success'].all()}")
+
     failed = df[~df["optimizer_success"]]
     if not failed.empty:
         print(f"  → {len(failed)} configs did not fully converge (results still usable):")
         for _, r in failed.iterrows():
             print(f"    bull={r['bullish_threshold']} bear={r['bearish_threshold']} "
-                  f"delta={r['delta']} ΔS={r['sharpe_delta']:+.4f}")
-    print(f"\nSharpe Δ: mean={df['sharpe_delta'].mean():.4f} | "
-          f"std={df['sharpe_delta'].std():.4f} | "
-          f"range=[{df['sharpe_delta'].min():.4f}, {df['sharpe_delta'].max():.4f}]")
-    print(f"Turnover: mean={df['turnover'].mean():.4f} | "
-          f"std={df['turnover'].std():.4f} | "
-          f"range=[{df['turnover'].min():.4f}, {df['turnover'].max():.4f}]")
+                  f"delta={r['delta']} ΔS={r['exp_sharpe_delta']:+.4f}")
 
-    print("\n--- Effect of delta (averaged over all threshold combinations) ---")
+    print(f"\nExpected ΔSharpe : mean={df['exp_sharpe_delta'].mean():.4f} | "
+          f"std={df['exp_sharpe_delta'].std():.4f} | "
+          f"range=[{df['exp_sharpe_delta'].min():.4f}, {df['exp_sharpe_delta'].max():.4f}]")
+    print(f"Turnover         : mean={df['turnover'].mean()*100:.1f}% | "
+          f"std={df['turnover'].std()*100:.1f}% | "
+          f"range=[{df['turnover'].min()*100:.1f}%, {df['turnover'].max()*100:.1f}%]")
+
+    print("\n--- Effect of delta on EXPECTED metrics ---")
     print(df.groupby("delta")[
-        ["sharpe_delta", "return_delta_pct", "turnover"]
+        ["exp_sharpe_delta", "exp_return_delta_pct", "turnover"]
     ].mean().round(4).to_string())
 
-    print("\n--- Effect of bullish_threshold (averaged over delta) ---")
-    print(df.groupby("bullish_threshold")[
-        ["sharpe_delta", "n_bullish", "turnover"]
+    print("\n" + "=" * 70)
+    print("SENSITIVITY RESULTS — REALIZED METRICS")
+    print(f"Baseline: Sharpe={baseline_realized['realized_sharpe']:.4f} | "
+          f"Return={baseline_realized['realized_return']*100:.2f}% | "
+          f"Vol={baseline_realized['realized_vol']*100:.2f}%")
+    print("=" * 70)
+
+    print(f"\nRealized ΔSharpe : mean={df['real_sharpe_delta'].mean():.4f} | "
+          f"std={df['real_sharpe_delta'].std():.4f} | "
+          f"range=[{df['real_sharpe_delta'].min():.4f}, {df['real_sharpe_delta'].max():.4f}]")
+
+    print("\n--- Effect of delta on REALIZED metrics ---")
+    print(df.groupby("delta")[
+        ["real_sharpe_delta", "real_return_delta_pct", "turnover"]
     ].mean().round(4).to_string())
 
-    print("\n--- Effect of bearish_threshold (averaged over delta) ---")
-    print(df.groupby("bearish_threshold")[
-        ["sharpe_delta", "n_bearish", "turnover"]
-    ].mean().round(4).to_string())
-
-    best  = df.loc[df["sharpe_delta"].idxmax()]
-    worst = df.loc[df["sharpe_delta"].idxmin()]
-    prod  = df[(df["bullish_threshold"] == 0.60) &
-               (df["bearish_threshold"] == 0.40) &
-               (df["delta"] == 0.02)]
-
-    print(f"\nBest config  (ΔS={best['sharpe_delta']:+.4f}): "
-          f"bull={best['bullish_threshold']} bear={best['bearish_threshold']} "
-          f"delta={best['delta']}")
-    print(f"Worst config (ΔS={worst['sharpe_delta']:+.4f}): "
-          f"bull={worst['bullish_threshold']} bear={worst['bearish_threshold']} "
-          f"delta={worst['delta']}")
+    # Production config
+    prod = df[
+        (df["bullish_threshold"] == 0.60) &
+        (df["bearish_threshold"] == 0.40) &
+        (df["delta"] == 0.02)
+    ]
     if not prod.empty:
         p = prod.iloc[0]
-        print(f"\nProduction config (bull=0.60, bear=0.40, delta=0.02): "
-              f"ΔS={p['sharpe_delta']:+.4f} | "
+        print(f"\nProduction config (bull=0.60, bear=0.40, delta=0.02):")
+        print(f"  Expected : ΔS={p['exp_sharpe_delta']:+.4f} | "
               f"Turnover={p['turnover']*100:.1f}% | "
               f"#Bull={int(p['n_bullish'])} #Bear={int(p['n_bearish'])}")
+        print(f"  Realized : ΔS={p['real_sharpe_delta']:+.4f} | "
+              f"Return={p['real_return_pct']:.2f}% | "
+              f"Vol={p['real_vol_pct']:.2f}%")
 
+    best_exp  = df.loc[df["exp_sharpe_delta"].idxmax()]
+    worst_exp = df.loc[df["exp_sharpe_delta"].idxmin()]
+    best_real  = df.loc[df["real_sharpe_delta"].idxmax()]
+    worst_real = df.loc[df["real_sharpe_delta"].idxmin()]
+
+    print(f"\nBest expected  (ΔS={best_exp['exp_sharpe_delta']:+.4f}): "
+          f"bull={best_exp['bullish_threshold']} bear={best_exp['bearish_threshold']} "
+          f"delta={best_exp['delta']}")
+    print(f"Worst expected (ΔS={worst_exp['exp_sharpe_delta']:+.4f}): "
+          f"bull={worst_exp['bullish_threshold']} bear={worst_exp['bearish_threshold']} "
+          f"delta={worst_exp['delta']}")
+    print(f"\nBest realized  (ΔS={best_real['real_sharpe_delta']:+.4f}): "
+          f"bull={best_real['bullish_threshold']} bear={best_real['bearish_threshold']} "
+          f"delta={best_real['delta']}")
+    print(f"Worst realized (ΔS={worst_real['real_sharpe_delta']:+.4f}): "
+          f"bull={worst_real['bullish_threshold']} bear={worst_real['bearish_threshold']} "
+          f"delta={worst_real['delta']}")
+
+    # ============================================================
+    # Save outputs
+    # ============================================================
     if save_outputs:
         csv_path = OUT_DIR / "constraint_sensitivity_results.csv"
         df.to_csv(csv_path, index=False)
@@ -338,6 +380,7 @@ def run_constraint_sensitivity_study(
             "parameters": {
                 "rf": rf, "w_max": w_max, "lambda_l2": lambda_l2,
                 "universe_size": len(tickers),
+                "signals_file": str(signals_path),
                 "min_baseline_weight_filter": MIN_BASELINE_WEIGHT,
                 "grid": {
                     "bullish_thresholds": BULLISH_THRESHOLDS,
@@ -346,17 +389,28 @@ def run_constraint_sensitivity_study(
                 },
             },
             "baseline": {
-                "return": baseline["return"],
-                "vol": baseline["vol"],
-                "sharpe": baseline["sharpe"],
+                "expected_sharpe": baseline["sharpe"],
+                "expected_return": baseline["return"],
+                "expected_vol": baseline["vol"],
+                "realized_sharpe": baseline_realized["realized_sharpe"],
+                "realized_return": baseline_realized["realized_return"],
+                "realized_vol": baseline_realized["realized_vol"],
+                "realized_max_dd": baseline_realized["realized_max_dd"],
+                "realized_n_days": baseline_realized["realized_n_days"],
             },
             "n_configs": len(df),
             "all_converged": bool(df["optimizer_success"].all()),
-            "sharpe_delta": {
-                "mean": float(df["sharpe_delta"].mean()),
-                "std":  float(df["sharpe_delta"].std()),
-                "min":  float(df["sharpe_delta"].min()),
-                "max":  float(df["sharpe_delta"].max()),
+            "expected_sharpe_delta": {
+                "mean": float(df["exp_sharpe_delta"].mean()),
+                "std":  float(df["exp_sharpe_delta"].std()),
+                "min":  float(df["exp_sharpe_delta"].min()),
+                "max":  float(df["exp_sharpe_delta"].max()),
+            },
+            "realized_sharpe_delta": {
+                "mean": float(df["real_sharpe_delta"].mean()),
+                "std":  float(df["real_sharpe_delta"].std()),
+                "min":  float(df["real_sharpe_delta"].min()),
+                "max":  float(df["real_sharpe_delta"].max()),
             },
             "turnover": {
                 "mean": float(df["turnover"].mean()),
@@ -364,22 +418,13 @@ def run_constraint_sensitivity_study(
                 "min":  float(df["turnover"].min()),
                 "max":  float(df["turnover"].max()),
             },
-            "return_delta_pct": {
-                "mean": float(df["return_delta_pct"].mean()),
-                "std":  float(df["return_delta_pct"].std()),
-            },
             "production_config": {
                 "bullish_threshold": 0.60,
                 "bearish_threshold": 0.40,
                 "delta": 0.02,
-                "sharpe_delta": float(prod.iloc[0]["sharpe_delta"]) if not prod.empty else None,
+                "expected_sharpe_delta": float(prod.iloc[0]["exp_sharpe_delta"]) if not prod.empty else None,
+                "realized_sharpe_delta": float(prod.iloc[0]["real_sharpe_delta"]) if not prod.empty else None,
                 "turnover": float(prod.iloc[0]["turnover"]) if not prod.empty else None,
-            },
-            "best_config": {
-                "bullish_threshold": float(best["bullish_threshold"]),
-                "bearish_threshold": float(best["bearish_threshold"]),
-                "delta": float(best["delta"]),
-                "sharpe_delta": float(best["sharpe_delta"]),
             },
         }
 
@@ -388,12 +433,10 @@ def run_constraint_sensitivity_study(
             json.dump(summary, f, indent=2)
         print(f"[Saved] {json_path}")
 
-    return {"df": df, "baseline": baseline, "summary": summary}
+    return {"df": df, "baseline": baseline, "baseline_realized": baseline_realized}
 
 
 if __name__ == "__main__":
-    # Uses ALL tickers from signals file intersected with mu/cov.
-    # No hardcoded ticker list — full 101-ticker universe.
     run_constraint_sensitivity_study(
         signals_path=SIGNALS_PATH,
         rf=0.02,

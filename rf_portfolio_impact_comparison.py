@@ -1,19 +1,11 @@
 # rf_portfolio_impact_comparison.py
 # ============================================================
 # PURPOSE: Compare RF vs LR portfolio-level impact
-# Hoca sorusu: "RF sinyalleriyle portfolio yaptığında ne olur?"
-#
-# Her iki model için:
-#   1. all_features feature set kullanılır (production)
-#   2. Model eğitilir, latest signals üretilir
-#   3. Constraints build edilir
-#   4. Portfolio optimize edilir
-#   5. ΔSharpe, ΔReturn, ΔVol, Turnover, #Bull, #Bear raporlanır
-#
-# Standalone — mevcut kodlara dokunmaz.
+# 5-run mean±std version (no fixed seeds — probabilistic)
+# ✅ look-ahead bias fix: latest_dataset capped at SIGNAL_CUTOFF
 # ============================================================
 from __future__ import annotations
-
+from realized_eval import compute_realized_metrics, load_test_returns
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -29,12 +21,16 @@ from sklearn.preprocessing import StandardScaler
 # CONFIG
 # ============================================================
 
-RAW_PATH  = "data/news_prediction/news_timeseries_dataset_raw_h7_alltickers_v2_enrichedd.csv"
-MU_PATH   = Path("data/processed_yahoo/summary_per_asset_annual.csv")
-COV_PATH  = Path("data/processed_yahoo/cov_annual.csv")
-OUT_DIR   = Path("data/ablation_study")
+RAW_PATH      = "data/news_prediction/news_timeseries_dataset_raw_h7_alltickers_v2_enrichedd.csv"
+MU_PATH       = Path("data/processed_yahoo/summary_per_asset_annual.csv")
+COV_PATH      = Path("data/processed_yahoo/cov_annual.csv")
+OUT_DIR       = Path("data/ablation_study")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
+# ✅ look-ahead bias fix: signals must be available before test period
+SIGNAL_CUTOFF = pd.Timestamp("2026-01-14")
+
+N_RUNS            = 5
 RF_RATE           = 0.02
 W_MAX             = 0.30
 LAMBDA_L2         = 1e-3
@@ -43,7 +39,6 @@ BEARISH_THRESHOLD = 0.40
 DELTA             = 0.02
 MIN_BASELINE_W    = 1e-3
 
-# Production feature set — all 14 features
 FEATURE_COLS = [
     "article_count",
     "weighted_sentiment",
@@ -115,10 +110,11 @@ def _optimize(mu, cov, rf, w_max, lambda_l2, extra_constraints=None):
 
 
 # ============================================================
-# Dataset builder (same as news_model_feature_ablation.py)
+# Dataset builders
 # ============================================================
 
 def _build_dataset(raw_path: str) -> pd.DataFrame:
+    """Training dataset with tau=0.02 filter."""
     df = pd.read_csv(raw_path)
     df["news_date_dt"] = pd.to_datetime(df["news_date"], errors="coerce")
     df = df.dropna(subset=[
@@ -141,9 +137,9 @@ def _build_dataset(raw_path: str) -> pd.DataFrame:
         weights = g["article_confidence"].astype(float)
         w_sum = float(weights.sum())
 
-        def wmean(col):
-            vals = g[col].astype(float)
-            return float(np.average(vals, weights=weights)) if w_sum > 0 else float(vals.mean())
+        def wmean(col, _g=g, _w=weights, _ws=w_sum):
+            vals = _g[col].astype(float)
+            return float(np.average(vals, weights=_w)) if _ws > 0 else float(vals.mean())
 
         grouped_rows.append({
             "ticker": ticker,
@@ -183,8 +179,74 @@ def _build_dataset(raw_path: str) -> pd.DataFrame:
     return out
 
 
+def _build_latest_dataset(raw_path: str) -> pd.DataFrame:
+    """
+    Unfiltered dataset for latest signal generation (tau=None).
+    ✅ look-ahead bias fix: capped at SIGNAL_CUTOFF (2026-01-14).
+    """
+    df_raw = pd.read_csv(raw_path)
+    df_raw["news_date_dt"] = pd.to_datetime(df_raw["news_date"], errors="coerce")
+    df_raw = df_raw.dropna(subset=[
+        "news_date_dt", "ticker", "future_return",
+        "article_sentiment", "article_confidence",
+        "prob_positive", "prob_negative", "prob_neutral",
+        "combined_weight", "past_5d_return",
+        "past_20d_return", "past_20d_volatility",
+    ]).copy()
+
+    df_raw["ticker"] = df_raw["ticker"].astype(str).str.upper().str.strip()
+
+    # ✅ look-ahead bias fix: only use signals available before test period
+    df_raw = df_raw[df_raw["news_date_dt"] <= SIGNAL_CUTOFF].copy()
+
+    df_raw["is_positive_article"] = (df_raw["prob_positive"] > df_raw["prob_negative"]).astype(int)
+    df_raw["is_negative_article"] = (df_raw["prob_negative"] > df_raw["prob_positive"]).astype(int)
+    df_raw["sentiment_confidence"] = df_raw["article_sentiment"] * df_raw["article_confidence"]
+
+    grouped_rows = []
+    for (ticker, news_date, news_date_dt), g in df_raw.groupby(
+        ["ticker", "news_date", "news_date_dt"]
+    ):
+        weights_g = g["article_confidence"].astype(float)
+        w_sum = float(weights_g.sum())
+
+        def wmean(col, _g=g, _w=weights_g, _ws=w_sum):
+            vals = _g[col].astype(float)
+            return float(np.average(vals, weights=_w)) if _ws > 0 else float(vals.mean())
+
+        grouped_rows.append({
+            "ticker": ticker, "news_date": news_date, "news_date_dt": news_date_dt,
+            "article_count": int(len(g)),
+            "weighted_sentiment": wmean("article_sentiment"),
+            "sentiment_std": float(g["article_sentiment"].std()) if len(g) > 1 else 0.0,
+            "mean_confidence": float(g["article_confidence"].mean()),
+            "positive_ratio": float(g["is_positive_article"].mean()),
+            "negative_ratio": float(g["is_negative_article"].mean()),
+            "mean_sentiment_confidence": float(g["sentiment_confidence"].mean()),
+            "past_5d_return": float(g["past_5d_return"].mean()),
+            "past_20d_return": float(g["past_20d_return"].mean()),
+            "past_20d_volatility": float(g["past_20d_volatility"].mean()),
+            "future_return": float(g["future_return"].mean()),
+        })
+
+    latest = pd.DataFrame(grouped_rows)
+    latest = latest.sort_values(["ticker", "news_date_dt"]).reset_index(drop=True)
+
+    flow_parts = []
+    for ticker, g in latest.groupby("ticker"):
+        g = g.sort_values("news_date_dt").copy()
+        for w in [5, 20]:
+            g[f"sentiment_flow_{w}d"] = g["weighted_sentiment"].shift(1).rolling(w, min_periods=1).mean()
+            g[f"confidence_flow_{w}d"] = g["mean_confidence"].shift(1).rolling(w, min_periods=1).mean()
+        flow_parts.append(g)
+
+    latest = pd.concat(flow_parts, ignore_index=True).dropna().reset_index(drop=True)
+    latest["target_direction"] = (latest["future_return"] > 0).astype(int)
+    return latest
+
+
 # ============================================================
-# Train model → get latest probabilities
+# Train model → get latest probabilities (single run)
 # ============================================================
 
 def _train_and_get_probs(
@@ -194,11 +256,6 @@ def _train_and_get_probs(
     test_size: float = 0.30,
     latest_dataset: Optional[pd.DataFrame] = None,
 ) -> Optional[Dict]:
-    """
-    Train on filtered dataset (tau=0.02).
-    Generate latest signals from unfiltered dataset (tau=None),
-    matching production inference flow exactly.
-    """
     available = [f for f in FEATURE_COLS if f in dataset.columns]
     if not available:
         return None
@@ -239,7 +296,6 @@ def _train_and_get_probs(
     roc_auc = float(roc_auc_score(y_test, proba_test)) if y_test.nunique() == 2 else None
     bal_acc = float(balanced_accuracy_score(y_test, pred_test))
 
-    # Latest signals from UNFILTERED dataset (production style)
     latest_source = latest_dataset if latest_dataset is not None else df
     latest_df = latest_source.dropna(
         subset=available + ["target_direction", "news_date_dt", "ticker"]
@@ -261,11 +317,7 @@ def _train_and_get_probs(
         p = float(model.predict_proba(latest_row[feat_cols].astype(float))[0, 1])
         probs[ticker] = p
 
-    return {
-        "roc_auc": roc_auc,
-        "bal_acc": bal_acc,
-        "probs": probs,
-    }
+    return {"roc_auc": roc_auc, "bal_acc": bal_acc, "probs": probs}
 
 
 # ============================================================
@@ -284,7 +336,6 @@ def _probs_to_portfolio_impact(
     tickers = list(mu.index)
     ticker_to_idx = {t: i for i, t in enumerate(tickers)}
 
-    # Build constraints (same logic as news_constraint_integration.py)
     news_constraints = {}
     for ticker, prob in probs.items():
         if ticker not in baseline_weights:
@@ -333,11 +384,36 @@ def _probs_to_portfolio_impact(
         "n_bullish": n_bull,
         "n_bearish": n_bear,
         "n_constraints": n_bull + n_bear,
+        "weights": constrained["weights"],
     }
 
 
 # ============================================================
-# Main comparison
+# Aggregate 5 runs → mean ± std
+# ============================================================
+
+def _aggregate_runs(model_name: str, run_results: List[Dict]) -> Dict:
+    if not run_results:
+        return {"model": model_name, "n_runs": 0}
+
+    metrics = [
+        "roc_auc", "bal_acc", "prob_std",
+        "sharpe_delta", "return_delta", "vol_delta",
+        "turnover", "n_constraints", "n_bullish", "n_bearish",
+        "realized_sharpe", "realized_return", "realized_vol", "realized_max_dd",
+    ]
+
+    out: Dict[str, Any] = {"model": model_name, "n_runs": len(run_results)}
+    for m in metrics:
+        vals = [r[m] for r in run_results if m in r and r[m] is not None]
+        if vals:
+            out[f"{m}_mean"] = float(np.mean(vals))
+            out[f"{m}_std"]  = float(np.std(vals))
+    return out
+
+
+# ============================================================
+# Main
 # ============================================================
 
 def run_rf_vs_lr_portfolio_impact(
@@ -347,234 +423,215 @@ def run_rf_vs_lr_portfolio_impact(
 ) -> Dict[str, Any]:
 
     print("\n" + "=" * 70)
-    print("RF vs LR — PORTFOLIO-LEVEL IMPACT COMPARISON")
-    print("Feature set: all_features (14 features, production)")
+    print("RF vs LR — PORTFOLIO-LEVEL IMPACT COMPARISON (5-run mean±std)")
+    print(f"N_RUNS={N_RUNS} | No fixed seeds (probabilistic)")
     print(f"bull>={BULLISH_THRESHOLD}, bear<={BEARISH_THRESHOLD}, delta={DELTA}")
+    print(f"✅ Signal cutoff: {SIGNAL_CUTOFF.date()} (no look-ahead bias)")
     print("=" * 70)
 
     # Load portfolio data
     mu, cov = _load_mu_cov()
     tickers = list(mu.index)
     baseline = _optimize(mu, cov, RF_RATE, W_MAX, LAMBDA_L2)
+    returns_test = load_test_returns()
     baseline_weights = baseline["weights"]
+
     print(f"\nUniverse: {len(tickers)} tickers")
-    print(f"Baseline: Sharpe={baseline['sharpe']:.4f} | "
+    print(f"Baseline (expected): Sharpe={baseline['sharpe']:.4f} | "
           f"Return={baseline['return']*100:.2f}% | "
           f"Vol={baseline['vol']*100:.2f}%")
 
-    # Build datasets
+    # Build datasets once (deterministic)
     print("\nBuilding datasets...")
-    dataset = _build_dataset(raw_path)  # tau=0.02 for training
-    # unfiltered for latest signal generation
-    df_raw = pd.read_csv(raw_path)
-    df_raw["news_date_dt"] = pd.to_datetime(df_raw["news_date"], errors="coerce")
-    df_raw = df_raw.dropna(subset=[
-        "news_date_dt", "ticker", "future_return",
-        "article_sentiment", "article_confidence",
-        "prob_positive", "prob_negative", "prob_neutral",
-        "combined_weight", "past_5d_return",
-        "past_20d_return", "past_20d_volatility",
-    ]).copy()
-    df_raw["ticker"] = df_raw["ticker"].astype(str).str.upper().str.strip()
-    df_raw["is_positive_article"] = (df_raw["prob_positive"] > df_raw["prob_negative"]).astype(int)
-    df_raw["is_negative_article"] = (df_raw["prob_negative"] > df_raw["prob_positive"]).astype(int)
-    df_raw["sentiment_confidence"] = df_raw["article_sentiment"] * df_raw["article_confidence"]
-    grouped_rows = []
-    for (ticker, news_date, news_date_dt), g in df_raw.groupby(
-        ["ticker", "news_date", "news_date_dt"]
-    ):
-        weights_g = g["article_confidence"].astype(float)
-        w_sum = float(weights_g.sum())
-        def wmean(col, _g=g, _w=weights_g, _ws=w_sum):
-            vals = _g[col].astype(float)
-            return float(np.average(vals, weights=_w)) if _ws > 0 else float(vals.mean())
-        grouped_rows.append({
-            "ticker": ticker, "news_date": news_date, "news_date_dt": news_date_dt,
-            "article_count": int(len(g)),
-            "weighted_sentiment": wmean("article_sentiment"),
-            "sentiment_std": float(g["article_sentiment"].std()) if len(g) > 1 else 0.0,
-            "mean_confidence": float(g["article_confidence"].mean()),
-            "positive_ratio": float(g["is_positive_article"].mean()),
-            "negative_ratio": float(g["is_negative_article"].mean()),
-            "mean_sentiment_confidence": float(g["sentiment_confidence"].mean()),
-            "past_5d_return": float(g["past_5d_return"].mean()),
-            "past_20d_return": float(g["past_20d_return"].mean()),
-            "past_20d_volatility": float(g["past_20d_volatility"].mean()),
-            "future_return": float(g["future_return"].mean()),
-        })
-    latest_dataset = pd.DataFrame(grouped_rows)
-    latest_dataset = latest_dataset.sort_values(["ticker", "news_date_dt"]).reset_index(drop=True)
-    flow_parts = []
-    for ticker, g in latest_dataset.groupby("ticker"):
-        g = g.sort_values("news_date_dt").copy()
-        for w in [5, 20]:
-            g[f"sentiment_flow_{w}d"] = g["weighted_sentiment"].shift(1).rolling(w, min_periods=1).mean()
-            g[f"confidence_flow_{w}d"] = g["mean_confidence"].shift(1).rolling(w, min_periods=1).mean()
-        flow_parts.append(g)
-    latest_dataset = pd.concat(flow_parts, ignore_index=True).dropna().reset_index(drop=True)
-    latest_dataset["target_direction"] = (latest_dataset["future_return"] > 0).astype(int)
+    dataset        = _build_dataset(raw_path)
+    latest_dataset = _build_latest_dataset(raw_path)
 
-    print(f"Training dataset: {len(dataset)} rows (tau=0.02)")
-    print(f"Latest-signal dataset: {len(latest_dataset)} rows (tau=None)")
+    print(f"Training dataset : {len(dataset)} rows (tau=0.02)")
+    print(f"Latest dataset   : {len(latest_dataset)} rows (tau=None, capped at {SIGNAL_CUTOFF.date()})")
+    print(f"Latest dataset max date: {latest_dataset['news_date_dt'].max().date()}")
 
-    # Model factories
+    # Baseline realized
+    baseline_realized = compute_realized_metrics(baseline_weights, returns_test)
+
+    # Model factories — NO random_state (probabilistic)
     lr_factory = lambda: Pipeline([
         ("scaler", StandardScaler()),
         ("clf", LogisticRegression(
-            max_iter=2000, class_weight="balanced",
-            C=0.3, random_state=42,
+            max_iter=2000, class_weight="balanced", C=0.3,
         )),
     ])
     rf_factory = lambda: RandomForestClassifier(
         n_estimators=500, max_depth=6, min_samples_leaf=10,
-        class_weight="balanced_subsample", random_state=42, n_jobs=-1,
+        class_weight="balanced_subsample", n_jobs=-1,
     )
 
     models = {
-        "LR (C=0.3)": lr_factory,
+        "LR (C=0.3)":   lr_factory,
         "RF (depth=6)": rf_factory,
     }
 
-    rows = []
-    prob_distributions = {}
+    summary_rows = []
+    all_run_rows  = []
 
     for model_name, factory in models.items():
-        print(f"\n→ {model_name}")
-        result = _train_and_get_probs(
-            dataset=dataset,
-            model_factory=factory,
-            portfolio_tickers=tickers,
-            test_size=test_size,
-            latest_dataset=latest_dataset,
-        )
-        if result is None:
-            print("  FAILED")
-            continue
+        print(f"\n{'─'*60}")
+        print(f"Model: {model_name}")
+        print(f"{'─'*60}")
 
-        probs = result["probs"]
-        roc_auc = result["roc_auc"]
-        bal_acc = result["bal_acc"]
+        run_results = []
 
-        # Probability distribution analysis
-        prob_values = list(probs.values())
-        n_bull = sum(1 for p in prob_values if p >= BULLISH_THRESHOLD)
-        n_bear = sum(1 for p in prob_values if p <= BEARISH_THRESHOLD)
-        n_neut = len(prob_values) - n_bull - n_bear
-        prob_mean = float(np.mean(prob_values))
-        prob_std  = float(np.std(prob_values))
+        for run_idx in range(N_RUNS):
+            print(f"  Run {run_idx+1}/{N_RUNS} ...", end=" ", flush=True)
 
-        prob_distributions[model_name] = {
-            "mean": prob_mean,
-            "std": prob_std,
-            "n_bullish_raw": n_bull,
-            "n_bearish_raw": n_bear,
-            "n_neutral_raw": n_neut,
-        }
+            result = _train_and_get_probs(
+                dataset=dataset,
+                model_factory=factory,
+                portfolio_tickers=tickers,
+                test_size=test_size,
+                latest_dataset=latest_dataset,
+            )
+            if result is None:
+                print("FAILED")
+                continue
 
-        print(f"  ROC-AUC={roc_auc:.4f} | Bal.Acc={bal_acc:.4f}")
-        print(f"  Prob distribution: mean={prob_mean:.3f} std={prob_std:.3f}")
-        print(f"  Raw signals: #Bull={n_bull} #Bear={n_bear} #Neutral={n_neut}")
+            probs   = result["probs"]
+            roc_auc = result["roc_auc"]
+            bal_acc = result["bal_acc"]
 
-        impact = _probs_to_portfolio_impact(
-            probs=probs,
-            mu=mu, cov=cov,
-            baseline_weights=baseline_weights,
-            baseline_sharpe=baseline["sharpe"],
-            baseline_return=baseline["return"],
-            baseline_vol=baseline["vol"],
-        )
+            prob_values = list(probs.values())
+            prob_std    = float(np.std(prob_values))
 
-        print(f"  ΔSharpe={impact['sharpe_delta']:+.4f} | "
-              f"ΔReturn={impact['return_delta']*100:+.2f}% | "
-              f"Turnover={impact['turnover']*100:.1f}% | "
-              f"#Bull={impact['n_bullish']} #Bear={impact['n_bearish']}")
+            impact = _probs_to_portfolio_impact(
+                probs=probs,
+                mu=mu, cov=cov,
+                baseline_weights=baseline_weights,
+                baseline_sharpe=baseline["sharpe"],
+                baseline_return=baseline["return"],
+                baseline_vol=baseline["vol"],
+            )
 
-        rows.append({
-            "model": model_name,
-            "roc_auc": roc_auc,
-            "bal_acc": bal_acc,
-            "prob_mean": prob_mean,
-            "prob_std": prob_std,
-            "n_signals_raw": n_bull + n_bear,
-            **impact,
-        })
+            realized = compute_realized_metrics(impact["weights"], returns_test)
 
-    # Print results table
+            run_row = {
+                "model": model_name,
+                "run": run_idx + 1,
+                "roc_auc": roc_auc,
+                "bal_acc": bal_acc,
+                "prob_std": prob_std,
+                **{k: v for k, v in impact.items() if k != "weights"},
+                "realized_sharpe": realized["realized_sharpe"],
+                "realized_return": realized["realized_return"],
+                "realized_vol":    realized["realized_vol"],
+                "realized_max_dd": realized["realized_max_dd"],
+                "realized_n_days": realized["realized_n_days"],
+            }
+            run_results.append(run_row)
+            all_run_rows.append(run_row)
+
+            print(f"ROC-AUC={roc_auc:.4f} | ΔS={impact['sharpe_delta']:+.4f} | "
+                  f"#C={impact['n_constraints']} | TO={impact['turnover']*100:.1f}%")
+
+        summary = _aggregate_runs(model_name, run_results)
+        summary_rows.append(summary)
+
+    # ============================================================
+    # Print summary table
+    # ============================================================
     print(f"\n\n{'='*70}")
-    print("RF vs LR — PORTFOLIO IMPACT TABLE")
-    print(f"Baseline: Sharpe={baseline['sharpe']:.4f} | "
-          f"Return={baseline['return']*100:.2f}% | "
-          f"Vol={baseline['vol']*100:.2f}%")
+    print(f"SUMMARY TABLE — mean ± std over {N_RUNS} runs")
+    print(f"✅ Signal cutoff: {SIGNAL_CUTOFF.date()} (no look-ahead bias)")
     print(f"{'='*70}")
 
-    col = 10
-    header = (
-        f"{'Model':<16}"
-        f"{'ROC-AUC':>{col}}"
-        f"{'Prob Std':>{col}}"
-        f"{'#Const':>{col}}"
-        f"{'ΔSharpe':>{col}}"
-        f"{'ΔReturn':>{col}}"
-        f"{'Turnover':>{col}}"
-    )
-    print(header)
-    print("-" * len(header))
+    col = 18
+    print(f"\n{'Model':<16} {'ROC-AUC':>{col}} {'Prob Std':>{col}} "
+          f"{'#Const':>{col}} {'ΔSharpe':>{col}} {'ΔReturn':>{col}} {'Turnover':>{col}}")
+    print("─" * (16 + col * 6 + 6))
+
+    print(f"{'Baseline':<16} {'—':>{col}} {'—':>{col}} "
+          f"{'0':>{col}} {'+0.000±0.000':>{col}} {'+0.00%±0.00%':>{col}} {'0.0%±0.0%':>{col}}")
+
+    for s in summary_rows:
+        def fmt_mean_std(key, pct=False, digits=3):
+            m = s.get(f"{key}_mean")
+            d = s.get(f"{key}_std")
+            if m is None:
+                return "—"
+            if pct:
+                return f"{m*100:+.2f}%±{d*100:.2f}%"
+            return f"{m:+.{digits}f}±{d:.{digits}f}"
+
+        def fmt_int(key):
+            m = s.get(f"{key}_mean")
+            d = s.get(f"{key}_std")
+            if m is None:
+                return "—"
+            return f"{m:.1f}±{d:.1f}"
+
+        print(
+            f"{s['model']:<16}"
+            f" {fmt_mean_std('roc_auc', digits=4):>{col}}"
+            f" {fmt_mean_std('prob_std', digits=4):>{col}}"
+            f" {fmt_int('n_constraints'):>{col}}"
+            f" {fmt_mean_std('sharpe_delta', digits=3):>{col}}"
+            f" {fmt_mean_std('return_delta', pct=True):>{col}}"
+            f" {fmt_mean_std('turnover', pct=True):>{col}}"
+        )
+
+    print(f"\n\n{'='*70}")
+    print(f"REALIZED METRICS — mean ± std over {N_RUNS} runs")
+    print(f"(test period: 2026-01-15 → 2026-05-22)")
+    print(f"{'='*70}")
+
+    print(f"\n{'Model':<16} {'Real.Sharpe':>{col}} {'Real.Return':>{col}} "
+          f"{'Real.Vol':>{col}} {'Real.MaxDD':>{col}}")
+    print("─" * (16 + col * 4 + 4))
+
     print(
         f"{'Baseline':<16}"
-        f"{'—':>{col}}"
-        f"{'—':>{col}}"
-        f"{'0':>{col}}"
-        f"{'+0.0000':>{col}}"
-        f"{'+0.00%':>{col}}"
-        f"{'0.0%':>{col}}"
+        f" {baseline_realized['realized_sharpe']:>{col}.4f}"
+        f" {baseline_realized['realized_return']*100:>{col}.2f}%"
+        f" {baseline_realized['realized_vol']*100:>{col}.2f}%"
+        f" {baseline_realized['realized_max_dd']*100:>{col}.2f}%"
     )
-    for r in rows:
+
+    for s in summary_rows:
+        def fmt_r(key, pct=False, digits=4):
+            m = s.get(f"{key}_mean")
+            d = s.get(f"{key}_std")
+            if m is None:
+                return "—"
+            if pct:
+                return f"{m*100:.2f}%±{d*100:.2f}%"
+            return f"{m:.{digits}f}±{d:.{digits}f}"
+
         print(
-            f"{r['model']:<16}"
-            f"{r['roc_auc']:>{col}.4f}"
-            f"{r['prob_std']:>{col}.4f}"
-            f"{r['n_constraints']:>{col}}"
-            f"{r['sharpe_delta']:>+{col}.4f}"
-            f"{r['return_delta']*100:>+{col}.2f}%"
-            f"{r['turnover']*100:>{col}.1f}%"
+            f"{s['model']:<16}"
+            f" {fmt_r('realized_sharpe'):>{col}}"
+            f" {fmt_r('realized_return', pct=True):>{col}}"
+            f" {fmt_r('realized_vol', pct=True):>{col}}"
+            f" {fmt_r('realized_max_dd', pct=True):>{col}}"
         )
 
-    # Key insight
-    print(f"\n{'='*70}")
-    print("KEY FINDING")
-    print(f"{'='*70}")
-    lr_row = next((r for r in rows if "LR" in r["model"]), None)
-    rf_row = next((r for r in rows if "RF" in r["model"]), None)
+    # ============================================================
+    # Save outputs
+    # ============================================================
+    if save_outputs:
+        if all_run_rows:
+            df_runs = pd.DataFrame(all_run_rows)
+            p = OUT_DIR / "rf_vs_lr_all_runs.csv"
+            df_runs.to_csv(p, index=False)
+            print(f"\n[Saved] {p}")
 
-    if lr_row and rf_row:
-        print(f"\nLR probability std = {lr_row['prob_std']:.4f} "
-              f"(spreads across [0,1], reaches thresholds)")
-        print(f"RF probability std = {rf_row['prob_std']:.4f} "
-              f"(clusters near 0.5, rarely reaches thresholds)")
-        print(f"\nLR active constraints: {lr_row['n_constraints']} "
-              f"(#Bull={lr_row['n_bullish']}, #Bear={lr_row['n_bearish']})")
-        print(f"RF active constraints: {rf_row['n_constraints']} "
-              f"(#Bull={rf_row['n_bullish']}, #Bear={rf_row['n_bearish']})")
-
-        if rf_row['n_constraints'] == 0:
-            print("\nRF produces ZERO active constraints → portfolio identical to baseline.")
-            print("This confirms that RF's poor probability calibration makes it")
-            print("ineffective as a constraint generator, regardless of ROC-AUC.")
-        else:
-            constraint_ratio = rf_row['n_constraints'] / max(lr_row['n_constraints'], 1)
-            print(f"\nRF generates {constraint_ratio:.1%} as many constraints as LR.")
-
-    # Save
-    if save_outputs and rows:
-        df_out = pd.DataFrame(rows)
-        csv_path = OUT_DIR / "rf_vs_lr_portfolio_impact.csv"
-        df_out.to_csv(csv_path, index=False)
-        print(f"\n[Saved] {csv_path}")
+        if summary_rows:
+            df_summary = pd.DataFrame(summary_rows)
+            p = OUT_DIR / "rf_vs_lr_summary.csv"
+            df_summary.to_csv(p, index=False)
+            print(f"[Saved] {p}")
 
     return {
-        "rows": rows,
+        "summary_rows": summary_rows,
         "baseline": baseline,
-        "prob_distributions": prob_distributions,
+        "baseline_realized": baseline_realized,
     }
 
 
