@@ -790,21 +790,53 @@ class LLMClient:
                 refine_obj = str(((payload.get("refine") or {}).get("objective")) or "").strip()
                 base_obj = str(((payload.get("base") or {}).get("objective")) or "").strip()
 
+                refine_metrics = _safe_dict((payload.get("refine") or {}).get("metrics"))
+                base_metrics = _safe_dict((payload.get("base") or {}).get("metrics"))
+
+                def _pct_str(m: Dict[str, Any], key_pct: str, key_dec: str) -> str:
+                    v = _safe_float(m.get(key_pct))
+                    if v is not None:
+                        return f"{v:.2f}%"
+                    v = _safe_float(m.get(key_dec))
+                    if v is not None:
+                        return f"{v * 100:.2f}%"
+                    return "unknown"
+
+                final_return_str = _pct_str(refine_metrics, "return_pct", "return")
+                final_vol_str = _pct_str(refine_metrics, "vol_pct", "vol")
+                final_sharpe_str = str(_safe_float(refine_metrics.get("sharpe")) or "unknown")
+                final_maxw_str = _pct_str(refine_metrics, "max_weight_pct", "max_weight")
+
+                base_return_str = _pct_str(base_metrics, "return_pct", "return")
+                base_vol_str = _pct_str(base_metrics, "vol_pct", "vol")
+                base_sharpe_str = str(_safe_float(base_metrics.get("sharpe")) or "unknown")
+
                 user = (
-                    f"Final selected portfolio objective: {refine_obj}\n"
-                    f"Base portfolio objective: {base_obj}\n"
-                    "Important: the FINAL selected portfolio must be described using the FINAL selected objective, not the base objective.\n"
-                    "If the final selected objective is minvar, describe the portfolio as focused on reducing volatility / smoother risk.\n"
-                    "If the final selected objective is maxsharpe, describe the portfolio as focused on maximizing return per unit of risk.\n"
+                    f"THE FINAL SELECTED PORTFOLIO (this is what you must describe as 'this portfolio' / 'the final portfolio'):\n"
+                    f"- objective: {refine_obj}\n"
+                    f"- expected annual return: {final_return_str}\n"
+                    f"- volatility: {final_vol_str}\n"
+                    f"- Sharpe ratio: {final_sharpe_str}\n"
+                    f"- max weight: {final_maxw_str}\n"
+                    "\n"
+                    f"THE BASE PORTFOLIO (only use these numbers when explicitly comparing 'compared to the base portfolio'):\n"
+                    f"- objective: {base_obj}\n"
+                    f"- expected annual return: {base_return_str}\n"
+                    f"- volatility: {base_vol_str}\n"
+                    f"- Sharpe ratio: {base_sharpe_str}\n"
+                    "\n"
+                    "CRITICAL: Every sentence that describes 'this portfolio', 'the final portfolio', or "
+                    "'the selected portfolio' MUST use ONLY the FINAL SELECTED PORTFOLIO numbers above. "
+                    "Never use the BASE PORTFOLIO numbers except inside an explicit before/after comparison sentence.\n"
+                    "\n"
                     "Important wording rules:\n"
                     "- Use 'expected annual return', not 'target return'.\n"
                     "- Do not describe Sharpe as a percent return.\n"
                     "- If volatility change is near zero, say it stayed almost unchanged.\n"
-                    "Here is the final portfolio insight payload as JSON.\n"
-                    "Write the final user-facing portfolio insight now.\n\n"
+                    "\n"
+                    "Here is the full payload as JSON for additional context (holdings, risk drivers, news overlay):\n\n"
                     + json.dumps(payload, ensure_ascii=False)
-)
-
+                )
                 return {"system": system, "developer": developer, "user": user}
 
             system = (

@@ -337,9 +337,9 @@ def _render_confusion_matrix_heatmap(metrics: Dict[str, Any]):
 
     fig.update_layout(
         title="Confusion Matrix",
-        paper_bgcolor="#0b1020",
-        plot_bgcolor="#0b1020",
-        font=dict(color="#E2E6FF"),
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        font=dict(color="#1a1f36"),
         height=360,
         margin=dict(l=20, r=20, t=50, b=20),
     )
@@ -368,9 +368,9 @@ def _render_probability_distribution(df: pd.DataFrame):
     )
 
     fig.update_layout(
-        paper_bgcolor="#0b1020",
-        plot_bgcolor="#0b1020",
-        font=dict(color="#E2E6FF"),
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        font=dict(color="#1a1f36"),
         xaxis_title="Predicted probability of positive return",
         yaxis_title="Number of predictions",
         height=360,
@@ -1287,19 +1287,54 @@ def _render_news_impact_heatmap(
         st.info("No numeric news impact values available for heatmap.")
         return
 
+    # ✅ NEW: drop tickers with no recorded news signal (all-zero rows)
+    # ✅ FIX: use Confidence specifically as the "has news" signal,
+    # since Risk adjustment carries a nonzero baseline even with zero news.
+    if "Confidence" in heat_df.columns:
+        row_has_signal = heat_df["Confidence"].abs() > 1e-9
+    else:
+        row_has_signal = heat_df.abs().sum(axis=1) > 1e-9
+    heat_df = heat_df[row_has_signal]
 
-    max_abs = np.nanmax(np.abs(heat_df.values))
+    if heat_df.empty:
+        st.info("No tickers with a recorded news signal to display.")
+        return
 
-    fig = px.imshow(
-        heat_df,
-        text_auto=".3f",
-        aspect="auto",
-        color_continuous_scale="RdYlGn",
-        range_color=[-max_abs, max_abs],
-        origin="lower",
+    # ✅ NEW: per-column normalization so one high-magnitude column
+    # (e.g. Confidence) does not visually dominate the shared color scale.
+    norm_df = heat_df.copy()
+    for col in available_cols:
+        col_max_abs = norm_df[col].abs().max()
+        if col_max_abs and col_max_abs > 1e-12:
+            norm_df[col] = norm_df[col] / col_max_abs
+        else:
+            norm_df[col] = 0.0
+
+    # text shows the ORIGINAL (non-normalized) values, formatted to 3 decimals
+    text_df = heat_df.round(3).astype(str)
+
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=norm_df.values,
+            x=norm_df.columns,
+            y=norm_df.index,
+            text=text_df.values,
+            texttemplate="%{text}",
+            colorscale="RdYlGn",
+            zmin=-1,
+            zmax=1,
+            colorbar=dict(title="Relative<br>magnitude"),
+        )
     )
 
-    fig.update_xaxes(side="top")
+    fig.update_layout(
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        font=dict(color="#1a1f36"),
+        xaxis=dict(side="top"),
+        height=max(360, 22 * len(heat_df)),
+        margin=dict(l=20, r=20, t=60, b=20),
+    )
 
     st.plotly_chart(fig, use_container_width=True, key=chart_key)
 
@@ -1308,7 +1343,9 @@ def _render_news_impact_heatmap(
         "Positive expected return adjustments increase the return input, while positive risk adjustments or Δ variance increase the risk input."
     )
     st.caption(
-    "Green indicates larger positive magnitudes, while values near zero appear neutral."
+        "Each column is color-scaled independently relative to its own maximum magnitude "
+        "(cell values shown are the original, non-normalized numbers). "
+        "Tickers with no recorded news signal have been omitted for clarity."
     )
 def _render_prob_news_trace(trace: Optional[Dict[str, Any]]):
     if not isinstance(trace, dict) or not trace:
@@ -1578,9 +1615,9 @@ def _render_base_vs_refined_metric_chart(
     )
 
     fig.update_layout(
-        paper_bgcolor="#0b1020",
-        plot_bgcolor="#0b1020",
-        font=dict(color="#E2E6FF"),
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        font=dict(color="#1a1f36"),
         margin=dict(l=10, r=10, t=30, b=10),
         yaxis_title="Value",
         xaxis_title="",
@@ -1684,9 +1721,9 @@ def _render_double_frontier_chart(
         )
 
     fig.update_layout(
-        paper_bgcolor="#0b1020",
-        plot_bgcolor="#0b1020",
-        font=dict(color="#E2E6FF"),
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        font=dict(color="#1a1f36"),
         margin=dict(l=10, r=10, t=30, b=10),
         xaxis_title="Risk (Volatility, σ)",
         yaxis_title="Expected Return (µ)",
@@ -1791,9 +1828,9 @@ def _render_weight_change_chart(
     fig.add_vline(x=0, line_width=1)
 
     fig.update_layout(
-        paper_bgcolor="#0b1020",
-        plot_bgcolor="#0b1020",
-        font=dict(color="#E2E6FF"),
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        font=dict(color="#1a1f36"),
         margin=dict(l=10, r=10, t=30, b=10),
         xaxis_title="Change in portfolio weight",
         yaxis_title="",
@@ -2343,7 +2380,7 @@ def _render_why_this_portfolio_cards(state: Optional[Dict[str, Any]]):
             f"""
             <div class="metric-card" style="margin-top:0.6rem;">
                 <div class="metric-label">{title}</div>
-                <div style="color:#f7f9ff; font-size:0.95rem; line-height:1.45;">
+                <div style="color:#1a1f36; font-size:0.95rem; line-height:1.45;">
                     {content}
                 </div>
             </div>
@@ -2414,9 +2451,9 @@ def _render_mode_c_diversification_chart(
     fig.update_traces(textposition="outside", cliponaxis=False)
 
     fig.update_layout(
-        paper_bgcolor="#0b1020",
-        plot_bgcolor="#0b1020",
-        font=dict(color="#E2E6FF"),
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        font=dict(color="#1a1f36"),
         margin=dict(l=10, r=10, t=50, b=10),
         height=400,
         legend_title="",
@@ -2632,7 +2669,7 @@ def _render_portfolio_story_timeline(
             border = "rgba(74,222,128,0.35)"
             bg = "rgba(74,222,128,0.08)"
         else:
-            glow = "#94a3b8"
+            glow = "#6b7280"
             border = "rgba(148,163,184,0.25)"
             bg = "rgba(148,163,184,0.05)"
 
@@ -2668,7 +2705,7 @@ def _render_portfolio_story_timeline(
             margin: 0;
             background: transparent;
             font-family: Inter, Arial, sans-serif;
-            color: #e2e8f0;
+            color: #1a1f36;
         }}
 
         .timeline-wrap {{
@@ -2711,7 +2748,7 @@ def _render_portfolio_story_timeline(
 
         .timeline-card {{
             flex: 1;
-            background: linear-gradient(135deg, rgba(11,16,32,0.98), rgba(15,23,42,0.94));
+            background: linear-gradient(135deg, rgba(255,255,255,0.98), rgba(248,249,252,0.94));
             border: 1px solid;
             border-radius: 20px;
             padding: 18px 20px;
@@ -2727,21 +2764,21 @@ def _render_portfolio_story_timeline(
         }}
 
         .step-title {{
-            color: #f8fafc;
+            color: #1a1f36;
             font-size: 1.08rem;
             font-weight: 800;
             margin-bottom: 8px;
         }}
 
         .step-subtitle {{
-            color: #cbd5e1;
+            color: #374151;
             font-size: 0.94rem;
             line-height: 1.45;
             margin-bottom: 9px;
         }}
 
         .step-detail {{
-            color: #94a3b8;
+            color: #6b7280;
             font-size: 0.84rem;
             line-height: 1.45;
         }}
@@ -2762,33 +2799,61 @@ st.set_page_config(page_title="Financial Risk & Portfolio Optimizer", layout="wi
 st.markdown(
     """
     <style>
-    .main { background-color: #050816; }
+    .main { background-color: #f5f6fa; }
     .block-container { padding-top: 1.5rem; padding-bottom: 1.5rem; }
     .card {
-        background: #0b1020;
-        border-radius: 18px;
-        padding: 18px 20px;
-        border: 1px solid #20263a;
+        background: #ffffff;
+        border-radius: 16px;
+        padding: 16px 20px;
+        border: 1px solid #e2e6ef;
         box-shadow: 0 0 20px rgba(0,0,0,0.3);
     }
     .metric-card {
-        background: #0b1020;
+        background: #ffffff;
         border-radius: 18px;
         padding: 16px 18px;
-        border: 1px solid #20263a;
+        border: 1px solid #e2e6ef;
         text-align: left;
     }
-    .metric-label { font-size: 0.85rem; color: #8b9ac5; }
-    .metric-value { font-size: 1.6rem; font-weight: 700; color: #f7f9ff; }
-    .metric-sub { font-size: 0.8rem; color: #9aa6d4; }
+    .metric-label { font-size: 0.85rem; color: #5b6b8c; }
+    .metric-value { font-size: 1.6rem; font-weight: 700; color: #1a1f36; }
+    .metric-sub { font-size: 0.8rem; color: #5b6b8c; }
     .section-title {
         font-size: 1.1rem;
         font-weight: 600;
-        color: #e2e6ff;
+        color: #1a1f36;
         margin-bottom: 0.5rem;
     }
-    .header-title { font-size: 1.6rem; font-weight: 700; color: #f7f9ff; margin-bottom: 0.2rem; }
-    .header-sub { font-size: 0.95rem; color: #9aa6d4; }
+    .header-title { font-size: 1.6rem; font-weight: 700; color: #1a1f36; margin-bottom: 0.2rem; }
+    .header-sub { font-size: 0.95rem; color: #5b6b8c; }
+    /* Chat input kutusu - SİYAH kenarlık, net görünür */
+    [data-testid="stChatInput"] textarea,
+        [data-testid="stChatInput"] input {
+            background-color: #ffffff !important;
+            border: none !important;
+            color: #000000 !important;
+        }
+        [data-testid="stChatInput"] textarea::placeholder,
+        [data-testid="stChatInput"] input::placeholder {
+            color: #333333 !important;
+            opacity: 1 !important;
+        }
+        div[data-testid="stChatInput"] > div {
+            border: 2px solid #000000 !important;
+            border-radius: 12px !important;
+            background-color: #ffffff !important;
+        }
+    [data-testid="stChatInput"] {
+        border-top: 1px solid #e2e6ef !important;
+    }
+    /* Chat mesaj balonları */
+    [data-testid="stChatMessage"] {
+        background-color: #f5f6fa !important;
+        border: 1px solid #e2e6ef !important;
+        border-radius: 14px !important;
+        padding: 10px 14px !important;
+        margin-bottom: 6px !important;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -3557,9 +3622,9 @@ with col_mid:
             showlegend=True,
             legend=dict(orientation="h", y=-0.1),
             margin=dict(l=10, r=10, t=10, b=10),
-            paper_bgcolor="#0b1020",
-            plot_bgcolor="#0b1020",
-            font=dict(color="#E2E6FF"),
+            paper_bgcolor="#ffffff",
+            plot_bgcolor="#ffffff",
+            font=dict(color="#1a1f36"),
         )
         st.plotly_chart(fig, use_container_width=True)
 
@@ -4344,9 +4409,9 @@ else:
                         
 
     fig_frontier.update_layout(
-        paper_bgcolor="#0b1020",
-        plot_bgcolor="#0b1020",
-        font=dict(color="#E2E6FF"),
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        font=dict(color="#1a1f36"),
         margin=dict(l=40, r=40, t=20, b=50),
         xaxis_title="Risk (Volatility, σ)",
         yaxis_title="Expected Return (µ)",
