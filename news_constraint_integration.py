@@ -27,9 +27,6 @@ def build_news_probability_constraints(
         prob = float(row["predicted_positive_probability"])
         base_weight = float(baseline_weights[ticker])
 
-        # ✅ IMPORTANT:
-        # Do not create constraints for assets that are effectively not used
-        # in the baseline portfolio.
         if base_weight < min_baseline_weight:
             continue
 

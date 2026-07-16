@@ -3,7 +3,7 @@ import glob
 import pandas as pd
 import numpy as np
 
-# Yıllık iş gün sayısı (finansta klasik varsayım)
+
 DAYS_PER_YEAR = 252
 
 RAW_DIR = "data/raw/daily"
@@ -12,7 +12,7 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 price_frames = []
 
-# Her hisse için günlük close fiyatlarını okuyup merge edeceğiz
+
 for path in sorted(glob.glob(os.path.join(RAW_DIR, "*_daily.csv"))):
     fname = os.path.basename(path)
     ticker = fname.split("_")[0]   # "AAPL_daily.csv" -> "AAPL"

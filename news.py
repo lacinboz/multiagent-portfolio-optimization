@@ -1,4 +1,4 @@
-# finnhub_news_probe.py
+#news.py
 # Usage examples:
 #   python finnhub_news_probe.py --tickers AAPL MSFT NVDA --lookback-days 7
 #   python finnhub_news_probe.py --tickers-file tickers.txt --lookback-days 3 --market-categories general merger

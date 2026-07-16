@@ -12,9 +12,9 @@
 #   Metrics: Expected ΔSharpe, Realized ΔSharpe, Turnover, #Bull, #Bear
 #   5-run mean±std (no fixed seeds)
 #
-# ✅ look-ahead bias fix: latest_dataset capped at 2026-01-14
-# ✅ Both expected AND realized metrics in Table 2
-# ✅ No fixed seeds (probabilistic)
+#  look-ahead bias fix: latest_dataset capped at 2026-01-14
+#  Both expected AND realized metrics in Table 2
+#  No fixed seeds (probabilistic)
 # ============================================================
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ RAW_PATH = "data/news_prediction/news_timeseries_dataset_raw_h7_alltickers_v2_en
 MU_PATH  = Path("data/processed_yahoo/summary_per_asset_annual.csv")
 COV_PATH = Path("data/processed_yahoo/cov_annual.csv")
 
-# ✅ look-ahead bias fix
+#  look-ahead bias fix
 SIGNAL_CUTOFF = pd.Timestamp("2026-01-14")
 
 N_RUNS            = 5
@@ -260,7 +260,7 @@ def _build_dataset(raw_path: str, min_abs_return: Optional[float] = MIN_ABS_RETU
 def _build_latest_dataset(raw_path: str) -> pd.DataFrame:
     """
     Unfiltered dataset for latest signal generation (tau=None).
-    ✅ look-ahead bias fix: capped at SIGNAL_CUTOFF (2026-01-14).
+     look-ahead bias fix: capped at SIGNAL_CUTOFF (2026-01-14).
     """
     df = pd.read_csv(raw_path)
     df["news_date_dt"] = pd.to_datetime(df["news_date"], errors="coerce")
@@ -273,7 +273,7 @@ def _build_latest_dataset(raw_path: str) -> pd.DataFrame:
     ]).copy()
     df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
 
-    # ✅ look-ahead bias fix
+    #  look-ahead bias fix
     df = df[df["news_date_dt"] <= SIGNAL_CUTOFF].copy()
 
     df["is_positive_article"] = (df["prob_positive"] > df["prob_negative"]).astype(int)
@@ -479,22 +479,24 @@ def _probs_to_portfolio_impact(
     # Realized metrics
     real = compute_realized_metrics(constrained["weights"], returns_test)
 
+
     return {
-        # expected
-        "exp_sharpe_delta": constrained["sharpe"] - baseline_sharpe,
-        "exp_return_delta": constrained["return"] - baseline_return,
-        "exp_vol_delta":    constrained["vol"] - baseline_vol,
-        # realized
-        "real_sharpe":       real["realized_sharpe"],
-        "real_sharpe_delta": real["realized_sharpe"] - baseline_realized_sharpe,
-        "real_return_pct":   real["realized_return"] * 100,
-        "real_vol_pct":      real["realized_vol"] * 100,
-        # common
-        "turnover":    turnover,
-        "n_bullish":   n_bull,
-        "n_bearish":   n_bear,
-        "weights":     constrained["weights"],
-    }
+            # expected
+            "exp_sharpe_delta": constrained["sharpe"] - baseline_sharpe,
+            "exp_return_delta": constrained["return"] - baseline_return,
+            "exp_vol_delta":    constrained["vol"] - baseline_vol,
+            # realized
+            "real_sharpe":       real["realized_sharpe"],
+            "real_sharpe_delta": real["realized_sharpe"] - baseline_realized_sharpe,
+            "real_return_pct":   real["realized_return"] * 100,
+            "real_vol_pct":      real["realized_vol"] * 100,
+            "real_max_dd_pct":   real["realized_max_dd"] * 100,
+            # common
+            "turnover":    turnover,
+            "n_bullish":   n_bull,
+            "n_bearish":   n_bear,
+            "weights":     constrained["weights"],
+        }
 
 
 # ============================================================
@@ -509,6 +511,7 @@ def _aggregate(model_name: str, feat_name: str, run_results: List[Dict]) -> Dict
         "roc_auc", "bal_acc", "f1", "bal_acc_delta",
         "exp_sharpe_delta", "exp_return_delta", "exp_vol_delta",
         "real_sharpe_delta", "real_sharpe", "real_return_pct", "real_vol_pct",
+        "real_max_dd_pct",
         "turnover", "n_bullish", "n_bearish",
     ]
     out: Dict[str, Any] = {
@@ -538,8 +541,8 @@ def run_feature_ablation_study(
     print("\n" + "=" * 70)
     print("NEWS MODEL FEATURE ABLATION STUDY")
     print(f"N_RUNS={N_RUNS} | No fixed seeds (probabilistic)")
-    print(f"✅ Signal cutoff: {SIGNAL_CUTOFF.date()} (no look-ahead bias)")
-    print(f"✅ Both expected AND realized metrics in Table 2")
+    print(f" Signal cutoff: {SIGNAL_CUTOFF.date()} (no look-ahead bias)")
+    print(f" Both expected AND realized metrics in Table 2")
     print("=" * 70)
     print(f"Fixed: 101 tickers | 70/30 chronological split")
     print(f"       bull>={BULLISH_THRESHOLD}, bear<={BEARISH_THRESHOLD}, "

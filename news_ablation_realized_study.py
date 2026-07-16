@@ -442,14 +442,16 @@ def run_news_ablation_study():
     print("\n" + "─" * 60)
     print("MODE B: Prediction-Constrained Optimization")
 
-    if not MODEL_PATH.exists():
-        print(f"  [SKIP] Model not found: {MODEL_PATH}")
-    else:
-        model_bundle = joblib.load(MODEL_PATH)
-        print(f"  Model loaded: {MODEL_PATH.name}")
+    SIGNALS_CSV = Path("data/news_prediction/latest_news_prediction_signals_as_of_20260114.csv")
 
-        dataset_b = _build_mode_b_dataset_as_of(RAW_PATH, AS_OF_DATE)
-        probs     = _generate_mode_b_signals(model_bundle, dataset_b, tickers)
+    if not SIGNALS_CSV.exists():
+        print(f"  [SKIP] Signals file not found: {SIGNALS_CSV}")
+    else:
+        signals_df = pd.read_csv(SIGNALS_CSV)
+        signals_df["ticker"] = signals_df["ticker"].astype(str).str.upper().str.strip()
+        probs = dict(zip(signals_df["ticker"], signals_df["predicted_positive_probability"].astype(float)))
+        probs = {t: p for t, p in probs.items() if t in tickers}
+        print(f"  Loaded {len(probs)} ticker signals from {SIGNALS_CSV.name}")
 
         news_constraints_b, sci_cons_b = _build_constraints_from_probs(probs, baseline_weights)
         n_bull = sum(1 for c in news_constraints_b.values() if c["type"] == "bullish")

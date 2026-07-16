@@ -1,9 +1,3 @@
-# model_comparison_rf_vs_lr.py
-# ============================================================
-# Hocamın notu: "Random forest vs LR"
-# İkisini aynı dataset üzerinde karşılaştır, neden LR seçtik göster.
-# Mevcut kodlara dokunmaz. Standalone script.
-# ============================================================
 from __future__ import annotations
 
 import json
@@ -30,6 +24,8 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 RAW_PATH = "data/news_prediction/news_timeseries_dataset_raw_h7_alltickers_v2_enrichedd.csv"
 
+N_RUNS = 5  #  consistent with feature_ablation script
+
 FEATURE_COLS = [
     "article_count",
     "weighted_sentiment",
@@ -49,13 +45,19 @@ FEATURE_COLS = [
 
 # ============================================================
 # Model configs to compare
+#  Now use FACTORIES (callables) instead of pre-built instances,
+#    so each of the N_RUNS gets a fresh model with fresh randomness.
+#  RF configs no longer pass random_state (matches feature_ablation.py).
+#  LR configs keep random_state=42: LR with the default 'lbfgs'
+#    solver is deterministic given fixed data, so repeated runs
+#    are expected to produce identical results (std ≈ 0).
 # ============================================================
 
 MODEL_CONFIGS = {
     "logistic_C03": {
         "type": "logistic",
         "description": "Logistic Regression L2, C=0.3 (production model)",
-        "model": Pipeline([
+        "factory": lambda: Pipeline([
             ("scaler", StandardScaler()),
             ("clf", LogisticRegression(
                 max_iter=2000, class_weight="balanced",
@@ -66,7 +68,7 @@ MODEL_CONFIGS = {
     "logistic_C01": {
         "type": "logistic",
         "description": "Logistic Regression L2, C=0.1 (stronger regularization)",
-        "model": Pipeline([
+        "factory": lambda: Pipeline([
             ("scaler", StandardScaler()),
             ("clf", LogisticRegression(
                 max_iter=2000, class_weight="balanced",
@@ -77,7 +79,7 @@ MODEL_CONFIGS = {
     "logistic_C10": {
         "type": "logistic",
         "description": "Logistic Regression L2, C=1.0 (weaker regularization)",
-        "model": Pipeline([
+        "factory": lambda: Pipeline([
             ("scaler", StandardScaler()),
             ("clf", LogisticRegression(
                 max_iter=2000, class_weight="balanced",
@@ -88,37 +90,37 @@ MODEL_CONFIGS = {
     "random_forest_d6": {
         "type": "random_forest",
         "description": "Random Forest, max_depth=6 (production config)",
-        "model": RandomForestClassifier(
+        "factory": lambda: RandomForestClassifier(
             n_estimators=500, max_depth=6,
             min_samples_leaf=10,
             class_weight="balanced_subsample",
-            random_state=42, n_jobs=-1,
+            n_jobs=-1,  #  no random_state
         ),
     },
     "random_forest_d4": {
         "type": "random_forest",
         "description": "Random Forest, max_depth=4 (more regularized)",
-        "model": RandomForestClassifier(
+        "factory": lambda: RandomForestClassifier(
             n_estimators=500, max_depth=4,
             min_samples_leaf=10,
             class_weight="balanced_subsample",
-            random_state=42, n_jobs=-1,
+            n_jobs=-1,  #  no random_state
         ),
     },
     "random_forest_d8": {
         "type": "random_forest",
         "description": "Random Forest, max_depth=8 (less regularized)",
-        "model": RandomForestClassifier(
+        "factory": lambda: RandomForestClassifier(
             n_estimators=500, max_depth=8,
             min_samples_leaf=5,
             class_weight="balanced_subsample",
-            random_state=42, n_jobs=-1,
+            n_jobs=-1,  #  no random_state
         ),
     },
 }
 
 # ============================================================
-# Dataset builder
+# Dataset builder (unchanged)
 # ============================================================
 
 def _build_dataset(raw_path: str) -> pd.DataFrame:
@@ -188,11 +190,11 @@ def _build_dataset(raw_path: str) -> pd.DataFrame:
 
 
 # ============================================================
-# Single model evaluation
+# Single model evaluation (single run)
 # ============================================================
 
-def _evaluate_model(
-    model: Any,
+def _evaluate_model_once(
+    model_factory,
     dataset: pd.DataFrame,
     test_size: float = 0.30,
     use_ticker_features: bool = True,
@@ -209,9 +211,7 @@ def _evaluate_model(
         df = pd.concat([df, dummies], axis=1)
         feat_cols += list(dummies.columns)
 
-    y = df["target_direction"].astype(int)
     split_idx = int(len(df) * (1.0 - test_size))
-
     train_df = df.iloc[:split_idx]
     test_df = df.iloc[split_idx:]
 
@@ -220,6 +220,7 @@ def _evaluate_model(
     X_test = test_df[feat_cols].astype(float)
     y_test = test_df["target_direction"].astype(int)
 
+    model = model_factory()
     model.fit(X_train, y_train)
     pred = model.predict(X_test)
     proba = model.predict_proba(X_test)[:, 1]
@@ -246,15 +247,32 @@ def _evaluate_model(
             roc_auc is not None and roc_auc >= 0.55
             and (bal_acc - baseline_bal) > 0.0
         ),
-        "train_date_range": [
-            str(train_df["news_date_dt"].min().date()),
-            str(train_df["news_date_dt"].max().date()),
-        ],
-        "test_date_range": [
-            str(test_df["news_date_dt"].min().date()),
-            str(test_df["news_date_dt"].max().date()),
-        ],
     }
+
+
+def _aggregate_runs(name: str, description: str, model_type: str,
+                     run_results: List[Dict]) -> Dict[str, Any]:
+    """✅ Aggregate N_RUNS results into mean±std, matching
+    news_model_feature_ablation.py's _aggregate()."""
+    out: Dict[str, Any] = {
+        "model": name,
+        "type": model_type,
+        "description": description,
+        "n_runs": len(run_results),
+    }
+    metrics = [
+        "roc_auc", "balanced_accuracy", "accuracy", "precision",
+        "recall", "f1", "lift",
+    ]
+    for m in metrics:
+        vals = [r[m] for r in run_results if r.get(m) is not None]
+        if vals:
+            out[f"{m}_mean"] = float(np.mean(vals))
+            out[f"{m}_std"] = float(np.std(vals))
+    out["use_as_signal"] = bool(
+        out.get("roc_auc_mean", 0) >= 0.55 and out.get("lift_mean", 0) > 0.0
+    )
+    return out
 
 
 # ============================================================
@@ -269,6 +287,7 @@ def run_rf_vs_lr_comparison(
 
     print("\n" + "=" * 70)
     print("RANDOM FOREST vs LOGISTIC REGRESSION COMPARISON")
+    print(f"N_RUNS={N_RUNS} | No fixed seed for RF (matches feature_ablation.py)")
     print("=" * 70)
 
     print("\nBuilding dataset...")
@@ -282,63 +301,59 @@ def run_rf_vs_lr_comparison(
     for name, cfg in MODEL_CONFIGS.items():
         print(f"\n→ {name}: {cfg['description']}")
         try:
-            metrics = _evaluate_model(
-                model=cfg["model"],
-                dataset=dataset,
-                test_size=test_size,
-            )
-            results[name] = {**metrics, "description": cfg["description"], "type": cfg["type"]}
+            run_results = []
+            for run_idx in range(N_RUNS):
+                m = _evaluate_model_once(
+                    model_factory=cfg["factory"],
+                    dataset=dataset,
+                    test_size=test_size,
+                )
+                run_results.append(m)
 
-            print(f"  ROC-AUC={metrics['roc_auc']:.4f} | "
-                  f"Bal.Acc={metrics['balanced_accuracy']:.4f} | "
-                  f"Lift={metrics['lift']:+.4f} | "
-                  f"Signal={metrics['use_as_signal']}")
+            agg = _aggregate_runs(name, cfg["description"], cfg["type"], run_results)
+            results[name] = agg
 
-            rows.append({
-                "model": name,
-                "type": cfg["type"],
-                "description": cfg["description"],
-                "roc_auc": metrics["roc_auc"],
-                "balanced_accuracy": metrics["balanced_accuracy"],
-                "accuracy": metrics["accuracy"],
-                "precision": metrics["precision"],
-                "recall": metrics["recall"],
-                "f1": metrics["f1"],
-                "baseline_balanced_accuracy": metrics["baseline_balanced_accuracy"],
-                "lift": metrics["lift"],
-                "use_as_signal": metrics["use_as_signal"],
-                "train_size": metrics["train_size"],
-                "test_size_rows": metrics["test_size"],
-            })
+            print(f"  ROC-AUC={agg.get('roc_auc_mean', 0):.4f}"
+                  f"±{agg.get('roc_auc_std', 0):.4f} | "
+                  f"Bal.Acc={agg.get('balanced_accuracy_mean', 0):.4f}"
+                  f"±{agg.get('balanced_accuracy_std', 0):.4f} | "
+                  f"Lift={agg.get('lift_mean', 0):+.4f}"
+                  f"±{agg.get('lift_std', 0):.4f} | "
+                  f"Signal={agg['use_as_signal']}")
+
+            rows.append(agg)
 
         except Exception as e:
             print(f"  FAILED: {e}")
 
     # ── Comparison table ───────────────────────────────────────
     print("\n\n" + "=" * 70)
-    print("COMPARISON TABLE")
+    print(f"COMPARISON TABLE (mean±std, {N_RUNS} runs)")
     print("=" * 70)
-    col = 12
+    col = 18
     print(
-        f"{'Model':<24}"
+        f"{'Model':<20}"
         f"{'ROC-AUC':>{col}}"
         f"{'Bal.Acc':>{col}}"
-        f"{'Lift':>{col}}"
         f"{'F1':>{col}}"
-        f"{'Signal?':>{col}}"
+        f"{'Lift':>{col}}"
+        f"{'Signal?':>10}"
     )
-    print("-" * (24 + col * 5))
+    print("-" * (20 + col * 4 + 10))
 
-    # Sort by ROC-AUC descending
-    rows_sorted = sorted(rows, key=lambda x: x["roc_auc"] or 0, reverse=True)
+    rows_sorted = sorted(rows, key=lambda x: x.get("roc_auc_mean", 0), reverse=True)
     for row in rows_sorted:
+        roc = f"{row.get('roc_auc_mean', 0):.4f}±{row.get('roc_auc_std', 0):.4f}"
+        bal = f"{row.get('balanced_accuracy_mean', 0):.4f}±{row.get('balanced_accuracy_std', 0):.4f}"
+        f1v = f"{row.get('f1_mean', 0):.4f}±{row.get('f1_std', 0):.4f}"
+        lift = f"{row.get('lift_mean', 0):+.4f}±{row.get('lift_std', 0):.4f}"
         print(
-            f"{row['model']:<24}"
-            f"{row['roc_auc']:.4f}".rjust(col) +
-            f"{row['balanced_accuracy']:.4f}".rjust(col) +
-            f"{row['lift']:+.4f}".rjust(col) +
-            f"{row['f1']:.4f}".rjust(col) +
-            f"{'YES' if row['use_as_signal'] else 'NO'}".rjust(col)
+            f"{row['model']:<20}"
+            f"{roc:>{col}}"
+            f"{bal:>{col}}"
+            f"{f1v:>{col}}"
+            f"{lift:>{col}}"
+            f"{'YES' if row['use_as_signal'] else 'NO':>10}"
         )
 
     # ── Why LR over RF? ────────────────────────────────────────
@@ -349,16 +364,16 @@ def run_rf_vs_lr_comparison(
     lr_results = {k: v for k, v in results.items() if v["type"] == "logistic"}
     rf_results = {k: v for k, v in results.items() if v["type"] == "random_forest"}
 
-    best_lr = max(lr_results.items(), key=lambda x: x[1]["roc_auc"] or 0)
-    best_rf = max(rf_results.items(), key=lambda x: x[1]["roc_auc"] or 0)
+    best_lr = max(lr_results.items(), key=lambda x: x[1].get("roc_auc_mean", 0))
+    best_rf = max(rf_results.items(), key=lambda x: x[1].get("roc_auc_mean", 0))
 
-    print(f"\nBest LR: {best_lr[0]} → ROC-AUC={best_lr[1]['roc_auc']:.4f} "
-          f"Bal.Acc={best_lr[1]['balanced_accuracy']:.4f}")
-    print(f"Best RF: {best_rf[0]} → ROC-AUC={best_rf[1]['roc_auc']:.4f} "
-          f"Bal.Acc={best_rf[1]['balanced_accuracy']:.4f}")
+    print(f"\nBest LR: {best_lr[0]} → ROC-AUC={best_lr[1]['roc_auc_mean']:.4f}"
+          f"±{best_lr[1]['roc_auc_std']:.4f}")
+    print(f"Best RF: {best_rf[0]} → ROC-AUC={best_rf[1]['roc_auc_mean']:.4f}"
+          f"±{best_rf[1]['roc_auc_std']:.4f}")
 
-    roc_diff = best_lr[1]["roc_auc"] - best_rf[1]["roc_auc"]
-    lift_diff = best_lr[1]["lift"] - best_rf[1]["lift"]
+    roc_diff = best_lr[1]["roc_auc_mean"] - best_rf[1]["roc_auc_mean"]
+    lift_diff = best_lr[1]["lift_mean"] - best_rf[1]["lift_mean"]
 
     print(f"\nROC-AUC difference (LR - RF): {roc_diff:+.4f}")
     print(f"Lift difference (LR - RF): {lift_diff:+.4f}")
@@ -368,8 +383,7 @@ def run_rf_vs_lr_comparison(
         print("  LR achieves equal or better ROC-AUC than RF on this dataset.")
     else:
         print(f"  RF achieves higher ROC-AUC by {abs(roc_diff):.4f}.")
-        print("  However, LR is preferred for interpretability and constraint generation:")
-
+    print("  LR is preferred for interpretability and constraint generation:")
     print("  1. LR produces calibrated probabilities → better threshold behavior")
     print("  2. LR coefficients are directly interpretable")
     print("  3. LR with L2 regularization (C=0.3) is less prone to overfitting")

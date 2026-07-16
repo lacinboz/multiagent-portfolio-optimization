@@ -7,10 +7,10 @@
 #   bear ∈ {0.30, 0.35, 0.40, 0.45}
 #   delta ∈ {0.01, 0.02, 0.03, 0.05}
 #
-# ✅ Reports BOTH expected metrics (w^T mu, w^T Sigma w)
-#    AND realized metrics (test period daily returns)
-# ✅ No look-ahead bias: uses as_of_20260114 signals file
-# ✅ Deterministic — no 5-run loop needed (no model randomness)
+#  Reports BOTH expected metrics (w^T mu, w^T Sigma w)
+#  AND realized metrics (test period daily returns)
+#  No look-ahead bias: uses as_of_20260114 signals file
+#  Deterministic — no 5-run loop needed (no model randomness)
 # ============================================================
 from __future__ import annotations
 

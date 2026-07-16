@@ -387,22 +387,20 @@ def recommendation_agent(
                 )
 
             if vol < v_c and ret >= r_c:
-                text.append("✅ The optimized portfolio improves **both** risk and return.")
+                text.append(" The optimized portfolio improves **both** risk and return.")
             elif vol < v_c and ret < r_c:
                 text.append(
-                    "✅ The optimized portfolio reduces risk significantly, trading off some return to improve risk-adjusted performance."
+                    " The optimized portfolio reduces risk significantly, trading off some return to improve risk-adjusted performance."
                 )
             elif vol >= v_c and ret > r_c:
-                text.append("⚠️ The optimized portfolio increases risk to chase higher return (check if this matches your risk tolerance).")
+                text.append(" The optimized portfolio increases risk to chase higher return (check if this matches your risk tolerance).")
             else:
-                text.append("ℹ️ The optimized portfolio is a different trade-off; review the risk contribution chart to understand what changed.")
+                text.append("ℹ The optimized portfolio is a different trade-off; review the risk contribution chart to understand what changed.")
 
     return "\n\n".join(text)
 
 
-# ============================================================
-# Insight Generator (LLM agent) — your existing code unchanged
-# ============================================================
+
 
 def _top_k_from_weights(weights: Dict[str, float], k: int = 10) -> List[Dict[str, Any]]:
     items = [(str(t), float(w)) for t, w in (weights or {}).items()]
@@ -967,15 +965,15 @@ def apply_news_actions_to_params(
 
         elif t == "reduce_exposure":
             intensity = str(a.get("intensity") or "medium").lower().strip()
-            # Global w_max'ı düşür: o hissenin etkisini azaltır
+       
             reduction = {"low": 0.03, "medium": 0.07, "high": 0.12}[intensity]
             w_max_new = max(0.05, w_max_new - reduction)
-            # lambda'yı da biraz artır (diversification teşvik eder)
+         
             mult = {"low": 1.5, "medium": 2.0, "high": 3.0}[intensity]
             lambda_new = lambda_new * mult
 
         elif t == "hedge":
-            # hedge optimizer'a direkt map edilmiyor, lambda artır
+           
             lambda_new = lambda_new * 1.5
 
     return {
@@ -991,7 +989,7 @@ def apply_news_actions_to_params(
 
 _FINNHUB_BASE = "https://finnhub.io/api/v1"
 
-# ✅ NEW: persistent disk cache (survives Streamlit reruns / restarts)
+
 _NEWS_CACHE_DIR = Path("data/news_cache")
 _NEWS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1100,10 +1098,10 @@ def _finnhub_get(endpoint: str, params: Dict[str, Any], *, timeout_s: int = 30, 
     q = dict(params or {})
     q["token"] = api_key
 
-    # ✅ Use cache keys WITHOUT token for disk (so we don't store secrets)
+    #  Use cache keys WITHOUT token for disk (so we don't store secrets)
     q_no_token = _stable_params_for_cache(q)
 
-    # 1) ✅ disk cache (persistent)
+    # 1)  disk cache (persistent)
     disk_hit = _disk_cache_get(endpoint, q_no_token, ttl_s=cache_ttl_s)
     if disk_hit is not None:
         p = _disk_cache_path(endpoint, q_no_token)
@@ -1123,7 +1121,7 @@ def _finnhub_get(endpoint: str, params: Dict[str, Any], *, timeout_s: int = 30, 
     if mem_hit is not None:
         print(f"[NEWS:CACHE] MEM HIT endpoint={endpoint} ttl={cache_ttl_s}s")
 
-        # ✅ PROOF (cache)
+
         sample = _news_sample_from_payload(mem_hit)
         _print_fetch_proof("MEM_HIT", endpoint, url, sample)
 
@@ -1138,16 +1136,16 @@ def _finnhub_get(endpoint: str, params: Dict[str, Any], *, timeout_s: int = 30, 
     r = requests.get(url, params=q, timeout=timeout_s)
     dt_ms = int((time.time() - t0) * 1000)
 
-    # ✅ PROOF (HTTP layer)
+  
     print(f"[NEWS:HTTP] endpoint={endpoint} status={r.status_code} elapsed_ms={dt_ms} bytes={len(r.content)}")
 
     if r.status_code != 200:
-        # keep existing behavior
+      
         raise RuntimeError(f"Finnhub HTTP {r.status_code} on {endpoint}: {r.text[:300]}")
 
     data = r.json()
 
-    # ✅ PROOF (payload layer)
+
     sample = _news_sample_from_payload(data)
     _print_fetch_proof("LIVE_200", endpoint, url, {"elapsed_ms": dt_ms, **sample})
 
@@ -1237,9 +1235,9 @@ def fetch_company_news_for_ticker(
         items.append(
             {
                 "id": d.get("id"),
-                "ticker": ticker,                 # ✅ önemli: LLM tarafında filtreleme kolaylaşır
-                "provider": "finnhub_company",     # ✅ opsiyonel ama debug için çok iyi
-                "date": date_str,                 # ✅ epoch yerine UI/LLM için hazır alan
+                "ticker": ticker,                
+                "provider": "finnhub_company",    
+                "date": date_str,                
                 "datetime": dt_epoch,
                 "source": source,
                 "headline": headline,
@@ -1337,7 +1335,7 @@ def fetch_market_news(
         headline = str(d.get("headline") or "").strip()
         url = str(d.get("url") or "").strip()
 
-        # market news'te ticker yok -> burada boş bırakacağız, sonra filtreleyen fonksiyon ekliyor/taşıyor
+       
         items.append(
             {
                 "id": d.get("id"),
@@ -1368,7 +1366,7 @@ def _filter_market_news_for_ticker(market_items: List[Dict[str, Any]], ticker: s
         if t and (t in text):
             it2 = dict(it)
             it2["ticker"] = t
-            out.append(it2)   # ✅ BUNU EKLE
+            out.append(it2)   
 
     return _dedup_news_items(out)
 
@@ -1377,7 +1375,7 @@ def _filter_market_news_for_ticker(market_items: List[Dict[str, Any]], ticker: s
 def news_agent_fetch_for_tickers(
     tickers: List[str],
     *,
-    include_news: bool = True,  # ✅ hard guard
+    include_news: bool = True,  
     lookback_days: int = 7,
     min_company_items: int = 1,
     max_items_per_ticker: int = 20,
@@ -1471,7 +1469,7 @@ def news_agent_fetch_for_tickers(
         f"[NEWS] fetched tickers={len(tickers)} total_items={total_items} "
         f"company={used_company} fallback={used_fb} lookback_days={lookback_days}"
     )
-    # ✅ Portfolio ile aynı evidence_id üretimi (tek kaynak)
+    
     flat: List[Dict[str, Any]] = []
     for t in tickers:
         for it in (items_by_ticker.get(t) or []):
@@ -1481,7 +1479,6 @@ def news_agent_fetch_for_tickers(
 
     flat_with_ids, evidence_map = assign_evidence_ids_and_map(flat)
 
-    # ✅ Tekrar ticker bazlı grupla (order korunur)
     new_items_by_ticker: Dict[str, List[Dict[str, Any]]] = {t: [] for t in tickers}
     for it in flat_with_ids:
         t = str(it.get("ticker") or "").upper().strip() or "UNK"
@@ -1490,7 +1487,7 @@ def news_agent_fetch_for_tickers(
         new_items_by_ticker[t].append(it)
 
     items_by_ticker = new_items_by_ticker
-    # ✅ evidence_id -> full item lookup (dashboard en rahat bunu kullanır)
+    
     news_items_by_id = {
         str(it.get("evidence_id")): it
         for it in (flat_with_ids or [])

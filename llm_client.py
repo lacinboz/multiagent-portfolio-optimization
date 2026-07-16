@@ -1,15 +1,15 @@
 # llm_client.py
-# ✅ Option A (robust): Decision + Explanation are DECOUPLED
-# + ✅ NEW: LLM Interpretation + LLM Verifier (self-check)
-# + ✅ NEW (ADDITIVE): News Snapshot + News Risk Check (LLM) + Deterministic verifier
+#  Option A (robust): Decision + Explanation are DECOUPLED
+# +  NEW: LLM Interpretation + LLM Verifier (self-check)
+# +  NEW (ADDITIVE): News Snapshot + News Risk Check (LLM) + Deterministic verifier
 #
 # Flow (refine):
 # 0) LLM interprets user feedback -> tiny intent JSON (no hard mapping)
 # 1) LLM chooses candidate -> FINAL_CHOICE: <candidate>
 # 1.5) LLM verifies choice against intent + metric_table -> may correct
 # 2) LLM generates explanation (free-form)
-# 3) ✅ (optional) LLM summarizes recent news -> snapshot + risk flags (verifier cleans output)
-# 4) ✅ (optional) LLM proposes news actions -> deterministic cleaner -> optional LLM verifier -> deterministic cleaner
+# 3)  (optional) LLM summarizes recent news -> snapshot + risk flags (verifier cleans output)
+# 4)  (optional) LLM proposes news actions -> deterministic cleaner -> optional LLM verifier -> deterministic cleaner
 
 from __future__ import annotations
 
@@ -228,8 +228,8 @@ def _extract_final_choice(text: str, available: List[str]) -> Optional[str]:
 
 def _compact_candidate(c: Dict[str, Any]) -> Dict[str, Any]:
     """
-    ✅ Normalize return/vol so the LLM never sees mixed scales
-    ✅ Pass *_pct fields so the LLM writes "10.4%" not "0.104%".
+     Normalize return/vol so the LLM never sees mixed scales
+     Pass *_pct fields so the LLM writes "10.4%" not "0.104%".
     """
     m = _safe_dict(c.get("metrics"))
     w = _safe_dict(c.get("weights"))
@@ -978,7 +978,7 @@ class LLMClient:
 
         pain_points = _infer_pain_points_from_notes(extra_notes, pain_points)
 
-        # ✅ NEW: LLM interprets feedback -> intent
+    
         intent = self._interpret_feedback(pain_points, extra_notes)
 
         ctx = {
@@ -1147,9 +1147,7 @@ class LLMClient:
             "proposed_actions": [],
         }
 
-    # =========================================================
-    # ✅ NEW: Robust JSON parsing helper (used by insights + news)
-    # =========================================================
+
     def _parse_json_best_effort(self, text: str) -> Tuple[Optional[Dict[str, Any]], str]:
         if not text or not isinstance(text, str):
             return None, "empty"
@@ -1176,9 +1174,7 @@ class LLMClient:
 
         return None, "failed"
 
-    # =========================================================
-    # ✅ NEW: Insight Generator call (supports "narrative" + "json")
-    # =========================================================
+
     def _verify_insight_output_light(self, insight: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
         issues: List[str] = []
         cleaned = dict(insight or {})
@@ -1394,9 +1390,7 @@ class LLMClient:
                 break
         return out
 
-    # =========================================================
-    # ✅ NEW: News Snapshot + News Risk Check (ADD ONLY)
-    # =========================================================
+
     def _collect_allowed_evidence_ids(
         self,
         *,
@@ -1446,7 +1440,7 @@ class LLMClient:
         - keeps keys: summary, by_ticker, global
         - enforces ticker whitelist
         - clamps confidence to [0,1]
-        - ✅ filters evidence_ids against allowed_evidence_ids (if provided)
+        -  filters evidence_ids against allowed_evidence_ids (if provided)
         """
         issues: List[str] = []
         allowed = set(str(t).upper() for t in (tickers or []))
@@ -1675,7 +1669,6 @@ class LLMClient:
                     "date": str(it.get("date") or "unknown"),
                     "source": str(it.get("source") or it.get("provider") or "unknown"),
                     "headline": headline[:180],
-                    # ✅ NEW: give the LLM material to write a narrative
                     "summary": (str(it.get("summary") or "").strip() or None),
                     "url": (str(it.get("url") or "").strip() or None),
                 }
@@ -1784,7 +1777,7 @@ class LLMClient:
             except Exception:
                 pass
 
-        # ✅ Deterministically build the final text: LLM supplies only "why",
+        # Deterministically build the final text: LLM supplies only "why",
         # everything else (Action header + Evidence lines) comes straight
         # from `compact_actions` / `matched`, never from the LLM.
         lines: List[str] = ["EVIDENCE SNAPSHOT"]
@@ -1905,7 +1898,6 @@ class LLMClient:
         if not has_eids:
             items, _evidence_map = assign_evidence_ids_and_map(items)
 
-        # ✅ DEBUG: show assigned evidence_ids
         if os.getenv("LLM_DEBUG_NEWS_EVIDENCE_IDS", "0") == "1":
             print("\n===== DEBUG: evidence_id assignment (input news_items) =====")
             by_t: Dict[str, List[Dict[str, Any]]] = {}
@@ -2021,34 +2013,30 @@ class LLMClient:
             snapshot_text = j["snapshot_text"].strip()
         risk_json = j.get("risk_json") if isinstance(j.get("risk_json"), dict) else {}
 
-        # ✅ UI RAW (LLM-1’in güzel metni) — bunu dashboard’da göster
+  
         snapshot_text_raw = snapshot_text
 
-        # ----------------------------
-        # 2) Fixer gating: LLM-2 sadece gerekiyorsa çalışsın
-        # ----------------------------
+
         def _needs_fix_snapshot(st: str, tickers_local: List[str], max_bullets: int = 6) -> bool:
             s = st or ""
-            # hiç ticker görünmüyorsa muhtemelen format bozuk
+           
             if tickers_local and (not any(t in s for t in tickers_local)):
                 return True
-            # hiç bullet yoksa ( - () bekliyorsun)
+           
             if " - (" not in s:
                 return True
-            # kaba “çok bullet” check (aşırı saçmalamayı yakalar)
+          
             if s.count(" - (") > max(1, len(tickers_local)) * max_bullets:
                 return True
             return False
 
         run_formatter2 = _needs_fix_snapshot(snapshot_text, tickers_u, 6)
 
-        # ----------------------------
-        # 3) LLM-2: canonicalize (evidence_id ekle) — sadece gerekirse
-        # ----------------------------
+
         if run_formatter2:
             fmt = self.format_news_snapshot_strict(
                 tickers=tickers_u,
-                news_items=items,  # evidence_id’li items
+                news_items=items,  
                 draft_snapshot_text=snapshot_text,
                 draft_risk_json=risk_json,
                 max_bullets_per_ticker=6,
@@ -2069,19 +2057,14 @@ class LLMClient:
             snapshot_text_canonical = (fmt.get("snapshot_text") or snapshot_text).strip()
             risk_json = fmt.get("risk_json") if isinstance(fmt.get("risk_json"), dict) else risk_json
         else:
-            # formatter2 gerekmediyse, canonical = LLM-1
+            
             snapshot_text_canonical = (snapshot_text or "").strip()
 
-        # ----------------------------
-        # 4) allowed_eids çıkar + (opsiyonel) fallback
-        # ----------------------------
         allowed_eids = self._collect_allowed_evidence_ids(
             snapshot_text=snapshot_text_canonical,
             risk_json=risk_json,
         )
 
-        # ✅ Fallback: bazen model evidence_id yerine "AI report" gibi şey basıyor.
-        # allowed çok küçükse bütün item evidence_id’lerini kabul et ki actions pipeline kilitlenmesin.
         if len(allowed_eids) < 5:
             allowed_eids = {
                 str(it.get("evidence_id")).strip()
@@ -2112,21 +2095,18 @@ class LLMClient:
 
         return {
             "ok": bool(verified.get("ok")),
-            # ✅ canonical: actions + allowed_eids için
+           
             "snapshot_text": snapshot_text_canonical or "News snapshot generated.",
-            # ✅ UI’da bunu göster (RAW / güzel metin)
+           
             "snapshot_text_raw": snapshot_text_raw or "",
             "risk_json": verified.get("cleaned"),
             "issues": list(verified.get("issues") or []),
-            "raw_text": raw,               # LLM-1 raw json text
+            "raw_text": raw,               
             "parse_mode": parse_mode,
-            # debug/telemetry (istersen dashboard’da gizli tut)
+      
             "used_formatter2": bool(run_formatter2),
             "allowed_eids_count": int(len(allowed_eids)),
         }
-    # ============================
-# ✅ NEW: News Actions (LINE)
-# ============================
 
     def _parse_actions_lines(
         self,
@@ -2148,7 +2128,7 @@ class LLMClient:
 
         tickers_u = {str(t).upper().strip() for t in (tickers or []) if str(t).strip()}
         allowed_types = set(_ALLOWED_NEWS_ACTION_TYPES)
-        # ✅ 0) Extract only the ACTION BLOCK if present
+        #  0) Extract only the ACTION BLOCK if present
         # We ignore any text outside the block.
         m = re.search(r"BEGIN_ACTIONS\s*(.*?)\s*END_ACTIONS", text or "", flags=re.DOTALL | re.IGNORECASE)
         if m:
@@ -2168,7 +2148,7 @@ class LLMClient:
                 print(f"{idx:02d}: {ln}")
             print("===============================================================\n")
 
-        # ✅ Special explicit empty case
+        #  Special explicit empty case
         if text.strip().upper() == "NO_ACTIONS":
             return {"ok": True, "actions": [], "issues": ["no_actions_returned"]}
 
@@ -2203,7 +2183,7 @@ class LLMClient:
             eids = [x.strip() for x in eids_raw.split(",") if x.strip()]
             eids = [x for x in eids if x in allowed_evidence_ids]
 
-            # ✅ Ticker-evidence mismatch: reduce_exposure|AMD için AAPL_xxx geçersiz
+         
             _TICKER_REQUIRE_MATCH = {"reduce_exposure", "exclude_ticker"}
             if a_type in _TICKER_REQUIRE_MATCH and len(parts) > 1:
                 _action_ticker = parts[1].upper()
@@ -2487,7 +2467,7 @@ class LLMClient:
         max_actions: int = 8,
     ) -> Dict[str, Any]:
         """
-        ✅ NEW: Batched version.
+        Batched version.
         Splits news_items into ticker-based batches (~25 tickers per batch)
         and calls the single-batch generator for each, then merges results.
         This avoids overwhelming the model's context and ensures all
@@ -2504,7 +2484,7 @@ class LLMClient:
             if t in by_ticker:
                 by_ticker[t].append(it)
 
-        # ✅ NEW: build batches by ITEM COUNT (not ticker count) to keep
+        #  build batches by ITEM COUNT (not ticker count) to keep
         # each prompt small enough for the model to follow format reliably,
         # while still allowing each ticker's full news history to be seen.
         ITEMS_PER_BATCH = 35
@@ -2536,7 +2516,7 @@ class LLMClient:
                 print(f"[DEBUG]   batch {bi+1}: tickers={len(bt)} items={bcount}")
 
 
-        # ✅ Run every batch independently (no early break) — each batch
+        #  Run every batch independently (no early break) — each batch
         # generates as many grounded actions as it finds evidence for,
         # capped at a reasonable per-batch ceiling to avoid runaway output.
         PER_BATCH_CEILING = 8
@@ -2571,7 +2551,7 @@ class LLMClient:
             if os.getenv("LLM_DEBUG_NEWS_ACTIONS_LINES", "0") == "1":
                 print(f"[DEBUG] Batch {bi+1} produced {len(batch_actions)} actions")
 
-# ✅ NEW: quality filter BEFORE round-robin — drop placeholder reasons
+        #  NEW: quality filter BEFORE round-robin — drop placeholder reasons
         # and actions whose evidence sentiment contradicts the action direction
         flat_pool: List[Dict[str, Any]] = [a for batch_list in batch_results for a in batch_list]
 
@@ -2589,7 +2569,7 @@ class LLMClient:
             for iss in (filter_out.get("issues") or [])[:20]:
                 print(f"[DEBUG]   {iss}")
 
-        # ✅ Round-robin merge across batches using the FILTERED pool,
+        #  Round-robin merge across batches using the FILTERED pool,
         # rebuilt per-batch so diversity is preserved after filtering.
         kept_ids = {id(a) for a in kept_actions}
         filtered_batch_results = [
@@ -2651,7 +2631,7 @@ class LLMClient:
                 "headline": it.get("headline"),
             })
 
-        # ✅ FIX: allowed_ids must come from compact_items in THIS batch only
+        #  FIX: allowed_ids must come from compact_items in THIS batch only
         allowed_ids = sorted(
             {str(it.get("evidence_id")).strip() for it in compact_items if it.get("evidence_id")}
         )
@@ -2734,7 +2714,7 @@ class LLMClient:
         if need_fix:
             used_fixer = True
 
-            # ✅ NEW: only give the fixer the headlines it actually needs —
+            #  only give the fixer the headlines it actually needs —
             # i.e. evidence_ids referenced in its own broken output — not the
             # full batch. This keeps the fixer's context small (so it doesn't
             # regress into the same "too much context -> goes off-script"
@@ -2871,7 +2851,7 @@ class LLMClient:
         Deterministic cleaner for actions JSON:
         Output shape:
           {"ok": bool, "issues": [...], "cleaned": {"actions": [...]}}
-        ✅ Additionally filters evidence_ids against allowed_evidence_ids (if provided).
+         Additionally filters evidence_ids against allowed_evidence_ids (if provided).
         """
         issues: List[str] = []
         allowed = set(str(t).upper().strip() for t in (tickers or []))
@@ -2909,7 +2889,7 @@ class LLMClient:
 
             out["evidence_ids"] = ev_ids
 
-            # ✅ require evidence_ids (no ungrounded actions)
+            #  require evidence_ids (no ungrounded actions)
             if not out["evidence_ids"]:
                 issues.append("missing_evidence_ids")
                 continue
@@ -2979,7 +2959,7 @@ class LLMClient:
         allowed_ids = sorted(
             {str(it.get("evidence_id")).strip() for it in (news_items or []) if isinstance(it, dict) and it.get("evidence_id")}
         )
-        # prompt çok uzamasın diye (opsiyonel)
+       
         allowed_ids = allowed_ids[:120]
         allowed_ids_block = "\n".join(allowed_ids)
         system = (
@@ -3057,7 +3037,7 @@ class LLMClient:
                 "parse_mode": parse_mode,
             }
 
-        # ✅ Build allowed evidence set from snapshot_text + risk_json
+        #  Build allowed evidence set from snapshot_text + risk_json
         snap_text = ""
         if isinstance((snapshot or {}).get("snapshot_text"), str):
             snap_text = (snapshot or {}).get("snapshot_text") or ""
@@ -3067,7 +3047,7 @@ class LLMClient:
         verified = self._verify_news_actions_json(j, tickers_u, allowed_evidence_ids=allowed_set)
         cleaned = (verified.get("cleaned") or {}).get("actions") or []
 
-        # ✅ 2nd pass self-fix if output is unusable
+        #  2nd pass self-fix if output is unusable
         if (not cleaned) or (verified.get("issues")):
             fix_system = (
                 "You are a strict JSON fixer.\n"
@@ -3116,7 +3096,7 @@ class LLMClient:
         }
 
         # =========================================================
-    # ✅ NEW: Attach evidence_ids to already-generated actions (2nd pass)
+    #  NEW: Attach evidence_ids to already-generated actions (2nd pass)
     # =========================================================
     def attach_evidence_ids_to_actions(
         self,

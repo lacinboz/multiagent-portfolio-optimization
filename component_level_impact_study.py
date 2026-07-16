@@ -2,10 +2,10 @@
 # ============================================================
 # LAYER 1 ONLY — Full 101-ticker universe
 #
-# ✅ look-ahead bias fix: latest signals capped at 2026-01-14
-# ✅ Both expected AND realized metrics reported
-# ✅ 5-run mean±std (no fixed seeds)
-# ✅ Deterministic for LR (std≈0 expected, confirms stability)
+#  look-ahead bias fix: latest signals capped at 2026-01-14
+#  Both expected AND realized metrics reported
+#  5-run mean±std (no fixed seeds)
+#  Deterministic for LR (std≈0 expected, confirms stability)
 # ============================================================
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ RAW_PATH = "data/news_prediction/news_timeseries_dataset_raw_h7_alltickers_v2_en
 MU_PATH  = Path("data/processed_yahoo/summary_per_asset_annual.csv")
 COV_PATH = Path("data/processed_yahoo/cov_annual.csv")
 
-# ✅ look-ahead bias fix
+#  look-ahead bias fix
 SIGNAL_CUTOFF = pd.Timestamp("2026-01-14")
 
 N_RUNS            = 5
@@ -244,7 +244,7 @@ def _build_dataset(raw_path: str) -> pd.DataFrame:
 def _build_latest_dataset(raw_path: str) -> pd.DataFrame:
     """
     Unfiltered dataset for latest signal generation (tau=None).
-    ✅ look-ahead bias fix: capped at SIGNAL_CUTOFF (2026-01-14).
+     look-ahead bias fix: capped at SIGNAL_CUTOFF (2026-01-14).
     """
     df = pd.read_csv(raw_path)
     df["news_date_dt"] = pd.to_datetime(df["news_date"], errors="coerce")
@@ -257,7 +257,7 @@ def _build_latest_dataset(raw_path: str) -> pd.DataFrame:
     ]).copy()
     df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
 
-    # ✅ look-ahead bias fix
+    #  look-ahead bias fix
     df = df[df["news_date_dt"] <= SIGNAL_CUTOFF].copy()
 
     df["is_positive_article"] = (df["prob_positive"] > df["prob_negative"]).astype(int)
@@ -461,8 +461,8 @@ def run_component_level_impact_study(
     print("\n" + "=" * 70)
     print("COMPONENT-LEVEL PORTFOLIO IMPACT STUDY")
     print(f"N_RUNS={N_RUNS} | No fixed seeds (probabilistic)")
-    print(f"✅ Signal cutoff: {SIGNAL_CUTOFF.date()} (no look-ahead bias)")
-    print(f"✅ Both expected AND realized metrics reported")
+    print(f" Signal cutoff: {SIGNAL_CUTOFF.date()} (no look-ahead bias)")
+    print(f" Both expected AND realized metrics reported")
     print("=" * 70)
     print(f"rf={rf}, w_max={w_max}, lambda_l2={lambda_l2}")
     print(f"bull>={BULLISH_THRESHOLD}, bear<={BEARISH_THRESHOLD}, delta={DELTA}")

@@ -1,3 +1,4 @@
+# build_returns_yahoodata.py
 import os
 import glob
 import pandas as pd
@@ -8,9 +9,7 @@ RAW_DIR = "data/raw/daily_yahoo"
 OUT_DIR = "data/processed_yahoo"
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# ============================================================
-# CRITICAL: Training/Test split — NO LOOK-AHEAD BIAS
-# ============================================================
+
 TRAIN_END_DATE = "2026-01-14"   # training inclusive end
 TEST_START_DATE = "2026-01-15"  # test starts here
 TEST_END_DATE   = "2026-05-22"  # test ends here
@@ -117,8 +116,8 @@ print(f"Test returns shape:     {returns_test.shape}")
 prices_all.to_csv(  os.path.join(OUT_DIR, "prices_daily.csv"),       index=False)
 prices_train.to_csv(os.path.join(OUT_DIR, "prices_train.csv"),       index=False)
 prices_test.to_csv( os.path.join(OUT_DIR, "prices_test.csv"),        index=False)
-returns_train.to_csv(os.path.join(OUT_DIR, "returns_daily.csv"))     # optimizer bunu kullanıyor
-returns_test.to_csv( os.path.join(OUT_DIR, "returns_test.csv"))      # realized eval için
+returns_train.to_csv(os.path.join(OUT_DIR, "returns_daily.csv"))     
+returns_test.to_csv( os.path.join(OUT_DIR, "returns_test.csv"))     
 summary.to_csv(     os.path.join(OUT_DIR, "summary_per_asset_annual.csv"))
 cov_daily.to_csv(   os.path.join(OUT_DIR, "cov_daily.csv"))
 cov_annual.to_csv(  os.path.join(OUT_DIR, "cov_annual.csv"))

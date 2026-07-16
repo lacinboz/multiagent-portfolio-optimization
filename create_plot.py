@@ -1,6 +1,6 @@
 """
 Figure: Efficient Frontier (101-ticker universe)
-✅ No look-ahead bias: uses training-only mu/cov
+ No look-ahead bias: uses training-only mu/cov
    (data/processed_yahoo/summary_per_asset_annual.csv)
    (data/processed_yahoo/cov_annual.csv)
 Run this from your project root.
@@ -116,7 +116,7 @@ if np.linalg.eigvalsh(cov_np).min() < 0:
     cov_np = _near_psd(cov_np)
 
 print(f"Universe size: {len(tickers)} tickers")
-print("✅ Using training-only mu/cov (no look-ahead bias)")
+print(" Using training-only mu/cov (no look-ahead bias)")
 
 ms = max_sharpe(mu_np, cov_np)
 mv = min_variance(mu_np, cov_np)

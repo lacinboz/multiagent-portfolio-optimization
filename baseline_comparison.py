@@ -3,10 +3,10 @@ baseline_comparison_realized.py
 =======================================================================
 REALIZED-METRICS VERSION
 
-✅ Uses realized_eval.py (same as all other ablation scripts)
-✅ Test period: 2026-01-15 → 2026-05-22 (88 trading days)
-✅ Signal cutoff: 2026-01-14 (no look-ahead bias)
-✅ returns_test.csv used for all realized metrics (consistent)
+Uses realized_eval.py (same as all other ablation scripts)
+ Test period: 2026-01-15 → 2026-05-22 (88 trading days)
+ Signal cutoff: 2026-01-14 (no look-ahead bias)
+ returns_test.csv used for all realized metrics (consistent)
 
 Methods
 -------
@@ -185,7 +185,7 @@ def run_zhang_longshort(
 
     universe = list(mu.index)
 
-    # ✅ Only news before signal cutoff
+    #  Only news before signal cutoff
     signal_news = raw_df[raw_df["news_date_dt"] <= SIGNAL_CUTOFF].copy()
     print(f"  Signal news: {len(signal_news):,} rows up to {SIGNAL_CUTOFF.date()}")
 
@@ -404,18 +404,6 @@ def run_ncmvo(
     print("\n" + "="*60)
     print("METHOD 5 — NC-MVO [Ours]")
 
-    model        = model_bundle["model"]
-    feature_cols = model_bundle["feature_cols"]
-
-    df, _ = prepare_model_frame(dataset, use_ticker_features=True)
-    for col in feature_cols:
-        if col not in df.columns:
-            df[col] = 0.0
-
-    # ✅ Only signals before cutoff
-    signal_df = df[df["news_date_dt"] <= SIGNAL_CUTOFF].copy()
-    print(f"  Signal data up to: {signal_df['news_date_dt'].max().date()}")
-
     universe = list(mu.index)
 
     try:
@@ -425,18 +413,23 @@ def run_ncmvo(
     except Exception as e:
         return {"ok": False, "reason": f"Baseline MVO failed: {e}"}
 
-    latest = (signal_df.sort_values("news_date_dt")
-              .groupby("ticker").tail(1).copy())
-    ticker_here = [t for t in latest["ticker"].tolist() if t in universe]
+    #  Use the same canonical, pre-computed signal file as all other
+    # ablation scripts (Configuration Ablation, Feature Ablation,
+    # Component Impact, Sensitivity, RF vs LR) for cross-table consistency.
+    SIGNALS_CSV = NEWS_OUT_DIR / "latest_news_prediction_signals_as_of_20260114.csv"
+    ticker_here = []
+    if SIGNALS_CSV.exists():
+        signals_df = pd.read_csv(SIGNALS_CSV)
+        signals_df["ticker"] = signals_df["ticker"].astype(str).str.upper().str.strip()
+        sigs = signals_df[signals_df["ticker"].isin(universe)][
+            ["ticker", "predicted_positive_probability"]
+        ].copy()
+        ticker_here = sigs["ticker"].tolist()
+        print(f"  Loaded {len(sigs)} ticker signals from {SIGNALS_CSV.name}")
+    else:
+        print(f"  [WARN] Signals file not found: {SIGNALS_CSV}")
 
     if ticker_here:
-        sub   = latest[latest["ticker"].isin(ticker_here)]
-        X     = sub[feature_cols].astype(float)
-        proba = model.predict_proba(X)[:, 1]
-
-        sigs  = sub[["ticker"]].copy()
-        sigs["predicted_positive_probability"] = proba
-
         news_constraints = build_news_probability_constraints(
             latest_signals=sigs,
             baseline_weights=baseline_weights,
@@ -487,9 +480,9 @@ def run_baseline_comparison_realized(
 
     print("\n" + "═"*70)
     print("BASELINE COMPARISON — REALIZED METRICS")
-    print(f"✅ Test period  : {TEST_START.date()} → {TEST_END.date()} (88 days)")
-    print(f"✅ Signal cutoff: {SIGNAL_CUTOFF.date()} (no look-ahead bias)")
-    print(f"✅ realized_eval.py used (consistent with all ablation scripts)")
+    print(f" Test period  : {TEST_START.date()} → {TEST_END.date()} (88 days)")
+    print(f" Signal cutoff: {SIGNAL_CUTOFF.date()} (no look-ahead bias)")
+    print(f" realized_eval.py used (consistent with all ablation scripts)")
     print("═"*70)
 
     # Load returns_test (same file as all ablation scripts)
@@ -509,7 +502,7 @@ def run_baseline_comparison_realized(
     dataset     = dataset.sort_values("news_date_dt").reset_index(drop=True)
     all_tickers = raw_df["ticker"].dropna().unique().tolist()
     mu, cov     = data_agent_get_mu_cov(all_tickers)
-    print(f"mu/cov: {len(mu)} tickers (training-only ✅)")
+    print(f"mu/cov: {len(mu)} tickers (training-only )")
 
     # Model
     model_bundle = None

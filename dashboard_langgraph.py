@@ -1287,8 +1287,8 @@ def _render_news_impact_heatmap(
         st.info("No numeric news impact values available for heatmap.")
         return
 
-    # ✅ NEW: drop tickers with no recorded news signal (all-zero rows)
-    # ✅ FIX: use Confidence specifically as the "has news" signal,
+     
+    # use Confidence specifically as the "has news" signal,
     # since Risk adjustment carries a nonzero baseline even with zero news.
     if "Confidence" in heat_df.columns:
         row_has_signal = heat_df["Confidence"].abs() > 1e-9
@@ -1300,7 +1300,7 @@ def _render_news_impact_heatmap(
         st.info("No tickers with a recorded news signal to display.")
         return
 
-    # ✅ NEW: per-column normalization so one high-magnitude column
+    # per-column normalization so one high-magnitude column
     # (e.g. Confidence) does not visually dominate the shared color scale.
     norm_df = heat_df.copy()
     for col in available_cols:
@@ -1464,7 +1464,7 @@ def _render_prob_news_trace(trace: Optional[Dict[str, Any]]):
                 st.dataframe(pd.DataFrame(article_rows), use_container_width=True, height=320)
 def _portfolio_summary_from_state(state: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """
-    ✅ For Evaluation section.
+     For Evaluation section.
     Prefer optimized_* (final) to avoid mismatch.
     """
     if not state:
@@ -1941,7 +1941,7 @@ def _detect_mentioned_tickers(text: str, universe: list[str], max_n: int = 6) ->
         return []
     text_u = text.upper()
 
-    # en basit ve güvenli yöntem: universe içindeki ticker'ları text içinde ara
+   
     found = []
     for t in universe:
         tt = str(t).upper().strip()
@@ -1953,14 +1953,14 @@ def _detect_mentioned_tickers(text: str, universe: list[str], max_n: int = 6) ->
             break
     return found
 
-# ✅ NEW: News rendering helpers (supports placeholder + real LLM news snapshot output)
+# : News rendering helpers (supports placeholder + real LLM news snapshot output)
 def _extract_news_snapshot_and_risk(state: Dict[str, Any]) -> tuple[Optional[str], Optional[Dict[str, Any]]]:
     if not state:
         return None, None
 
-    # ✅ NEW: prefer explicit fields from backend
+    #  prefer explicit fields from backend
     snapshot_text = None
-    # ✅ 0) UI-friendly raw snapshot (if backend provides it)
+    #  0) UI-friendly raw snapshot (if backend provides it)
     if isinstance(state.get("news_snapshot_text_raw"), str) and state["news_snapshot_text_raw"].strip():
         snapshot_text = state["news_snapshot_text_raw"].strip()
     if isinstance(state.get("news_snapshot_text"), str) and state["news_snapshot_text"].strip():
@@ -3283,7 +3283,7 @@ def _handle_chat_command(
     if not selected_tickers:
         _append_chat_message("assistant", "Please select at least one ticker in the universe first.")
         return
-    # ✅ FIX: news keyword'lerini LLM'den önce yakala
+  
     _msg_lower = user_msg.lower().strip()
     _news_phrases = [
         "use news", "include news", "apply news", "consider news",
@@ -3312,7 +3312,7 @@ def _handle_chat_command(
                 ],
             },
         )
-        return  # ← LLM'e hiç gitme
+        return 
 
 
     client = LLMClient()
@@ -3324,7 +3324,7 @@ def _handle_chat_command(
 
     intent = str(cmd.get("intent") or "unsupported").strip()
     params = cmd.get("parameters") if isinstance(cmd.get("parameters"), dict) else {}
-    # ← GEÇİCİ DEBUG: terminalde göreceksin
+   
     print(f"\n===== CHAT INTENT DEBUG =====")
     print(f"user_msg: {user_msg!r}")
     print(f"intent: {intent!r}")
@@ -3701,7 +3701,7 @@ else:
 
     st.markdown("---")
     st.markdown('<div class="section-title">💬 Portfolio Chatbot</div>', unsafe_allow_html=True)
-    with st.expander("ℹ️ What can I ask this chatbot?", expanded=False):
+    with st.expander("ℹ️ What can I ask to this chatbot?", expanded=False):
         st.markdown(
             """
             You can ask me to:
@@ -3940,7 +3940,7 @@ else:
                             print(json.dumps(selected_actions, indent=2, default=str))
                             print("===========================================================\n")
 
-                            # refine backend'e gönderilecek gerçek selection
+                           
                             st.session_state["selected_news_actions"] = selected_actions
 
                             print("\n===== FRONTEND DEBUG: selected_news_actions saved to session =====")
@@ -3974,7 +3974,7 @@ else:
                                 },
                             )
 
-                            # artık eski seçim state'te kalmasın
+                        
                             st.session_state["selected_news_actions"] = []
                             st.session_state["temp_selected_actions"] = []
 
@@ -4090,7 +4090,7 @@ else:
                     if os.path.exists(debug_path):
                         df_debug = pd.read_csv(debug_path, index_col=0)
 
-                        # Optional: sadece seçili tickerları göster
+                       
                         selected_debug_tickers = [t for t in selected_tickers if t in df_debug.index]
                         if selected_debug_tickers:
                             df_debug = df_debug.loc[selected_debug_tickers]
@@ -4120,8 +4120,7 @@ else:
             elif kind == "news_prediction_model":
                 st.markdown("**Trained News Prediction Model**")
 
-                # ✅ FIX: sadece prediction_model_used=True değilse çalıştır
-                # Böylece prob_news flow'u (veya başka bir flow) refined_state'i set etmişse EZMEYİZ
+
                 active_state = st.session_state.get("refined_state")
                 if active_state is None or not active_state.get("prediction_model_used"):
                     run_prediction_constrained_optimization(
@@ -4132,7 +4131,7 @@ else:
                     )
                     st.rerun()
 
-                # rerun sonrası buraya gelir
+               
                 active_state = st.session_state.get("refined_state")
 
                 _render_saved_news_prediction_model(

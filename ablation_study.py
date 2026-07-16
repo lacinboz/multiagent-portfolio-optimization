@@ -1,11 +1,11 @@
 # ablation_study.py
 # ============================================================
 # Constraint Design Ablation Study
-#
+
 # PURPOSE: Justify why production uses A1 config
-# ✅ Both expected AND realized metrics reported
-# ✅ No look-ahead bias: uses as_of_20260114 signals
-# ✅ Deterministic — no 5-run loop needed
+#  Both expected AND realized metrics reported
+#  No look-ahead bias: uses as_of_20260114 signals
+#  Deterministic — no 5-run loop needed
 # ============================================================
 from __future__ import annotations
 
@@ -170,7 +170,7 @@ def _run_config(
     n_bull = sum(1 for c in constraints.values() if c.get("type") == "bullish")
     n_bear = sum(1 for c in constraints.values() if c.get("type") == "bearish")
 
-    # ✅ Realized metrics
+    #  Realized metrics
     real = compute_realized_metrics(result["weights"], returns_test)
 
     return {
@@ -215,8 +215,8 @@ def run_ablation_study(
 
     print("\n" + "=" * 70)
     print("CONSTRAINT DESIGN ABLATION STUDY")
-    print("✅ Both expected AND realized metrics reported")
-    print("✅ No look-ahead bias: signals capped at 2026-01-14")
+    print(" Both expected AND realized metrics reported")
+    print(" No look-ahead bias: signals capped at 2026-01-14")
     print("=" * 70)
     print(f"rf={rf}, w_max={w_max}, lambda_l2={lambda_l2}")
     print(f"Fixed: bull>={BULL_THR}, bear<={BEAR_THR}, base_delta={DELTA}")

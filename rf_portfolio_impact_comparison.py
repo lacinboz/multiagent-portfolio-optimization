@@ -1,8 +1,9 @@
 # rf_portfolio_impact_comparison.py
+#tab:rf_vs_lr_portfolio
 # ============================================================
 # PURPOSE: Compare RF vs LR portfolio-level impact
 # 5-run mean±std version (no fixed seeds — probabilistic)
-# ✅ look-ahead bias fix: latest_dataset capped at SIGNAL_CUTOFF
+# look-ahead bias fix: latest_dataset capped at SIGNAL_CUTOFF
 # ============================================================
 from __future__ import annotations
 from realized_eval import compute_realized_metrics, load_test_returns
@@ -182,7 +183,7 @@ def _build_dataset(raw_path: str) -> pd.DataFrame:
 def _build_latest_dataset(raw_path: str) -> pd.DataFrame:
     """
     Unfiltered dataset for latest signal generation (tau=None).
-    ✅ look-ahead bias fix: capped at SIGNAL_CUTOFF (2026-01-14).
+     look-ahead bias fix: capped at SIGNAL_CUTOFF (2026-01-14).
     """
     df_raw = pd.read_csv(raw_path)
     df_raw["news_date_dt"] = pd.to_datetime(df_raw["news_date"], errors="coerce")
@@ -196,7 +197,7 @@ def _build_latest_dataset(raw_path: str) -> pd.DataFrame:
 
     df_raw["ticker"] = df_raw["ticker"].astype(str).str.upper().str.strip()
 
-    # ✅ look-ahead bias fix: only use signals available before test period
+    #  look-ahead bias fix: only use signals available before test period
     df_raw = df_raw[df_raw["news_date_dt"] <= SIGNAL_CUTOFF].copy()
 
     df_raw["is_positive_article"] = (df_raw["prob_positive"] > df_raw["prob_negative"]).astype(int)
@@ -426,7 +427,7 @@ def run_rf_vs_lr_portfolio_impact(
     print("RF vs LR — PORTFOLIO-LEVEL IMPACT COMPARISON (5-run mean±std)")
     print(f"N_RUNS={N_RUNS} | No fixed seeds (probabilistic)")
     print(f"bull>={BULLISH_THRESHOLD}, bear<={BEARISH_THRESHOLD}, delta={DELTA}")
-    print(f"✅ Signal cutoff: {SIGNAL_CUTOFF.date()} (no look-ahead bias)")
+    print(f" Signal cutoff: {SIGNAL_CUTOFF.date()} (no look-ahead bias)")
     print("=" * 70)
 
     # Load portfolio data
